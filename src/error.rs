@@ -1,0 +1,1 @@
+//! App-wide error type.
