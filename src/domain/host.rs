@@ -133,9 +133,7 @@ pub fn validate_inventory(inventory: &Inventory) -> Vec<String> {
                     host.name, jump
                 ));
             } else if detect_jump_cycle(host, &inventory.hosts) {
-                errors.push(format!(
-                    "Host '{}' is part of a jump host cycle", host.name
-                ));
+                errors.push(format!("Host '{}' is part of a jump host cycle", host.name));
             }
         }
     }
