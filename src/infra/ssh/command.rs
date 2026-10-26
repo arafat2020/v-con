@@ -54,5 +54,7 @@ pub fn build_ssh_command(host: &EffectiveHost, opts: &SshCommandOptions) -> Vec<
         args.push(format!("{}={}", key, val));
     }
 
+    args.push(format!("{}@{}", host.user, host.address));
+
     args
 }
