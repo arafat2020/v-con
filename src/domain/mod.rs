@@ -2,6 +2,6 @@
 
 mod health;
 pub mod host; 
-mod selector;
+pub mod selector;
 mod snippet;
 mod tunnel;
