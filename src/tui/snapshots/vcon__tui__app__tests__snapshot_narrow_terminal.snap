@@ -1,0 +1,16 @@
+---
+source: src/tui/app.rs
+expression: screen
+---
+ vcon  1 Hosts  2 Health  3 Files  4 Ses
+┌ Hosts ─ 5 ───────────────────────────┐
+│NAME                ADDRESS           │
+│>  bastion          198.51.100.5      │
+│   web-1            203.0.113.10      │
+│   web-2            203.0.113.11      │
+│   db-1             10.0.0.20         │
+│   db-3             10.0.0.23         │
+│                                      │
+│                                      │
+└──────────────────────────────────────┘
+ j/k move   h/l focus   / search   space

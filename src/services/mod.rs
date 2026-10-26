@@ -7,7 +7,7 @@ mod connect;
 mod exec;
 mod files;
 mod health;
-mod inventory;
+pub mod inventory;
 mod sessions;
 mod snippets;
 mod tunnels;

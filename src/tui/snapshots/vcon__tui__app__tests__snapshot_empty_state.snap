@@ -1,0 +1,28 @@
+---
+source: src/tui/app.rs
+expression: screen
+---
+ vcon  1 Hosts  2 Health  3 Files  4 Sessions  5 Log
+┌ Tags ────────────────┐┌ Hosts ─ 0 ───────────────────────────────────────────┐
+│  all (0)             ││No hosts yet — press `i` to import from ~/.ssh/config │
+│  recent (0)          ││or `a` to add one (phase 3), or edit                  │
+│  favorites (0)       ││~/.config/vcon/hosts.toml                             │
+│                      ││                                                      │
+│                      ││                                                      │
+│                      ││                                                      │
+│                      ││                                                      │
+│                      ││                                                      │
+│                      ││                                                      │
+│                      ││                                                      │
+│                      ││                                                      │
+│                      ││                                                      │
+└──────────────────────┘└──────────────────────────────────────────────────────┘
+┌ Detail ──────────────────────────────────────────────────────────────────────┐
+│No host selected.                                                             │
+│                                                                              │
+│                                                                              │
+│                                                                              │
+│                                                                              │
+│                                                                              │
+└──────────────────────────────────────────────────────────────────────────────┘
+ j/k move   h/l focus   / search   space select   y copy   ? help   q quit

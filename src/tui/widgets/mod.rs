@@ -3,6 +3,6 @@
 mod form;
 mod gauge;
 mod input;
-mod modal;
+pub mod modal;
 mod table;
 mod toast;
