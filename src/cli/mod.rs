@@ -1,7 +1,8 @@
 //! Command-line entry point.
 //!
-//! No subcommand starts the TUI. `init`, `list` (`ls`), `check`, and `connect`
-//! (`c`) share [`crate::services::inventory`] and the state file with the Hosts screen.
+//! No subcommand starts the TUI. `init`, `list` (`ls`), `check`, `connect`
+//! (`c`), and `import` share [`crate::services::inventory`] and the state file
+//! with the Hosts screen.
 
 mod commands;
 
@@ -55,6 +56,20 @@ pub enum Command {
     Connect {
         /// Host name, for example `web-1`.
         name: String,
+    },
+    /// Import hosts. The source is `ssh-config`.
+    Import {
+        /// Source name. Only `ssh-config` is supported.
+        source: String,
+        /// Config file to read. The default is `~/.ssh/config`.
+        #[arg(long)]
+        file: Option<PathBuf>,
+        /// Print the plan and do not write `hosts.toml`.
+        #[arg(long)]
+        dry_run: bool,
+        /// Replace hosts that already use an imported name.
+        #[arg(long)]
+        overwrite: bool,
     },
 }
 
@@ -112,6 +127,30 @@ fn dispatch(cli: &Cli) -> Result<ExitCode, Error> {
         Some(Command::Connect { name }) => {
             let (bundle, config) = inventory::load(&paths, &paths::local_user())?;
             commands::connect::run(&bundle, &config, &paths, name)?;
+            Ok(ExitCode::SUCCESS)
+        }
+        Some(Command::Import {
+            source,
+            file,
+            dry_run,
+            overwrite,
+        }) => {
+            if source != "ssh-config" {
+                return Err(Error::Message(format!(
+                    "unknown import source `{source}`; use ssh-config"
+                )));
+            }
+            let config_file = file
+                .clone()
+                .unwrap_or_else(crate::infra::ssh_config::default_path);
+            let result = commands::import::run(
+                &paths.hosts_file(),
+                &config_file,
+                *dry_run,
+                *overwrite,
+                &paths::local_user(),
+            )?;
+            println!("{}", result.text);
             Ok(ExitCode::SUCCESS)
         }
         None => {

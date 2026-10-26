@@ -25,4 +25,4 @@ expression: screen
 │                                                                              │
 │                                                                              │
 └──────────────────────────────────────────────────────────────────────────────┘
- ⏎ connect   j/k move   / search   * fav   E edit   ? help   q quit
+ ⏎ connect   a add   e edit   d del   i import   ? help   q quit

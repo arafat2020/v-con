@@ -5,7 +5,7 @@ mod completions;
 pub mod connect;
 mod doctor;
 mod exec;
-mod import;
+pub mod import;
 pub mod init;
 pub mod list;
 mod log;

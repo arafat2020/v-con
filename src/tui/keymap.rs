@@ -113,6 +113,15 @@ fn defaults() -> HashMap<Binding, Action> {
         Action::EditInventory,
     );
     bind(KeyCode::Char('S'), KeyModifiers::NONE, Action::ToggleSort);
+    bind(KeyCode::Char('a'), KeyModifiers::NONE, Action::AddHost);
+    bind(KeyCode::Char('e'), KeyModifiers::NONE, Action::EditHost);
+    bind(
+        KeyCode::Char('D'),
+        KeyModifiers::NONE,
+        Action::DuplicateHost,
+    );
+    bind(KeyCode::Char('d'), KeyModifiers::NONE, Action::DeleteHost);
+    bind(KeyCode::Char('i'), KeyModifiers::NONE, Action::ImportHosts);
     map
 }
 
@@ -129,6 +138,11 @@ fn action_by_name(name: &str) -> Option<Action> {
         "favorite" => Action::ToggleFavorite,
         "sort" => Action::ToggleSort,
         "edit" => Action::EditInventory,
+        "add" => Action::AddHost,
+        "edit_host" => Action::EditHost,
+        "duplicate" => Action::DuplicateHost,
+        "delete" => Action::DeleteHost,
+        "import" => Action::ImportHosts,
         "up" => Action::MoveUp,
         "down" => Action::MoveDown,
         _ => return None,

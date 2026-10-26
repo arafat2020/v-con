@@ -1,7 +1,7 @@
 //! vcon browses an SSH host inventory from the terminal and from scripts.
 //!
 //! With no arguments, [`tui::run`] opens the Hosts screen. `vcon init`,
-//! `vcon ls`, `vcon check`, and `vcon connect` share one inventory.
+//! `vcon ls`, `vcon check`, `vcon connect`, and `vcon import` share one inventory.
 
 mod cli;
 mod config;

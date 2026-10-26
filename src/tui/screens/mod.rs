@@ -3,9 +3,9 @@
 mod exec;
 mod files;
 mod health;
-mod host_form;
+pub mod host_form;
 pub mod hosts;
-mod import;
+pub mod import;
 mod log;
 mod sessions;
 mod snippets;

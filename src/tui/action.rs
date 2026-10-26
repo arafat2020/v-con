@@ -62,6 +62,16 @@ pub enum Action {
     ToggleSort,
     /// Open `hosts.toml` in `$EDITOR`, then reload it.
     EditInventory,
+    /// Open a blank host form.
+    AddHost,
+    /// Open the host form for the cursor host.
+    EditHost,
+    /// Open the host form with a copied name.
+    DuplicateHost,
+    /// Ask to delete the cursor host.
+    DeleteHost,
+    /// Open the ssh config import screen.
+    ImportHosts,
 }
 
 /// Work the event loop performs after `update` returns.
