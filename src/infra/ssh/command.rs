@@ -27,4 +27,32 @@ pub fn build_ssh_command(host: &EffectiveHost, opts: &SshCommandOptions) -> Vec<
         args.push("-J".to_string());
         args.push(jump.clone());
     }
+
+    if opts.batch_mode {
+        args.push("-o".to_string());
+        args.push("BatchMode=yes".to_string());
+    }
+
+    if let Some(timeout) = opts.connect_timeout {
+        args.push("-o".to_string());
+        args.push(format!("ConnectTimeout={}", timeout));
+    }
+
+    if opts.enable_control_master {
+        if let Some(ref dir) = opts.control_path_dir {
+            args.push("-o".to_string());
+            args.push("ControlMaster=auto".to_string());
+            args.push("-o".to_string());
+            args.push(format!("ControlPath={}/cm/%C", dir));
+            args.push("-o".to_string());
+            args.push("ControlPersist=10m".to_string());
+        }
+    }
+
+    for (key, val) in &host.ssh_options {
+        args.push("-o".to_string());
+        args.push(format!("{}={}", key, val));
+    }
+
+    args
 }
