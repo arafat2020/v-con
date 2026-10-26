@@ -1,9 +1,10 @@
 //! Terminal lifecycle.
 //!
 //! [`setup`] enables raw mode, the alternate screen, and bracketed paste.
-//! [`restore`] reverses that and is safe to call twice. A panic hook calls
-//! restore before the default hook prints, so a panic does not leave the
-//! terminal in raw mode.
+//! [`restore`] reverses that and is safe to call twice. [`suspend`] and
+//! [`resume`] wrap the same teardown around an ssh session or `$EDITOR`.
+//! A panic hook calls restore before the default hook prints, so a panic does
+//! not leave the terminal in raw mode.
 
 use crossterm::cursor::{Hide, Show};
 use crossterm::event::{
@@ -15,7 +16,7 @@ use crossterm::terminal::{
 };
 use ratatui::Terminal;
 use ratatui::backend::CrosstermBackend;
-use std::io::{self, Stdout};
+use std::io::{self, Stdout, Write};
 use std::sync::atomic::{AtomicBool, Ordering};
 
 static RESTORED: AtomicBool = AtomicBool::new(true);
@@ -50,6 +51,40 @@ pub fn restore() -> io::Result<()> {
         LeaveAlternateScreen,
         Show
     )
+}
+
+/// Leave raw mode and the alternate screen so a child can use the terminal.
+///
+/// The panic hook treats the terminal as already restored. [`resume`] puts the
+/// TUI back afterwards.
+pub fn suspend(terminal: &mut Tui) -> io::Result<()> {
+    disable_raw_mode()?;
+    execute!(
+        terminal.backend_mut(),
+        DisableMouseCapture,
+        DisableBracketedPaste,
+        LeaveAlternateScreen,
+        Show
+    )?;
+    let _ = io::stdout().flush();
+    RESTORED.store(true, Ordering::SeqCst);
+    Ok(())
+}
+
+/// Return to the TUI after a child process exits and force a full redraw.
+pub fn resume(terminal: &mut Tui, mouse: bool) -> io::Result<()> {
+    enable_raw_mode()?;
+    execute!(
+        terminal.backend_mut(),
+        EnterAlternateScreen,
+        EnableBracketedPaste,
+        Hide
+    )?;
+    if mouse {
+        execute!(terminal.backend_mut(), EnableMouseCapture)?;
+    }
+    RESTORED.store(false, Ordering::SeqCst);
+    terminal.clear()
 }
 
 fn install_panic_hook() {

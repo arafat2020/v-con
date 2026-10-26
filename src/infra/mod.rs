@@ -6,4 +6,4 @@ mod pty;
 mod remote_fs;
 pub mod ssh;
 mod ssh_config;
-mod state_store;
+pub mod state_store;

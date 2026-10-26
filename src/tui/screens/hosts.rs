@@ -3,8 +3,8 @@
 //! Filtering lives in [`crate::domain::filter`]. This module owns cursor
 //! movement, multi-select (stored by host name), and drawing. The detail pane
 //! hides when the terminal is narrower than 70 columns or shorter than 20 rows.
-//! The tag tree hides below 60 columns. `recent` and `favorites` are drawn with
-//! a count of zero until phase 2.
+//! The tag tree hides below 60 columns. `recent` and `favorites` list hosts
+//! recorded in the state file. `recent` is ordered newest first.
 
 use crate::domain::filter::{Field, FilterOutput, Scope, cursor_position, filter};
 use crate::domain::host::EffectiveHost;
@@ -84,6 +84,18 @@ pub struct HostsView {
     pub table_offset: usize,
     /// Rows that fit in the table, updated while drawing. Page keys use it.
     pub table_page: usize,
+    /// Host names in the recent group, newest first.
+    pub recent_order: Vec<String>,
+    /// Membership of the recent group.
+    pub recent: BTreeSet<String>,
+    /// Membership of the favorites group.
+    pub favorites: BTreeSet<String>,
+    /// Compact last-connected labels keyed by host name.
+    pub last_seen: BTreeMap<String, String>,
+    /// Frecency scores. Missing names sort as zero.
+    pub scores: BTreeMap<String, u64>,
+    /// When true, the all and tag tables sort by [`Self::scores`].
+    pub sort_frecency: bool,
 }
 
 /// Theme, paths, and the flags that decide whether the detail pane is shown.
@@ -120,7 +132,33 @@ impl HostsView {
             tree,
             table_offset: 0,
             table_page: 10,
+            recent_order: Vec::new(),
+            recent: BTreeSet::new(),
+            favorites: BTreeSet::new(),
+            last_seen: BTreeMap::new(),
+            scores: BTreeMap::new(),
+            sort_frecency: false,
         }
+    }
+
+    /// Replace the recent, favorite, and frecency data the table sorts with.
+    pub fn apply_groups(
+        &mut self,
+        recent_order: Vec<String>,
+        favorites: BTreeSet<String>,
+        last_seen: BTreeMap<String, String>,
+        scores: BTreeMap<String, u64>,
+    ) {
+        self.recent = recent_order.iter().cloned().collect();
+        self.recent_order = recent_order;
+        self.favorites = favorites;
+        self.last_seen = last_seen;
+        self.scores = scores;
+    }
+
+    /// Put the cursor back on a visible row after the inventory changes.
+    pub fn refresh(&mut self, hosts: &[EffectiveHost]) {
+        self.restabilize(hosts);
     }
 
     /// Apply a host-list action. Returns false for actions the shell handles
@@ -176,17 +214,46 @@ impl HostsView {
     }
 
     /// Rows visible with the current tag and search query.
+    ///
+    /// The recent group is newest-first. Other groups stay in inventory order
+    /// unless frecency sorting is on.
     pub fn output(&self, hosts: &[EffectiveHost]) -> FilterOutput {
-        filter(hosts, &self.query, self.scope_ref())
-    }
-
-    fn scope_ref(&self) -> Scope<'_> {
-        match &self.scope {
+        let scope = match &self.scope {
             HostScope::All => Scope::All,
             HostScope::Tag(tag) => Scope::Tag(tag),
-            HostScope::Recent => Scope::Recent,
-            HostScope::Favorites => Scope::Favorites,
+            HostScope::Recent => Scope::Recent(&self.recent),
+            HostScope::Favorites => Scope::Favorites(&self.favorites),
+        };
+        let mut output = filter(hosts, &self.query, scope);
+        match &self.scope {
+            HostScope::Recent => {
+                output.matches.sort_by_key(|matched| {
+                    self.recent_order
+                        .iter()
+                        .position(|name| name == &hosts[matched.index].name)
+                        .unwrap_or(usize::MAX)
+                });
+            }
+            _ if self.sort_frecency => {
+                output.matches.sort_by(|left, right| {
+                    let left_score = self
+                        .scores
+                        .get(&hosts[left.index].name)
+                        .copied()
+                        .unwrap_or(0);
+                    let right_score = self
+                        .scores
+                        .get(&hosts[right.index].name)
+                        .copied()
+                        .unwrap_or(0);
+                    right_score
+                        .cmp(&left_score)
+                        .then(left.index.cmp(&right.index))
+                });
+            }
+            _ => {}
         }
+        output
     }
 
     fn move_focused(&mut self, hosts: &[EffectiveHost], delta: isize) {
@@ -199,7 +266,7 @@ impl HostsView {
 
     fn move_edge(&mut self, hosts: &[EffectiveHost], top: bool) {
         if self.focus == Focus::Tree {
-            let nodes = node_list(hosts);
+            let nodes = self.nodes(hosts);
             if let Some((node, _)) = if top { nodes.first() } else { nodes.last() } {
                 self.select_node(node.clone(), hosts);
             }
@@ -229,7 +296,7 @@ impl HostsView {
     }
 
     fn move_tree(&mut self, hosts: &[EffectiveHost], delta: isize) {
-        let nodes = node_list(hosts);
+        let nodes = self.nodes(hosts);
         if nodes.is_empty() {
             return;
         }
@@ -252,6 +319,10 @@ impl HostsView {
         self.node = node.clone();
         self.tree.select(vec![node]);
         self.restabilize(hosts);
+    }
+
+    fn nodes(&self, hosts: &[EffectiveHost]) -> Vec<(NodeId, String)> {
+        node_list(hosts, self.recent.len(), self.favorites.len())
     }
 
     fn restabilize(&mut self, hosts: &[EffectiveHost]) {
@@ -328,7 +399,7 @@ fn draw_tree(
     hosts: &[EffectiveHost],
     options: &ViewOptions<'_>,
 ) {
-    let nodes = node_list(hosts);
+    let nodes = node_list(hosts, view.recent.len(), view.favorites.len());
     let _ = view.tree.select(vec![view.node.clone()]);
     let items: Vec<TreeItem<NodeId>> = nodes
         .iter()
@@ -418,16 +489,22 @@ fn draw_table(
             ])
         } else {
             Row::new(vec![
-                Cell::from(Line::from(name_spans(
+                Cell::from(Line::from(named(
                     &gutter,
                     host,
                     matched,
+                    view.favorites.contains(&host.name),
                     options.theme,
                 ))),
                 Cell::from(field_line(host, matched, Field::Address, options.theme)),
                 Cell::from(host.user.as_str()),
                 Cell::from(field_line(host, matched, Field::Tags, options.theme)),
-                Cell::from("—"),
+                Cell::from(
+                    view.last_seen
+                        .get(&host.name)
+                        .map(String::as_str)
+                        .unwrap_or("—"),
+                ),
             ])
         }
     });
@@ -540,6 +617,20 @@ fn gutter(name: &str, cursor: Option<&str>, selected: &BTreeSet<String>) -> Stri
     }
 }
 
+fn named<'a>(
+    gutter: &str,
+    host: &EffectiveHost,
+    matched: &crate::domain::filter::HostMatch,
+    favorite: bool,
+    theme: &Theme,
+) -> Vec<Span<'a>> {
+    let mut spans = name_spans(gutter, host, matched, theme);
+    if favorite {
+        spans.push(Span::raw(" *"));
+    }
+    spans
+}
+
 fn name_spans<'a>(
     gutter: &str,
     host: &EffectiveHost,
@@ -608,9 +699,13 @@ fn highlighted<'a>(text: &str, indices: &[u32], theme: &Theme) -> Vec<Span<'a>> 
     spans
 }
 
-/// Tag-tree rows: `all`, then each tag alphabetically with a count, then the
-/// empty `recent` and `favorites` groups.
-pub fn node_list(hosts: &[EffectiveHost]) -> Vec<(NodeId, String)> {
+/// Tag-tree rows: `all`, then each tag alphabetically with a count, then
+/// `recent` and `favorites`.
+pub fn node_list(
+    hosts: &[EffectiveHost],
+    recent: usize,
+    favorites: usize,
+) -> Vec<(NodeId, String)> {
     let mut counts = BTreeMap::<String, usize>::new();
     for host in hosts {
         for tag in &host.tags {
@@ -621,7 +716,7 @@ pub fn node_list(hosts: &[EffectiveHost]) -> Vec<(NodeId, String)> {
     for (tag, count) in counts {
         nodes.push((NodeId::Tag(tag.clone()), format!("{tag} ({count})")));
     }
-    nodes.push((NodeId::Recent, "recent (0)".to_string()));
-    nodes.push((NodeId::Favorites, "favorites (0)".to_string()));
+    nodes.push((NodeId::Recent, format!("recent ({recent})")));
+    nodes.push((NodeId::Favorites, format!("favorites ({favorites})")));
     nodes
 }

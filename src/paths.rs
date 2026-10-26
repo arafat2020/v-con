@@ -66,6 +66,11 @@ impl Paths {
     pub fn control_dir(&self) -> PathBuf {
         self.cache_dir.join("cm")
     }
+
+    /// Recents, favorites, and the last screen. vcon owns this file.
+    pub fn state_file(&self) -> PathBuf {
+        self.data_dir.join("state.json")
+    }
 }
 
 fn home_dir() -> PathBuf {

@@ -97,6 +97,22 @@ fn defaults() -> HashMap<Binding, Action> {
         Action::CopySshCommand,
     );
     bind(KeyCode::Enter, KeyModifiers::NONE, Action::Connect);
+    bind(
+        KeyCode::Char('*'),
+        KeyModifiers::SHIFT,
+        Action::ToggleFavorite,
+    );
+    bind(
+        KeyCode::Char('*'),
+        KeyModifiers::NONE,
+        Action::ToggleFavorite,
+    );
+    bind(
+        KeyCode::Char('E'),
+        KeyModifiers::NONE,
+        Action::EditInventory,
+    );
+    bind(KeyCode::Char('S'), KeyModifiers::NONE, Action::ToggleSort);
     map
 }
 
@@ -110,6 +126,9 @@ fn action_by_name(name: &str) -> Option<Action> {
         "select_all" => Action::SelectAll,
         "copy" => Action::CopySshCommand,
         "connect" => Action::Connect,
+        "favorite" => Action::ToggleFavorite,
+        "sort" => Action::ToggleSort,
+        "edit" => Action::EditInventory,
         "up" => Action::MoveUp,
         "down" => Action::MoveDown,
         _ => return None,
@@ -117,7 +136,17 @@ fn action_by_name(name: &str) -> Option<Action> {
 }
 
 fn parse_key(raw: &str) -> Option<Binding> {
-    let raw = raw.trim().to_ascii_lowercase();
+    let raw = raw.trim();
+    if let Some(letter) = raw.chars().next()
+        && raw.chars().count() == 1
+        && letter.is_ascii_uppercase()
+    {
+        return Some(Binding {
+            code: KeyCode::Char(letter),
+            modifiers: KeyModifiers::NONE,
+        });
+    }
+    let raw = raw.to_ascii_lowercase();
     let (modifiers, key) = if let Some(rest) = raw.strip_prefix("ctrl-") {
         (KeyModifiers::CONTROL, rest)
     } else if let Some(rest) = raw.strip_prefix("alt-") {

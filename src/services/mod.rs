@@ -3,7 +3,7 @@
 //! These modules do not know about ratatui.
 
 mod audit;
-mod connect;
+pub mod connect;
 mod exec;
 mod files;
 mod health;

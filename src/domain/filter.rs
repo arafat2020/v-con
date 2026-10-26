@@ -10,21 +10,23 @@ use crate::domain::host::EffectiveHost;
 use crate::domain::selector::{evaluate_selector, parse_selector};
 use nucleo::pattern::{CaseMatching, Normalization, Pattern};
 use nucleo::{Config, Matcher, Utf32Str};
+use std::collections::BTreeSet;
 
 /// Which slice of the inventory the tag tree is showing.
 ///
-/// `Recent` and `Favorites` are visible in the tree and stay empty until
-/// phase 2 records connection history.
+/// `Recent` and `Favorites` carry the host names recorded in the state file.
+/// An empty set shows an empty table. The filter keeps inventory order; the
+/// Hosts screen sorts the recent group so the newest connection is first.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum Scope<'a> {
     /// Every host in the inventory.
     All,
     /// Hosts that carry this tag.
     Tag(&'a str),
-    /// Virtual group. Always empty in phase 1.
-    Recent,
-    /// Virtual group. Always empty in phase 1.
-    Favorites,
+    /// Hosts whose names are in this set.
+    Recent(&'a BTreeSet<String>),
+    /// Hosts marked favorite in the state file.
+    Favorites(&'a BTreeSet<String>),
 }
 
 impl<'a> Scope<'a> {
@@ -33,7 +35,7 @@ impl<'a> Scope<'a> {
         match self {
             Scope::All => true,
             Scope::Tag(tag) => host.has_tag(tag),
-            Scope::Recent | Scope::Favorites => false,
+            Scope::Recent(names) | Scope::Favorites(names) => names.contains(&host.name),
         }
     }
 }
@@ -353,8 +355,20 @@ mod tests {
             names(&filter(&hosts, "", Scope::Tag("db")), &hosts),
             vec!["db-1", "db-3"]
         );
-        assert!(filter(&hosts, "", Scope::Recent).matches.is_empty());
-        assert!(filter(&hosts, "", Scope::Favorites).matches.is_empty());
+        let empty = BTreeSet::new();
+        assert!(filter(&hosts, "", Scope::Recent(&empty)).matches.is_empty());
+        assert!(
+            filter(&hosts, "", Scope::Favorites(&empty))
+                .matches
+                .is_empty()
+        );
+        let mut recent = BTreeSet::new();
+        recent.insert("cache-1".into());
+        recent.insert("db-1".into());
+        assert_eq!(
+            names(&filter(&hosts, "", Scope::Recent(&recent)), &hosts),
+            vec!["db-1", "cache-1"]
+        );
     }
 
     #[test]

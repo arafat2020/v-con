@@ -95,7 +95,8 @@ pub fn command_line(args: &[String]) -> String {
 ///
 /// Plain names are looked up in `hosts` and the walk follows each hop's own
 /// jump. A raw `user@host[:port]` stops the walk. A repeated name stops it too,
-/// so an invalid cycle cannot loop forever.
+/// so an invalid cycle cannot loop forever. The hop's identity file is not
+/// included: ssh-agent or `~/.ssh/config` authenticates the bastion.
 pub fn jump_chain(host: &EffectiveHost, hosts: &[EffectiveHost]) -> Vec<String> {
     let mut chain = Vec::new();
     let mut seen = HashSet::from([host.name.clone()]);
@@ -107,6 +108,32 @@ pub fn jump_chain(host: &EffectiveHost, hosts: &[EffectiveHost]) -> Vec<String> 
             }
             if let Some(hop) = hosts.iter().find(|candidate| candidate.name == jump) {
                 chain.push(jump_destination(hop));
+                next = hop.jump.clone();
+                continue;
+            }
+        }
+        chain.push(jump);
+        break;
+    }
+    chain.reverse();
+    chain
+}
+
+/// Jump names for the connect banner, client first.
+///
+/// A plain name stays a name (`bastion`). A raw `user@host[:port]` is kept as
+/// written. The order matches [`jump_chain`].
+pub fn jump_labels(host: &EffectiveHost, hosts: &[EffectiveHost]) -> Vec<String> {
+    let mut chain = Vec::new();
+    let mut seen = HashSet::from([host.name.clone()]);
+    let mut next = host.jump.clone();
+    while let Some(jump) = next {
+        if is_plain_jump(&jump) {
+            if !seen.insert(jump.clone()) {
+                break;
+            }
+            if let Some(hop) = hosts.iter().find(|candidate| candidate.name == jump) {
+                chain.push(jump.clone());
                 next = hop.jump.clone();
                 continue;
             }

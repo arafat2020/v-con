@@ -9,29 +9,37 @@ use crate::config::Config;
 use crate::domain::host::{EffectiveHost, Problem};
 use crate::error::Error;
 use crate::infra::ssh::command::{SshCommandOptions, build_ssh_command, command_line};
+use crate::infra::ssh::system::{self, missing_ssh_message};
+use crate::infra::state_store::{self, AppState};
 use crate::paths::Paths;
-use crate::services::inventory::InventoryBundle;
-use crate::tui::action::{Action, UiCommand};
+use crate::services::connect::{self, ConnectPlan};
+use crate::services::inventory::{self, InventoryBundle};
+use crate::tui::action::{Action, ConnectHandoff, EditorHandoff, Handoff, UiCommand};
 use crate::tui::keymap::Keymap;
 use crate::tui::screens::hosts::{self, HostsView, ViewOptions};
 use crate::tui::theme::Theme;
+use chrono::Utc;
 use crossterm::event::{KeyCode, KeyModifiers};
 use ratatui::Frame;
 use ratatui::layout::{Constraint, Layout, Rect};
 use ratatui::text::{Line, Span};
 use ratatui::widgets::Paragraph;
+use std::collections::{BTreeMap, BTreeSet};
 use std::path::PathBuf;
+use std::process::ExitStatus;
 use std::time::Duration;
 
 const TABS: [&str; 5] = ["Hosts", "Health", "Files", "Sessions", "Log"];
 
 /// Which popup is on top of the Hosts screen.
-#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+#[derive(Debug, Clone, PartialEq, Eq)]
 pub enum Modal {
     /// Key list. Also includes validation problems when there are any.
     Help,
     /// The validation problems from the last load.
     Problems,
+    /// A failure the user has to dismiss, such as ssh exiting 255.
+    Error(String),
 }
 
 /// Shell state: inventory, keymap, the Hosts screen, and the open modal.
@@ -55,6 +63,9 @@ pub struct App {
     terminal_height: u16,
     mouse: bool,
     frame: Duration,
+    state: AppState,
+    state_path: PathBuf,
+    ssh: Option<PathBuf>,
 }
 
 impl App {
@@ -71,7 +82,10 @@ impl App {
         let keymap = Keymap::from_config(&config.keys)?;
         let view = HostsView::new(&bundle.hosts);
         let frame = Duration::from_millis(1000 / u64::from(config.tui.fps.max(1)));
-        Ok(Self {
+        let state_path = paths.state_file();
+        let (state, warning) = state_store::load(&state_path);
+        let ssh = system::find_program("ssh", std::env::var_os("PATH").as_deref());
+        let mut app = Self {
             hosts: bundle.hosts,
             problems: bundle.problems,
             hosts_path: paths.hosts_file(),
@@ -90,7 +104,19 @@ impl App {
             terminal_height: 24,
             mouse: config.tui.mouse,
             frame,
-        })
+            state,
+            state_path,
+            ssh,
+        };
+        app.refresh_groups();
+        app.apply_start_screen(&config.tui.start_screen);
+        if app.ssh.is_none() {
+            app.modal = Some(Modal::Error(missing_ssh_message().to_string()));
+        }
+        if let Some(warning) = warning {
+            app.toast(warning);
+        }
+        Ok(app)
     }
 
     /// Whether setup should enable mouse capture.
@@ -117,8 +143,16 @@ impl App {
         if code == KeyCode::Char('c') && modifiers.contains(KeyModifiers::CONTROL) {
             return self.update(Action::Quit);
         }
-        if self.modal.is_some() && code == KeyCode::Esc {
-            return self.update(Action::CloseModal);
+        if self.modal.is_some() {
+            if code == KeyCode::Esc {
+                return self.update(Action::CloseModal);
+            }
+            return match self.keymap.lookup(code, modifiers) {
+                Some(action @ (Action::Quit | Action::ToggleHelp | Action::ToggleProblems)) => {
+                    self.update(action)
+                }
+                _ => Vec::new(),
+            };
         }
         if self.screen == 1 && self.view.editing && self.modal.is_none() {
             return match code {
@@ -144,7 +178,12 @@ impl App {
             return Vec::new();
         }
         match action {
-            Action::Quit => self.quit = true,
+            Action::Quit => {
+                self.state
+                    .remember_ui(screen_name(self.screen), &self.view.query);
+                self.quit = true;
+                return vec![UiCommand::Persist];
+            }
             Action::Tick => {
                 if let Some((_, left)) = &mut self.toast {
                     if *left == 0 {
@@ -175,7 +214,17 @@ impl App {
                 }
             }
             Action::CopySshCommand => return self.copy_command(),
-            Action::Connect => self.toast("connect arrives in phase 2"),
+            Action::Connect => return self.connect_command(),
+            Action::ToggleFavorite => return self.toggle_favorite(),
+            Action::ToggleSort => {
+                self.view.sort_frecency = !self.view.sort_frecency;
+                self.toast(if self.view.sort_frecency {
+                    "sorted by frecency"
+                } else {
+                    "sorted in inventory order"
+                });
+            }
+            Action::EditInventory => return self.edit_inventory(),
             Action::FocusTree
             | Action::FocusTable
             | Action::MoveUp
@@ -252,7 +301,7 @@ impl App {
             frame.render_widget(Paragraph::new(message), chunks[1]);
         }
         self.draw_hints(frame, chunks[2]);
-        if let Some(modal) = self.modal {
+        if let Some(modal) = self.modal.clone() {
             self.draw_modal(frame, area, modal);
         }
     }
@@ -282,8 +331,7 @@ impl App {
             message.clone()
         } else {
             let mut hint =
-                " j/k move   h/l focus   / search   space select   y copy   ? help   q quit"
-                    .to_string();
+                " ⏎ connect   j/k move   / search   * fav   E edit   ? help   q quit".to_string();
             if !self.problems.is_empty() {
                 hint.push_str("   v problems");
             }
@@ -296,6 +344,7 @@ impl App {
         let (title, lines) = match modal {
             Modal::Help => ("Help", self.help_lines()),
             Modal::Problems => ("Validation", self.problem_lines()),
+            Modal::Error(message) => ("Error", vec![Line::from(message.clone())]),
         };
         crate::tui::widgets::modal::render(frame, area, title, lines, &self.theme);
     }
@@ -311,6 +360,10 @@ impl App {
             Line::from("ctrl-a           select visible hosts"),
             Line::from("Esc              clear selection"),
             Line::from("y                copy the ssh command"),
+            Line::from("Enter            connect"),
+            Line::from("*                toggle favorite"),
+            Line::from("S                sort by frecency"),
+            Line::from("E                edit hosts.toml"),
             Line::from("v                validation problems"),
             Line::from("?                this help"),
             Line::from("q                quit"),
@@ -351,6 +404,188 @@ impl App {
             },
         ));
         vec![UiCommand::Copy(line)]
+    }
+
+    fn connect_command(&mut self) -> Vec<UiCommand> {
+        let Some(program) = self.ssh.clone() else {
+            self.modal = Some(Modal::Error(missing_ssh_message().to_string()));
+            return Vec::new();
+        };
+        let Some(host) = self.view.cursor(&self.hosts).cloned() else {
+            self.toast("No host selected");
+            return Vec::new();
+        };
+        let ConnectPlan {
+            host_name,
+            banner,
+            args,
+            ..
+        } = connect::plan(&host, &self.hosts, &self.session_options());
+        self.state.record_connect(&host_name, Utc::now());
+        self.refresh_groups();
+        vec![
+            UiCommand::Persist,
+            UiCommand::Suspend(Handoff::Connect(ConnectHandoff {
+                host_name,
+                banner,
+                program,
+                args,
+            })),
+        ]
+    }
+
+    fn toggle_favorite(&mut self) -> Vec<UiCommand> {
+        let Some(name) = self.view.cursor_name.clone() else {
+            self.toast("No host selected");
+            return Vec::new();
+        };
+        let favorite = self.state.toggle_favorite(&name);
+        self.refresh_groups();
+        self.toast(if favorite {
+            format!("{name} is a favorite")
+        } else {
+            format!("{name} is no longer a favorite")
+        });
+        vec![UiCommand::Persist]
+    }
+
+    fn edit_inventory(&mut self) -> Vec<UiCommand> {
+        let (program, args) = connect::editor_command(&self.hosts_path);
+        vec![UiCommand::Suspend(Handoff::Editor(EditorHandoff {
+            program,
+            args,
+        }))]
+    }
+
+    fn session_options(&self) -> SshCommandOptions {
+        connect::session_options(self.multiplexing, &self.control_dir)
+    }
+
+    /// Copy recent, favorite, and frecency data onto the host table.
+    pub fn refresh_groups(&mut self) {
+        let now = Utc::now();
+        let present: BTreeSet<String> = self.hosts.iter().map(|host| host.name.clone()).collect();
+        let recent_order = self
+            .state
+            .recent_names()
+            .into_iter()
+            .filter(|name| present.contains(name))
+            .collect();
+        let favorites = self
+            .state
+            .favorite_names()
+            .into_iter()
+            .filter(|name| present.contains(name))
+            .collect();
+        let mut last_seen = BTreeMap::new();
+        let mut scores = BTreeMap::new();
+        for host in &self.hosts {
+            if let Some(label) = self.state.age_label(&host.name, now) {
+                last_seen.insert(host.name.clone(), label);
+            }
+            let score = self.state.score(&host.name, now);
+            if score > 0 {
+                scores.insert(host.name.clone(), score);
+            }
+        }
+        self.view
+            .apply_groups(recent_order, favorites, last_seen, scores);
+    }
+
+    fn apply_start_screen(&mut self, start_screen: &str) {
+        let saved = start_screen == "last";
+        let name = if saved {
+            self.state.ui.last_screen.as_str()
+        } else {
+            start_screen
+        };
+        if saved && !self.state.ui.last_filter.is_empty() {
+            self.view.query = self.state.ui.last_filter.clone();
+            self.view.refresh(&self.hosts);
+        }
+        if let Some(screen) = screen_index(name) {
+            self.screen = screen;
+        }
+    }
+
+    /// Reload `hosts.toml` after the editor closes.
+    pub fn reload_inventory(&mut self) {
+        match inventory::load_hosts(&self.hosts_path, &crate::paths::local_user()) {
+            Ok(bundle) => {
+                let problems = bundle.problems.len();
+                self.hosts = bundle.hosts;
+                self.problems = bundle.problems;
+                self.view
+                    .selected
+                    .retain(|name| self.hosts.iter().any(|host| &host.name == name));
+                self.refresh_groups();
+                self.view.refresh(&self.hosts);
+                if problems == 0 {
+                    self.toast("reloaded hosts.toml");
+                } else {
+                    self.toast(format!("reloaded hosts.toml with {problems} problems"));
+                }
+            }
+            Err(error) => self.modal = Some(Modal::Error(error.to_string())),
+        }
+        self.dirty = true;
+    }
+
+    /// Show a modal when ssh could not start a shell.
+    pub fn note_session_exit(&mut self, status: &ExitStatus) {
+        match status.code() {
+            Some(255) => {
+                self.modal = Some(Modal::Error(
+                    "ssh exited with code 255. The session failed before a shell started."
+                        .to_string(),
+                ));
+            }
+            Some(_) => {}
+            None => self.toast("ssh was interrupted"),
+        }
+        self.dirty = true;
+    }
+
+    /// Show a modal when the ssh process could not be spawned.
+    pub fn note_session_error(&mut self, error: &std::io::Error) {
+        self.show_error(format!("could not start ssh: {error}"));
+    }
+
+    /// Open an error modal. Esc dismisses it.
+    pub fn show_error(&mut self, message: impl Into<String>) {
+        self.modal = Some(Modal::Error(message.into()));
+        self.dirty = true;
+    }
+
+    /// In-memory state the event loop writes on [`UiCommand::Persist`].
+    pub fn state(&self) -> &AppState {
+        &self.state
+    }
+
+    /// Path of `state.json`.
+    pub fn state_path(&self) -> &std::path::Path {
+        &self.state_path
+    }
+}
+
+fn screen_name(screen: u8) -> &'static str {
+    match screen {
+        1 => "hosts",
+        2 => "health",
+        3 => "files",
+        4 => "sessions",
+        _ => "log",
+    }
+}
+
+fn screen_index(name: &str) -> Option<u8> {
+    match name {
+        "hosts" => Some(1),
+        "health" => Some(2),
+        "files" => Some(3),
+        "sessions" => Some(4),
+        "log" => Some(5),
+        _ => None,
     }
 }
 
@@ -443,6 +678,9 @@ mod tests {
             terminal_height: 24,
             mouse: false,
             frame: Duration::from_millis(33),
+            state: AppState::default(),
+            state_path: PathBuf::from("/tmp/vcon-state.json"),
+            ssh: Some(PathBuf::from("ssh")),
         }
     }
 
@@ -547,6 +785,15 @@ mod tests {
     }
 
     #[test]
+    fn missing_ssh_opens_an_error_modal_instead_of_connecting() {
+        let mut app = preview(fleet());
+        app.ssh = None;
+        let commands = app.on_key(KeyCode::Enter, KeyModifiers::NONE);
+        assert!(commands.is_empty());
+        assert!(matches!(app.modal, Some(Modal::Error(ref text)) if text.contains("PATH")));
+    }
+
+    #[test]
     fn snapshot_full_list() {
         let mut app = preview(fleet());
         app.view.cursor_name = Some("web-1".into());
@@ -589,5 +836,136 @@ mod tests {
         assert!(!screen.contains("Detail"));
         assert!(screen.contains("web-1"));
         insta::assert_snapshot!(screen);
+    }
+
+    #[test]
+    fn enter_requests_ssh_without_moving_the_cursor() {
+        let mut app = preview(fleet());
+        app.view.cursor_name = Some("web-1".into());
+        app.view.query = "web".into();
+        app.view.selected.insert("web-1".into());
+        let commands = app.on_key(KeyCode::Enter, KeyModifiers::NONE);
+        assert_eq!(app.view.cursor_name.as_deref(), Some("web-1"));
+        assert_eq!(app.view.query, "web");
+        assert!(app.view.selected.contains("web-1"));
+        assert_eq!(app.state().hosts["web-1"].connect_count, 1);
+        match commands.as_slice() {
+            [
+                UiCommand::Persist,
+                UiCommand::Suspend(Handoff::Connect(handoff)),
+            ] => {
+                assert!(handoff.banner.contains("via bastion"), "{}", handoff.banner);
+                assert!(handoff.args.iter().any(|arg| arg == "deploy@203.0.113.10"));
+            }
+            other => panic!("expected a connect handoff, got {other:?}"),
+        }
+        app.view.scope = hosts::HostScope::Recent;
+        let names: Vec<_> = app
+            .view
+            .output(&app.hosts)
+            .matches
+            .iter()
+            .map(|matched| app.hosts[matched.index].name.as_str())
+            .collect();
+        assert_eq!(names, ["web-1"]);
+    }
+
+    #[test]
+    fn star_toggles_a_favorite_and_sorts_by_frecency() {
+        let mut app = preview(fleet());
+        app.view.cursor_name = Some("db-1".into());
+        let commands = app.on_key(KeyCode::Char('*'), KeyModifiers::SHIFT);
+        assert!(matches!(commands.as_slice(), [UiCommand::Persist]));
+        assert!(app.view.favorites.contains("db-1"));
+        app.view.scope = hosts::HostScope::Favorites;
+        let names: Vec<_> = app
+            .view
+            .output(&app.hosts)
+            .matches
+            .iter()
+            .map(|matched| app.hosts[matched.index].name.as_str())
+            .collect();
+        assert_eq!(names, ["db-1"]);
+
+        let now = Utc::now();
+        app.state
+            .record_connect("bastion", now - chrono::TimeDelta::days(40));
+        app.state
+            .record_connect("bastion", now - chrono::TimeDelta::days(40));
+        app.state.record_connect("db-1", now);
+        app.refresh_groups();
+        app.view.scope = hosts::HostScope::All;
+        app.on_key(KeyCode::Char('S'), KeyModifiers::SHIFT);
+        let names: Vec<_> = app
+            .view
+            .output(&app.hosts)
+            .matches
+            .iter()
+            .map(|matched| app.hosts[matched.index].name.as_str())
+            .collect();
+        assert_eq!(names[0], "db-1");
+    }
+
+    #[test]
+    fn last_filter_is_restored_when_start_screen_is_last() {
+        let mut app = preview(fleet());
+        app.state.remember_ui("hosts", "@db");
+        app.apply_start_screen("last");
+        assert_eq!(app.view.query, "@db");
+        let names: Vec<_> = app
+            .view
+            .output(&app.hosts)
+            .matches
+            .iter()
+            .map(|matched| app.hosts[matched.index].name.as_str())
+            .collect();
+        assert_eq!(names, ["db-1", "db-3"]);
+    }
+
+    #[test]
+    fn ssh_255_opens_an_error_modal() {
+        let mut app = preview(fleet());
+        let status = std::process::Command::new("sh")
+            .arg("-c")
+            .arg("exit 255")
+            .status()
+            .unwrap();
+        app.note_session_exit(&status);
+        assert!(matches!(app.modal, Some(Modal::Error(ref text)) if text.contains("255")));
+        app.on_key(KeyCode::Enter, KeyModifiers::NONE);
+        assert!(app.modal.is_some());
+        app.on_key(KeyCode::Esc, KeyModifiers::NONE);
+        assert!(app.modal.is_none());
+    }
+
+    #[test]
+    fn editor_handoff_targets_the_inventory_file() {
+        let mut app = preview(fleet());
+        let commands = app.on_key(KeyCode::Char('E'), KeyModifiers::NONE);
+        match commands.as_slice() {
+            [UiCommand::Suspend(Handoff::Editor(handoff))] => {
+                assert_eq!(
+                    handoff.args.last().map(String::as_str),
+                    Some("~/.config/vcon/hosts.toml")
+                );
+            }
+            other => panic!("expected an editor handoff, got {other:?}"),
+        }
+    }
+
+    #[test]
+    fn reload_picks_up_a_new_host() {
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join("hosts.toml");
+        std::fs::write(
+            &path,
+            "[[hosts]]\nname = \"added\"\naddress = \"203.0.113.9\"\n",
+        )
+        .unwrap();
+        let mut app = preview(fleet());
+        app.hosts_path = path;
+        app.reload_inventory();
+        assert!(app.hosts.iter().any(|host| host.name == "added"));
+        assert!(app.toast.as_ref().unwrap().0.contains("reloaded"));
     }
 }

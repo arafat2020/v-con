@@ -4,6 +4,7 @@
 //! and the TUI share one implementation. Later phases add health, tunnels, and
 //! snippets beside them.
 
+pub mod activity;
 pub mod filter;
 mod health;
 pub mod host;
