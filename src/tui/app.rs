@@ -8,15 +8,20 @@
 use crate::config::Config;
 use crate::domain::host::{EffectiveHost, Host, Inventory, Problem};
 use crate::error::Error;
-use crate::infra::ssh::command::{SshCommandOptions, build_ssh_command, command_line};
+use crate::infra::ssh::command::{
+    SshCommandOptions, build_ssh_command, command_line, exec_arguments,
+};
 use crate::infra::ssh::system::{self, missing_ssh_message};
 use crate::infra::ssh_config;
 use crate::infra::state_store::{self, AppState};
 use crate::paths::Paths;
 use crate::services::connect::{self, ConnectPlan};
+use crate::services::exec::{self as job, ExecSettings};
 use crate::services::inventory::{self, InventoryBundle};
 use crate::tui::action::{Action, ConnectHandoff, EditorHandoff, Handoff, UiCommand};
 use crate::tui::keymap::Keymap;
+use crate::tui::screens::exec as exec_ui;
+use crate::tui::screens::exec::{Confirm, Prompt, PromptEvent, Results, ResultsEvent};
 use crate::tui::screens::host_form::{self, HostFormEvent};
 use crate::tui::screens::hosts::{self, HostsView, ViewOptions};
 use crate::tui::screens::import::{self, ImportEvent};
@@ -76,6 +81,13 @@ pub struct App {
     state: AppState,
     state_path: PathBuf,
     ssh: Option<PathBuf>,
+    parallel: usize,
+    confirm_threshold: usize,
+    protected_tags: Vec<String>,
+    exec_prompt: Option<Prompt>,
+    exec_confirm: Option<Confirm>,
+    exec_results: Option<Results>,
+    exec_visible: bool,
 }
 
 impl App {
@@ -118,6 +130,13 @@ impl App {
             state,
             state_path,
             ssh,
+            parallel: config.parallel.max(1),
+            confirm_threshold: config.confirm_threshold,
+            protected_tags: config.protected_tags.clone(),
+            exec_prompt: None,
+            exec_confirm: None,
+            exec_results: None,
+            exec_visible: false,
         };
         app.refresh_groups();
         app.apply_start_screen(&config.tui.start_screen);
@@ -154,6 +173,12 @@ impl App {
         if code == KeyCode::Char('c') && modifiers.contains(KeyModifiers::CONTROL) {
             return self.update(Action::Quit);
         }
+        if self.exec_confirm.is_some() {
+            return self.exec_confirm_key(code);
+        }
+        if self.exec_prompt.is_some() {
+            return self.exec_prompt_key(code, modifiers);
+        }
         if self.modal.is_some() {
             if matches!(self.modal, Some(Modal::HostForm(_))) {
                 return self.host_form_key(code, modifiers);
@@ -173,6 +198,9 @@ impl App {
                 }
                 _ => Vec::new(),
             };
+        }
+        if self.exec_visible {
+            return self.exec_results_key(code);
         }
         if self.screen == 1 && self.view.editing && self.modal.is_none() {
             return match code {
@@ -202,9 +230,22 @@ impl App {
                 self.state
                     .remember_ui(screen_name(self.screen), &self.view.query);
                 self.quit = true;
-                return vec![UiCommand::Persist];
+                let mut commands = vec![UiCommand::Persist];
+                if self
+                    .exec_results
+                    .as_ref()
+                    .is_some_and(|results| results.running)
+                {
+                    commands.insert(0, UiCommand::CancelExec);
+                }
+                return commands;
             }
             Action::Tick => {
+                if let Some(results) = &mut self.exec_results
+                    && results.running
+                {
+                    results.spinner = results.spinner.wrapping_add(1);
+                }
                 if let Some((_, left)) = &mut self.toast {
                     if *left == 0 {
                         self.toast = None;
@@ -250,6 +291,8 @@ impl App {
             Action::DuplicateHost => self.open_duplicate(),
             Action::DeleteHost => self.open_delete(),
             Action::ImportHosts => self.open_import(),
+            Action::Exec => self.open_exec(),
+            Action::ShowExec => self.show_exec(),
             Action::FocusTree
             | Action::FocusTable
             | Action::MoveUp
@@ -326,6 +369,17 @@ impl App {
             frame.render_widget(Paragraph::new(message), chunks[1]);
         }
         self.draw_hints(frame, chunks[2]);
+        if self.exec_visible
+            && let Some(results) = &self.exec_results
+        {
+            exec_ui::draw_results(frame, area, results, &self.theme);
+        }
+        if let Some(prompt) = &self.exec_prompt {
+            exec_ui::draw_prompt(frame, area, prompt, &self.theme);
+        }
+        if let Some(confirm) = &self.exec_confirm {
+            exec_ui::draw_confirm(frame, area, confirm, &self.theme);
+        }
         if let Some(modal) = self.modal.clone() {
             self.draw_modal(frame, area, modal);
         }
@@ -356,7 +410,30 @@ impl App {
             message.clone()
         } else {
             let mut hint =
-                " ⏎ connect   a add   e edit   d del   i import   ? help   q quit".to_string();
+                " ⏎ connect   x exec   a add   e edit   d del   ? help   q quit".to_string();
+            if self
+                .exec_results
+                .as_ref()
+                .is_some_and(|results| results.running && !self.exec_visible)
+            {
+                let done = self
+                    .exec_results
+                    .as_ref()
+                    .map(|results| {
+                        results
+                            .rows
+                            .iter()
+                            .filter(|row| row.outcome.is_some())
+                            .count()
+                    })
+                    .unwrap_or(0);
+                let total = self
+                    .exec_results
+                    .as_ref()
+                    .map(|results| results.rows.len())
+                    .unwrap_or(0);
+                hint = format!(" exec {done}/{total}   {hint}");
+            }
             if !self.problems.is_empty() {
                 hint.push_str("   v problems");
             }
@@ -406,6 +483,8 @@ impl App {
             Line::from("D                duplicate the cursor host"),
             Line::from("d                delete the cursor host"),
             Line::from("i                import ~/.ssh/config"),
+            Line::from("x                run a command on the selection"),
+            Line::from("X                reopen exec results"),
             Line::from("*                toggle favorite"),
             Line::from("S                sort by frecency"),
             Line::from("E                edit hosts.toml"),
@@ -792,6 +871,216 @@ impl App {
         }
     }
 
+    fn open_exec(&mut self) {
+        if self.screen != 1 {
+            return;
+        }
+        if self
+            .exec_results
+            .as_ref()
+            .is_some_and(|results| results.running)
+        {
+            self.toast("an exec is already running");
+            self.exec_visible = true;
+            return;
+        }
+        let targets = self.exec_targets();
+        if targets.is_empty() {
+            self.toast("No host selected");
+            return;
+        }
+        self.exec_prompt = Some(Prompt::new(
+            targets.into_iter().map(|host| host.name).collect(),
+            self.state.ui.exec_history.clone(),
+        ));
+        self.exec_confirm = None;
+    }
+
+    fn show_exec(&mut self) {
+        if self.exec_results.is_some() {
+            self.exec_visible = true;
+        } else {
+            self.toast("no exec to show");
+        }
+    }
+
+    fn exec_targets(&self) -> Vec<EffectiveHost> {
+        if !self.view.selected.is_empty() {
+            return self
+                .hosts
+                .iter()
+                .filter(|host| self.view.selected.contains(&host.name))
+                .cloned()
+                .collect();
+        }
+        self.view.cursor(&self.hosts).cloned().into_iter().collect()
+    }
+
+    fn exec_prompt_key(&mut self, code: KeyCode, modifiers: KeyModifiers) -> Vec<UiCommand> {
+        let Some(mut prompt) = self.exec_prompt.take() else {
+            return Vec::new();
+        };
+        match exec_ui::prompt_on_key(&mut prompt, code, modifiers) {
+            PromptEvent::Continue => {
+                self.exec_prompt = Some(prompt);
+                Vec::new()
+            }
+            PromptEvent::Cancel => Vec::new(),
+            PromptEvent::Submit {
+                command,
+                sudo,
+                timeout,
+            } => self.stage_exec(command, sudo, timeout),
+        }
+    }
+
+    fn exec_confirm_key(&mut self, code: KeyCode) -> Vec<UiCommand> {
+        match code {
+            KeyCode::Char('y') | KeyCode::Char('Y') => {
+                let Some(confirm) = self.exec_confirm.take() else {
+                    return Vec::new();
+                };
+                self.start_exec(
+                    confirm.command,
+                    confirm.sudo,
+                    confirm.timeout,
+                    confirm.hosts,
+                )
+            }
+            KeyCode::Char('n') | KeyCode::Char('N') | KeyCode::Esc => {
+                self.exec_confirm = None;
+                Vec::new()
+            }
+            _ => Vec::new(),
+        }
+    }
+
+    fn exec_results_key(&mut self, code: KeyCode) -> Vec<UiCommand> {
+        let Some(results) = self.exec_results.as_mut() else {
+            self.exec_visible = false;
+            return Vec::new();
+        };
+        let event = exec_ui::results_on_key(results, code);
+        match event {
+            ResultsEvent::Continue => Vec::new(),
+            ResultsEvent::Close => {
+                self.exec_visible = false;
+                Vec::new()
+            }
+            ResultsEvent::Cancel => vec![UiCommand::CancelExec],
+            ResultsEvent::Copy(text) => vec![UiCommand::Copy(text)],
+            ResultsEvent::Rerun(names) => {
+                if self
+                    .exec_results
+                    .as_ref()
+                    .is_some_and(|results| results.running)
+                {
+                    self.toast("an exec is already running");
+                    return Vec::new();
+                }
+                let Some(results) = self.exec_results.clone() else {
+                    return Vec::new();
+                };
+                let hosts = self
+                    .hosts
+                    .iter()
+                    .filter(|host| names.iter().any(|name| name == &host.name))
+                    .cloned()
+                    .collect();
+                self.start_exec(results.command, results.sudo, results.timeout, hosts)
+            }
+        }
+    }
+
+    fn stage_exec(&mut self, command: String, sudo: bool, timeout: Duration) -> Vec<UiCommand> {
+        let hosts = self.exec_targets();
+        if hosts.is_empty() {
+            self.toast("No host selected");
+            self.exec_prompt = None;
+            return Vec::new();
+        }
+        let settings = ExecSettings {
+            confirm_threshold: self.confirm_threshold,
+            protected_tags: self.protected_tags.clone(),
+        };
+        if let Some(reason) = job::needs_confirmation(&hosts, &settings) {
+            self.exec_prompt = None;
+            self.exec_confirm = Some(Confirm {
+                command,
+                sudo,
+                timeout,
+                hosts,
+                reason: reason.message(),
+            });
+            return Vec::new();
+        }
+        self.start_exec(command, sudo, timeout, hosts)
+    }
+
+    fn start_exec(
+        &mut self,
+        command: String,
+        sudo: bool,
+        timeout: Duration,
+        hosts: Vec<EffectiveHost>,
+    ) -> Vec<UiCommand> {
+        let Some(program) = self.ssh.clone() else {
+            self.show_error(missing_ssh_message().to_string());
+            self.exec_prompt = None;
+            self.exec_confirm = None;
+            return Vec::new();
+        };
+        if hosts.is_empty() {
+            self.toast("No host selected");
+            return Vec::new();
+        }
+        let remote = job::remote_command(&command, sudo);
+        let connect_timeout = (timeout.as_secs() > 0).then_some(timeout.as_secs());
+        let control = self.control_dir.display().to_string();
+        let names: Vec<String> = hosts.iter().map(|host| host.name.clone()).collect();
+        let targets = hosts
+            .iter()
+            .map(|host| job::HostTarget {
+                name: host.name.clone(),
+                args: exec_arguments(
+                    host,
+                    &self.hosts,
+                    connect_timeout,
+                    self.multiplexing,
+                    Some(&control),
+                    &remote,
+                ),
+            })
+            .collect();
+        job::push_history(&mut self.state.ui.exec_history, &command);
+        self.exec_results = Some(Results::starting(command, sudo, timeout, &names));
+        self.exec_visible = true;
+        self.exec_prompt = None;
+        self.exec_confirm = None;
+        vec![
+            UiCommand::StartExec(job::ExecLaunch {
+                program,
+                targets,
+                timeout,
+                parallel: self.parallel,
+            }),
+            UiCommand::Persist,
+        ]
+    }
+
+    /// Fold one exec event into the results view.
+    pub fn apply_exec_event(&mut self, event: job::JobEvent) {
+        if let Some(results) = &mut self.exec_results {
+            results.apply(event);
+        }
+        self.dirty = true;
+    }
+
+    /// True while the results popup is on screen. The clipboard toast uses this.
+    pub fn exec_visible(&self) -> bool {
+        self.exec_visible
+    }
+
     /// Show a modal when ssh could not start a shell.
     pub fn note_session_exit(&mut self, status: &ExitStatus) {
         match status.code() {
@@ -943,6 +1232,13 @@ mod tests {
             state: AppState::default(),
             state_path: PathBuf::from("/tmp/vcon-state.json"),
             ssh: Some(PathBuf::from("ssh")),
+            parallel: 10,
+            confirm_threshold: 5,
+            protected_tags: Vec::new(),
+            exec_prompt: None,
+            exec_confirm: None,
+            exec_results: None,
+            exec_visible: false,
         }
     }
 
@@ -1342,6 +1638,42 @@ jump = "web-1"
         assert_eq!(
             copy.ssh_options.get("ForwardAgent").map(String::as_str),
             Some("yes")
+        );
+    }
+
+    #[test]
+    fn exec_confirms_a_protected_tag_and_q_stays_in_the_prompt() {
+        let mut app = preview(fleet());
+        app.on_key(KeyCode::Char('x'), KeyModifiers::NONE);
+        app.on_key(KeyCode::Char('q'), KeyModifiers::NONE);
+        assert!(!app.quit());
+        assert_eq!(app.exec_prompt.as_ref().unwrap().command, "q");
+        app.on_key(KeyCode::Esc, KeyModifiers::NONE);
+        assert!(app.exec_prompt.is_none());
+
+        app.protected_tags = vec!["prod".to_string()];
+        app.view.cursor_name = Some("web-1".to_string());
+        app.on_key(KeyCode::Char('x'), KeyModifiers::NONE);
+        for ch in "uptime".chars() {
+            app.on_key(KeyCode::Char(ch), KeyModifiers::NONE);
+        }
+        let commands = app.on_key(KeyCode::Enter, KeyModifiers::NONE);
+        assert!(commands.is_empty());
+        assert!(app.exec_confirm.as_ref().unwrap().reason.contains("prod"));
+        let commands = app.on_key(KeyCode::Char('y'), KeyModifiers::NONE);
+        assert!(commands.iter().any(|command| matches!(command, UiCommand::StartExec(launch) if launch.targets.len() == 1 && launch.targets[0].args.last().map(String::as_str) == Some("uptime"))));
+        assert!(app.exec_visible);
+        let commands = app.on_key(KeyCode::Esc, KeyModifiers::NONE);
+        assert!(commands.is_empty());
+        assert!(!app.exec_visible);
+        assert!(app.exec_results.as_ref().unwrap().running);
+        app.on_key(KeyCode::Char('X'), KeyModifiers::NONE);
+        assert!(app.exec_visible);
+        let commands = app.on_key(KeyCode::Char('c'), KeyModifiers::NONE);
+        assert!(
+            commands
+                .iter()
+                .any(|command| matches!(command, UiCommand::CancelExec))
         );
     }
 }

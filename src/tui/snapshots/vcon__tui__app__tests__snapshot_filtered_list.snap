@@ -25,4 +25,4 @@ expression: screen
 │ssh -J admin@198.51.100.5 deploy@203.0.113.10                                 │
 │                                                                              │
 └──────────────────────────────────────────────────────────────────────────────┘
- ⏎ connect   a add   e edit   d del   i import   ? help   q quit
+ ⏎ connect   x exec   a add   e edit   d del   ? help   q quit

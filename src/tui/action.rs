@@ -72,17 +72,25 @@ pub enum Action {
     DeleteHost,
     /// Open the ssh config import screen.
     ImportHosts,
+    /// Open the exec prompt for the selection, or the cursor host.
+    Exec,
+    /// Reopen the exec results view.
+    ShowExec,
 }
 
 /// Work the event loop performs after `update` returns.
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub enum UiCommand {
-    /// Copy this shell command to the clipboard.
+    /// Copy this text to the clipboard.
     Copy(String),
     /// Write the in-memory state file.
     Persist,
     /// Leave the TUI, run a child with the real terminal, then come back.
     Suspend(Handoff),
+    /// Start a parallel exec. The loop owns the child processes.
+    StartExec(crate::services::exec::ExecLaunch),
+    /// Kill the running exec and mark hosts that have not started as skipped.
+    CancelExec,
 }
 
 /// A child process that needs the real terminal.

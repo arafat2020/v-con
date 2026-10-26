@@ -13,4 +13,4 @@ expression: screen
 │                                      │
 │                                      │
 └──────────────────────────────────────┘
- ⏎ connect   a add   e edit   d del   i
+ ⏎ connect   x exec   a add   e edit   d

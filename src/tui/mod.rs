@@ -20,6 +20,7 @@ use crate::infra::ssh::backend::SshBackend;
 use crate::infra::ssh::system::SystemSsh;
 use crate::infra::state_store;
 use crate::paths::Paths;
+use crate::services::exec::{self as job, ExecLaunch};
 use crate::services::inventory::InventoryBundle;
 use crate::tui::action::{Action, Handoff, UiCommand};
 use crate::tui::app::App;
@@ -27,8 +28,11 @@ use crossterm::event::{Event, EventStream, KeyEventKind};
 use futures::StreamExt;
 use std::io::{self, Write};
 use std::process::{Command, Stdio};
+use std::sync::Arc;
 use std::time::Duration;
+use tokio::sync::mpsc;
 use tokio::time::MissedTickBehavior;
+use tokio_util::sync::CancellationToken;
 
 /// Open the Hosts screen and run until the user quits.
 ///
@@ -56,6 +60,7 @@ async fn event_loop(
     let mut events = EventStream::new();
     let mut tick = tokio::time::interval(Duration::from_millis(250));
     let mut render = tokio::time::interval(frame);
+    let mut job: Option<LiveExec> = None;
     tick.set_missed_tick_behavior(MissedTickBehavior::Skip);
     render.set_missed_tick_behavior(MissedTickBehavior::Skip);
     if let Ok(size) = terminal.size() {
@@ -64,21 +69,45 @@ async fn event_loop(
 
     loop {
         if app.quit() {
+            if let Some(live) = job.take() {
+                live.cancel.cancel();
+                let _ = tokio::time::timeout(Duration::from_secs(2), live.task).await;
+            }
             break;
         }
-        let mut handoff = None;
+        let mut effects = Effects::default();
         tokio::select! {
             biased;
             event = events.next() => {
                 match event {
                     Some(Ok(Event::Key(key))) if key.kind == KeyEventKind::Press || key.kind == KeyEventKind::Repeat => {
                         let commands = app.on_key(key.code, key.modifiers);
-                        handoff = apply_commands(app, commands);
+                        effects = apply_commands(app, commands);
                     }
                     Some(Ok(Event::Resize(width, height))) => app.note_size(width, height),
                     Some(Ok(_)) => {}
                     Some(Err(error)) => return Err(Error::Message(error.to_string())),
                     None => break,
+                }
+            }
+            exec_event = recv_exec(&mut job) => {
+                match exec_event {
+                    Some(event) => {
+                        app.apply_exec_event(event);
+                        if let Some(live) = job.as_mut() {
+                            for _ in 0..200 {
+                                match live.events.try_recv() {
+                                    Ok(event) => app.apply_exec_event(event),
+                                    Err(_) => break,
+                                }
+                            }
+                        }
+                    }
+                    None => {
+                        if let Some(live) = job.take() {
+                            let _ = live.task.await;
+                        }
+                    }
                 }
             }
             _ = tick.tick() => {
@@ -91,7 +120,19 @@ async fn event_loop(
                 app.dirty = false;
             }
         }
-        if let Some(handoff) = handoff {
+        if effects.cancel
+            && let Some(live) = &job
+        {
+            live.cancel.cancel();
+        }
+        if let Some(launch) = effects.start {
+            if let Some(live) = job.take() {
+                live.cancel.cancel();
+                let _ = tokio::time::timeout(Duration::from_secs(2), live.task).await;
+            }
+            job = Some(spawn_exec(launch));
+        }
+        if let Some(handoff) = effects.handoff {
             drop(events);
             run_handoff(terminal, app, handoff).await?;
             events = EventStream::new();
@@ -101,23 +142,75 @@ async fn event_loop(
     Ok(())
 }
 
-fn apply_commands(app: &mut App, commands: Vec<UiCommand>) -> Option<Handoff> {
-    let mut handoff = None;
+struct LiveExec {
+    cancel: CancellationToken,
+    events: mpsc::Receiver<job::JobEvent>,
+    task: tokio::task::JoinHandle<()>,
+}
+
+#[derive(Default)]
+struct Effects {
+    handoff: Option<Handoff>,
+    start: Option<ExecLaunch>,
+    cancel: bool,
+}
+
+fn spawn_exec(launch: ExecLaunch) -> LiveExec {
+    let cancel = CancellationToken::new();
+    let token = cancel.clone();
+    let (tx, events) = mpsc::channel(128);
+    let task = tokio::spawn(async move {
+        let runner = Arc::new(SystemSsh::new(launch.program));
+        job::run_job(
+            runner,
+            launch.targets,
+            launch.timeout,
+            launch.parallel,
+            token,
+            tx,
+        )
+        .await;
+    });
+    LiveExec {
+        cancel,
+        events,
+        task,
+    }
+}
+
+async fn recv_exec(job: &mut Option<LiveExec>) -> Option<job::JobEvent> {
+    match job {
+        Some(job) => job.events.recv().await,
+        None => std::future::pending().await,
+    }
+}
+
+fn apply_commands(app: &mut App, commands: Vec<UiCommand>) -> Effects {
+    let mut effects = Effects::default();
     for command in commands {
         match command {
-            UiCommand::Copy(text) => match copy_to_clipboard(&text) {
-                Ok(()) => app.toast("Copied ssh command"),
-                Err(error) => app.toast(error),
-            },
+            UiCommand::Copy(text) => {
+                let label = if app.exec_visible() {
+                    "Copied output"
+                } else {
+                    "Copied ssh command"
+                };
+                match copy_to_clipboard(&text) {
+                    Ok(()) => app.toast(label),
+                    Err(error) => app.toast(error),
+                }
+            }
             UiCommand::Persist => {
                 if let Err(error) = state_store::save(app.state_path(), app.state()) {
                     app.toast(format!("could not save state: {error}"));
                 }
             }
-            UiCommand::Suspend(next) => handoff = Some(next),
+            UiCommand::Suspend(next) => effects.handoff = Some(next),
+            UiCommand::StartExec(launch) => effects.start = Some(launch),
+            UiCommand::CancelExec => effects.cancel = true,
         }
     }
-    handoff
+    effects
 }
 
 async fn run_handoff(

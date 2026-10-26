@@ -4,7 +4,7 @@ pub mod check;
 mod completions;
 pub mod connect;
 mod doctor;
-mod exec;
+pub mod exec;
 pub mod import;
 pub mod init;
 pub mod list;

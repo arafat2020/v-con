@@ -83,6 +83,31 @@ pub fn build_ssh_command(
     args
 }
 
+/// Arguments after the ssh binary for a non-interactive command.
+///
+/// `remote_command` is one argv element, so the remote shell parses quotes,
+/// `$VARS`, pipes, and `&&`. BatchMode is always on. `ConnectTimeout` uses
+/// `connect_timeout` when it is set, otherwise the host default.
+pub fn exec_arguments(
+    host: &EffectiveHost,
+    hosts: &[EffectiveHost],
+    connect_timeout: Option<u64>,
+    multiplexing: bool,
+    control_dir: Option<&str>,
+    remote_command: &str,
+) -> Vec<String> {
+    let options = SshCommandOptions {
+        batch_mode: true,
+        connect_timeout,
+        multiplexing,
+        control_path_dir: control_dir.map(str::to_string),
+    };
+    let mut args = build_ssh_command(host, hosts, &options);
+    args.remove(0);
+    args.push(remote_command.to_string());
+    args
+}
+
 /// Shell-quote `args` into one line safe to display and paste.
 pub fn command_line(args: &[String]) -> String {
     args.iter()
@@ -284,5 +309,26 @@ mod tests {
             args.windows(2)
                 .any(|pair| pair == ["-J", "jumpuser@bastion.example:2200"])
         );
+    }
+
+    #[test]
+    fn exec_keeps_the_remote_command_as_one_argument() {
+        let web = host("web-1", "deploy", "203.0.113.10", 22);
+        let command = "echo '$HOME' && true";
+        let args = exec_arguments(
+            &web,
+            std::slice::from_ref(&web),
+            Some(15),
+            true,
+            Some("/tmp/vcon/cm"),
+            command,
+        );
+        assert!(args.windows(2).any(|pair| pair == ["-o", "BatchMode=yes"]));
+        assert!(
+            args.windows(2)
+                .any(|pair| pair == ["-o", "ConnectTimeout=15"])
+        );
+        assert_eq!(args.last().map(String::as_str), Some(command));
+        assert!(!args.iter().any(|arg| arg == "ssh"));
     }
 }

@@ -51,6 +51,9 @@ pub struct UiState {
     /// Search text without the leading `/`.
     #[serde(default)]
     pub last_filter: String,
+    /// Commands typed into the exec prompt, oldest first.
+    #[serde(default)]
+    pub exec_history: Vec<String>,
 }
 
 fn current_version() -> u32 {

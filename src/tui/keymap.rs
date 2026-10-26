@@ -122,6 +122,8 @@ fn defaults() -> HashMap<Binding, Action> {
     );
     bind(KeyCode::Char('d'), KeyModifiers::NONE, Action::DeleteHost);
     bind(KeyCode::Char('i'), KeyModifiers::NONE, Action::ImportHosts);
+    bind(KeyCode::Char('x'), KeyModifiers::NONE, Action::Exec);
+    bind(KeyCode::Char('X'), KeyModifiers::NONE, Action::ShowExec);
     map
 }
 
@@ -143,6 +145,8 @@ fn action_by_name(name: &str) -> Option<Action> {
         "duplicate" => Action::DuplicateHost,
         "delete" => Action::DeleteHost,
         "import" => Action::ImportHosts,
+        "exec" => Action::Exec,
+        "show_exec" => Action::ShowExec,
         "up" => Action::MoveUp,
         "down" => Action::MoveDown,
         _ => return None,
