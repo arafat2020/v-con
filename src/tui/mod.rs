@@ -21,6 +21,7 @@ use crate::infra::ssh::system::SystemSsh;
 use crate::infra::state_store;
 use crate::paths::Paths;
 use crate::services::exec::{self as job, ExecLaunch};
+use crate::services::health::{self as health_svc, HealthControl, HealthEvent};
 use crate::services::inventory::InventoryBundle;
 use crate::tui::action::{Action, Handoff, UiCommand};
 use crate::tui::app::App;
@@ -61,6 +62,7 @@ async fn event_loop(
     let mut tick = tokio::time::interval(Duration::from_millis(250));
     let mut render = tokio::time::interval(frame);
     let mut job: Option<LiveExec> = None;
+    let mut health = spawn_health(app);
     tick.set_missed_tick_behavior(MissedTickBehavior::Skip);
     render.set_missed_tick_behavior(MissedTickBehavior::Skip);
     if let Ok(size) = terminal.size() {
@@ -73,6 +75,10 @@ async fn event_loop(
                 live.cancel.cancel();
                 let _ = tokio::time::timeout(Duration::from_secs(2), live.task).await;
             }
+            if let Some(live) = health.take() {
+                live.cancel.cancel();
+                let _ = tokio::time::timeout(Duration::from_secs(2), live.task).await;
+            }
             break;
         }
         let mut effects = Effects::default();
@@ -82,7 +88,7 @@ async fn event_loop(
                 match event {
                     Some(Ok(Event::Key(key))) if key.kind == KeyEventKind::Press || key.kind == KeyEventKind::Repeat => {
                         let commands = app.on_key(key.code, key.modifiers);
-                        effects = apply_commands(app, commands);
+                        effects = apply_commands(app, commands, health.as_ref());
                     }
                     Some(Ok(Event::Resize(width, height))) => app.note_size(width, height),
                     Some(Ok(_)) => {}
@@ -105,6 +111,29 @@ async fn event_loop(
                     }
                     None => {
                         if let Some(live) = job.take() {
+                            let _ = live.task.await;
+                        }
+                    }
+                }
+            }
+            health_event = recv_health(&mut health) => {
+                match health_event {
+                    Some(event) => {
+                        app.apply_health_event(event);
+                        if let Some(live) = health.as_mut() {
+                            for _ in 0..200 {
+                                match live.events.try_recv() {
+                                    Ok(event) => app.apply_health_event(event),
+                                    Err(_) => break,
+                                }
+                            }
+                        }
+                        if let Err(error) = state_store::save(app.state_path(), app.state()) {
+                            app.toast(format!("could not save state: {error}"));
+                        }
+                    }
+                    None => {
+                        if let Some(live) = health.take() {
                             let _ = live.task.await;
                         }
                     }
@@ -148,6 +177,13 @@ struct LiveExec {
     task: tokio::task::JoinHandle<()>,
 }
 
+struct LiveHealth {
+    cancel: CancellationToken,
+    events: mpsc::Receiver<HealthEvent>,
+    control: mpsc::Sender<HealthControl>,
+    task: tokio::task::JoinHandle<()>,
+}
+
 #[derive(Default)]
 struct Effects {
     handoff: Option<Handoff>,
@@ -185,7 +221,36 @@ async fn recv_exec(job: &mut Option<LiveExec>) -> Option<job::JobEvent> {
     }
 }
 
-fn apply_commands(app: &mut App, commands: Vec<UiCommand>) -> Effects {
+async fn recv_health(job: &mut Option<LiveHealth>) -> Option<HealthEvent> {
+    match job {
+        Some(job) => job.events.recv().await,
+        None => std::future::pending().await,
+    }
+}
+
+fn spawn_health(app: &App) -> Option<LiveHealth> {
+    let (targets, settings, cache) = app.health_bootstrap()?;
+    let cancel = CancellationToken::new();
+    let token = cancel.clone();
+    let (events_tx, events) = mpsc::channel(128);
+    let (control, control_rx) = mpsc::channel(32);
+    let program = settings.program.clone();
+    let task = tokio::spawn(async move {
+        let runner = Arc::new(SystemSsh::new(program));
+        health_svc::run_scheduler(
+            runner, targets, settings, token, control_rx, events_tx, cache,
+        )
+        .await;
+    });
+    Some(LiveHealth {
+        cancel,
+        events,
+        control,
+        task,
+    })
+}
+
+fn apply_commands(app: &mut App, commands: Vec<UiCommand>, health: Option<&LiveHealth>) -> Effects {
     let mut effects = Effects::default();
     for command in commands {
         match command {
@@ -208,6 +273,11 @@ fn apply_commands(app: &mut App, commands: Vec<UiCommand>) -> Effects {
             UiCommand::Suspend(next) => effects.handoff = Some(next),
             UiCommand::StartExec(launch) => effects.start = Some(launch),
             UiCommand::CancelExec => effects.cancel = true,
+            UiCommand::Health(control) => {
+                if let Some(live) = health {
+                    let _ = live.control.try_send(control);
+                }
+            }
         }
     }
     effects

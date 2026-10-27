@@ -6,7 +6,7 @@ mod audit;
 pub mod connect;
 pub mod exec;
 mod files;
-mod health;
+pub mod health;
 pub mod inventory;
 mod sessions;
 mod snippets;

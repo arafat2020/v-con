@@ -2,7 +2,7 @@
 
 pub mod exec;
 mod files;
-mod health;
+pub mod health;
 pub mod host_form;
 pub mod hosts;
 pub mod import;

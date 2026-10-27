@@ -1,7 +1,7 @@
 //! Reusable interface pieces shared by screens.
 
 pub mod form;
-mod gauge;
+pub mod gauge;
 pub mod input;
 pub mod modal;
 mod table;

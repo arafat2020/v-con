@@ -91,6 +91,8 @@ pub enum UiCommand {
     StartExec(crate::services::exec::ExecLaunch),
     /// Kill the running exec and mark hosts that have not started as skipped.
     CancelExec,
+    /// Send a command to the background health scheduler.
+    Health(crate::services::health::HealthControl),
 }
 
 /// A child process that needs the real terminal.

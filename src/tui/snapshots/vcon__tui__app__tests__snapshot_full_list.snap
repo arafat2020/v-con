@@ -4,12 +4,12 @@ expression: screen
 ---
  vcon  1 Hosts  2 Health  3 Files  4 Sessions  5 Log
 ┌ Tags ────────────────┐┌ Hosts ─ 5 ───────────────────────────────────────────┐
-│  all (5)             ││NAME           ADDRESS        USER       TAGS     LAST│
-│  db (2)              ││   bastion     198.51.100.5   admin      infra    —   │
-│  infra (1)           ││>  web-1       203.0.113.10   deploy     web,prod —   │
-│  prod (4)            ││   web-2       203.0.113.11   deploy     web,prod —   │
-│  web (2)             ││   db-1        10.0.0.20      db         db,prod  —   │
-│  recent (0)          ││   db-3        10.0.0.23      db         db,prod  —   │
+│  all (5)             ││NAME           UP  ADDRESS    USER       TAGS     LAST│
+│  db (2)              ││   bastion     ·   198.51.100 admin      infra    —   │
+│  infra (1)           ││>  web-1       ·   203.0.113. deploy     web,prod —   │
+│  prod (4)            ││   web-2       ·   203.0.113. deploy     web,prod —   │
+│  web (2)             ││   db-1        ·   10.0.0.20  db         db,prod  —   │
+│  recent (0)          ││   db-3        ·   10.0.0.23  db         db,prod  —   │
 │  favorites (0)       ││                                                      │
 │                      ││                                                      │
 │                      ││                                                      │
