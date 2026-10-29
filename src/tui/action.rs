@@ -78,6 +78,8 @@ pub enum Action {
     ShowExec,
     /// Open the Files screen for the cursor host.
     OpenFiles,
+    /// Open an embedded PTY session for the cursor host (or each selection).
+    OpenSession,
 }
 
 /// Work the event loop performs after `update` returns.
@@ -97,6 +99,71 @@ pub enum UiCommand {
     Health(crate::services::health::HealthControl),
     /// File-browser work for the event loop.
     Files(FilesCommand),
+    /// Embedded-session work for the event loop.
+    Sessions(SessionsCommand),
+}
+
+/// Side effects for embedded PTY sessions.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub enum SessionsCommand {
+    /// Spawn `ssh -t` for `host` and place it in the UI.
+    Open {
+        /// Inventory host name.
+        host: String,
+        /// Initial rows.
+        rows: u16,
+        /// Initial columns.
+        cols: u16,
+        /// Where the new session goes.
+        place: SessionPlace,
+    },
+    /// Write bytes to a live session.
+    Write {
+        /// Target session.
+        id: crate::services::sessions::SessionId,
+        /// Encoded key or paste bytes.
+        bytes: Vec<u8>,
+    },
+    /// Resize one session's PTY.
+    Resize {
+        /// Target session.
+        id: crate::services::sessions::SessionId,
+        /// Rows.
+        rows: u16,
+        /// Columns.
+        cols: u16,
+    },
+    /// Kill and drop a session.
+    Close(crate::services::sessions::SessionId),
+    /// Kill every session (on quit).
+    CloseAll,
+    /// Move scrollback for a session (positive looks at older lines).
+    Scroll {
+        /// Target session.
+        id: crate::services::sessions::SessionId,
+        /// Row delta.
+        delta: isize,
+    },
+    /// Replace an ended session with a fresh connection.
+    Reconnect {
+        /// Pane to reuse.
+        id: crate::services::sessions::SessionId,
+        /// Host name.
+        host: String,
+        /// Rows.
+        rows: u16,
+        /// Columns.
+        cols: u16,
+    },
+}
+
+/// Where a newly opened session is attached in the Sessions UI.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub enum SessionPlace {
+    /// New sub-tab.
+    NewTab,
+    /// Split the focused pane.
+    Split(crate::tui::screens::sessions::SplitDir),
 }
 
 /// Side effects for the Files screen.
