@@ -4,7 +4,7 @@ mod audit_log;
 pub mod health;
 pub mod inventory_store;
 mod pty;
-mod remote_fs;
+pub mod remote_fs;
 pub mod ssh;
 pub mod ssh_config;
 pub mod state_store;

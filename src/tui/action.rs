@@ -76,6 +76,8 @@ pub enum Action {
     Exec,
     /// Reopen the exec results view.
     ShowExec,
+    /// Open the Files screen for the cursor host.
+    OpenFiles,
 }
 
 /// Work the event loop performs after `update` returns.
@@ -93,6 +95,67 @@ pub enum UiCommand {
     CancelExec,
     /// Send a command to the background health scheduler.
     Health(crate::services::health::HealthControl),
+    /// File-browser work for the event loop.
+    Files(FilesCommand),
+}
+
+/// Side effects for the Files screen.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub enum FilesCommand {
+    /// Reload local and/or remote listings.
+    Refresh {
+        /// Refresh the local pane.
+        local: bool,
+        /// Refresh the remote pane.
+        remote: bool,
+    },
+    /// Open an SFTP session to `host`.
+    Connect(String),
+    /// Close the remote SFTP session.
+    Disconnect,
+    /// Start copying the given paths toward the other pane.
+    Copy {
+        /// Upload or download.
+        direction: crate::services::files::TransferDirection,
+        /// Source paths.
+        sources: Vec<String>,
+        /// Destination directory.
+        dest_dir: String,
+        /// Remote host name for labels.
+        host: String,
+    },
+    /// Cancel active transfers.
+    CancelTransfers,
+    /// Delete paths on the local or remote side.
+    Delete {
+        /// Paths to remove.
+        paths: Vec<String>,
+        /// True deletes on the remote filesystem.
+        remote: bool,
+    },
+    /// Create a directory.
+    Mkdir {
+        /// Absolute path.
+        path: String,
+        /// True creates on the remote filesystem.
+        remote: bool,
+    },
+    /// Rename within one filesystem.
+    Rename {
+        /// Source path.
+        from: String,
+        /// Destination path.
+        to: String,
+        /// True operates on the remote filesystem.
+        remote: bool,
+    },
+    /// Load a text file into the viewer (cap 1 MB).
+    View {
+        /// Absolute path.
+        path: String,
+        /// True reads from the remote filesystem.
+        remote: bool,
+    },
 }
 
 /// A child process that needs the real terminal.

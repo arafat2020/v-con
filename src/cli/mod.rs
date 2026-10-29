@@ -124,6 +124,24 @@ pub enum Command {
         #[arg(short = 't', long)]
         timeout: Option<u64>,
     },
+    /// Upload a local file or directory to matched hosts.
+    Push {
+        /// Selector such as `web-1` or `@web`.
+        selector: String,
+        /// Local file or directory path.
+        local: PathBuf,
+        /// Remote destination directory.
+        remote: String,
+    },
+    /// Download from one host into a local directory.
+    Pull {
+        /// Host name.
+        host: String,
+        /// Remote file or directory path.
+        remote: String,
+        /// Local destination directory.
+        local: PathBuf,
+    },
 }
 
 /// Parse argv and run the selected command. The process exit code is the return value.
@@ -268,6 +286,41 @@ fn dispatch(cli: &Cli) -> Result<ExitCode, Error> {
                     selector: selector.as_deref(),
                     parallel: *parallel,
                     timeout: *timeout,
+                },
+            )
+        }
+        Some(Command::Push {
+            selector,
+            local,
+            remote,
+        }) => {
+            let (bundle, config) = inventory::load(&paths, &paths::local_user())?;
+            commands::push::run(
+                &bundle,
+                &config,
+                &paths,
+                &commands::push::PushRequest {
+                    selector,
+                    local,
+                    remote,
+                    yes: cli.yes,
+                },
+            )
+        }
+        Some(Command::Pull {
+            host,
+            remote,
+            local,
+        }) => {
+            let (bundle, config) = inventory::load(&paths, &paths::local_user())?;
+            commands::pull::run(
+                &bundle,
+                &config,
+                &paths,
+                &commands::pull::PullRequest {
+                    host,
+                    remote,
+                    local,
                 },
             )
         }

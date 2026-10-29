@@ -9,6 +9,7 @@ use crate::config::{Config, HealthConfig};
 use crate::domain::health::{HealthStatus, now_secs};
 use crate::domain::host::{EffectiveHost, Host, Inventory, Problem};
 use crate::error::Error;
+use crate::infra::remote_fs::{DirEntry, join, normalize};
 use crate::infra::ssh::command::{
     SshCommandOptions, build_ssh_command, command_line, exec_arguments,
 };
@@ -18,14 +19,17 @@ use crate::infra::state_store::{self, AppState};
 use crate::paths::Paths;
 use crate::services::connect::{self, ConnectPlan};
 use crate::services::exec::{self as job, ExecSettings};
+use crate::services::files::TransferEvent;
 use crate::services::health::{
     self as health_svc, HealthControl, HealthEvent, HealthSettings, HostHealth,
 };
 use crate::services::inventory::{self, InventoryBundle};
-use crate::tui::action::{Action, ConnectHandoff, EditorHandoff, Handoff, UiCommand};
+use crate::tui::action::{Action, ConnectHandoff, EditorHandoff, FilesCommand, Handoff, UiCommand};
 use crate::tui::keymap::Keymap;
 use crate::tui::screens::exec as exec_ui;
 use crate::tui::screens::exec::{Confirm, Prompt, PromptEvent, Results, ResultsEvent};
+use crate::tui::screens::files as files_ui;
+use crate::tui::screens::files::{FilesEvent, NameKind, PaneFocus, Viewer};
 use crate::tui::screens::health as health_ui;
 use crate::tui::screens::health::{HealthEvent as HealthKey, HealthView};
 use crate::tui::screens::host_form::{self, HostFormEvent};
@@ -98,6 +102,7 @@ pub struct App {
     health_config: HealthConfig,
     health_history: usize,
     health_refresh: Duration,
+    pub(crate) files: files_ui::FilesView,
 }
 
 impl App {
@@ -113,6 +118,7 @@ impl App {
         let theme = Theme::from_config(&config.theme, no_color)?;
         let keymap = Keymap::from_config(&config.keys)?;
         let view = HostsView::new(&bundle.hosts);
+        let files = files_ui::FilesView::new(files_home());
         let frame = Duration::from_millis(1000 / u64::from(config.tui.fps.max(1)));
         let state_path = paths.state_file();
         let (state, warning) = state_store::load(&state_path);
@@ -151,6 +157,7 @@ impl App {
             health_config: config.health.clone(),
             health_history: config.health.history_samples.max(2),
             health_refresh: Duration::from_secs(config.health.refresh_seconds.max(5)),
+            files,
         };
         app.seed_health_cache();
         app.refresh_groups();
@@ -220,6 +227,9 @@ impl App {
         if self.screen == 2 && self.modal.is_none() {
             return self.health_key(code, modifiers);
         }
+        if self.screen == 3 && self.modal.is_none() && !self.exec_visible {
+            return self.files_key(code, modifiers);
+        }
         if self.screen == 1 && self.view.editing && self.modal.is_none() {
             return match code {
                 KeyCode::Esc => self.update(Action::SearchClear),
@@ -245,6 +255,10 @@ impl App {
         }
         match action {
             Action::Quit => {
+                if self.files.queue.active() {
+                    self.toast("transfers running — press C to cancel transfers, then q to quit");
+                    return Vec::new();
+                }
                 self.state
                     .remember_ui(screen_name(self.screen), &self.view.query);
                 self.quit = true;
@@ -290,7 +304,32 @@ impl App {
             Action::SwitchScreen(screen) => {
                 if (1..=5).contains(&screen) {
                     self.screen = screen;
+                    if screen == 3 {
+                        return vec![UiCommand::Files(FilesCommand::Refresh {
+                            local: true,
+                            remote: self.files.host.is_some(),
+                        })];
+                    }
                 }
+            }
+            Action::OpenFiles => {
+                self.screen = 3;
+                let Some(name) = self.active_cursor_name() else {
+                    self.toast("No host selected");
+                    return vec![UiCommand::Files(FilesCommand::Refresh {
+                        local: true,
+                        remote: false,
+                    })];
+                };
+                self.files.host = Some(name.clone());
+                return vec![
+                    UiCommand::Files(FilesCommand::Disconnect),
+                    UiCommand::Files(FilesCommand::Connect(name)),
+                    UiCommand::Files(FilesCommand::Refresh {
+                        local: true,
+                        remote: true,
+                    }),
+                ];
             }
             Action::CopySshCommand => return self.copy_command(),
             Action::Connect => return self.connect_command(),
@@ -381,9 +420,10 @@ impl App {
             hosts::draw(frame, chunks[1], &mut self.view, &self.hosts, &options);
         } else if self.screen == 2 {
             health_ui::draw(frame, chunks[1], &mut self.health, &self.hosts, &self.theme);
+        } else if self.screen == 3 {
+            files_ui::draw(frame, chunks[1], &mut self.files, &self.hosts, &self.theme);
         } else {
             let message = match self.screen {
-                3 => "Files arrives in a later phase.",
                 4 => "Sessions arrives in a later phase.",
                 _ => "Log arrives in a later phase.",
             };
@@ -433,6 +473,22 @@ impl App {
                 self.theme.error(),
             ));
         }
+        if self.files.queue.active() {
+            let active = self
+                .files
+                .queue
+                .jobs
+                .iter()
+                .filter(|job| {
+                    matches!(
+                        job.state,
+                        crate::services::files::TransferState::Queued
+                            | crate::services::files::TransferState::Running
+                    )
+                })
+                .count();
+            spans.push(Span::styled(format!(" ↑{active} "), self.theme.ok()));
+        }
         frame.render_widget(Paragraph::new(Line::from(spans)), area);
     }
 
@@ -444,6 +500,8 @@ impl App {
             format!(
                 " ⏎ details   s sort   p pause   r refresh   R all   / filter   c connect   x exec   q quit{pause}"
             )
+        } else if self.screen == 3 {
+            " Tab panes   ⏎ open   h up   space mark   c copy   m mkdir   r rename   d delete   v view   H host   C cancel   q quit".to_string()
         } else {
             let mut hint =
                 " ⏎ connect   x exec   a add   e edit   d del   ? help   q quit".to_string();
@@ -514,6 +572,7 @@ impl App {
             Line::from("Esc              clear selection"),
             Line::from("y                copy the ssh command"),
             Line::from("Enter            connect"),
+            Line::from("f                open files for the cursor host"),
             Line::from("a                add a host"),
             Line::from("e                edit the cursor host"),
             Line::from("D                duplicate the cursor host"),
@@ -549,7 +608,11 @@ impl App {
     fn copy_command(&mut self) -> Vec<UiCommand> {
         let multiplexing = self.multiplexing;
         let control = self.control_dir.display().to_string();
-        let Some(host) = self.view.cursor(&self.hosts) else {
+        let Some(name) = self.active_cursor_name() else {
+            self.toast("No host selected");
+            return Vec::new();
+        };
+        let Some(host) = self.hosts.iter().find(|host| host.name == name) else {
             self.toast("No host selected");
             return Vec::new();
         };
@@ -574,6 +637,12 @@ impl App {
         let host = if self.screen == 2 {
             self.health
                 .cursor_name
+                .as_ref()
+                .and_then(|name| self.hosts.iter().find(|host| &host.name == name))
+                .cloned()
+        } else if self.screen == 3 {
+            self.files
+                .host
                 .as_ref()
                 .and_then(|name| self.hosts.iter().find(|host| &host.name == name))
                 .cloned()
@@ -702,7 +771,7 @@ impl App {
     }
 
     fn open_add(&mut self) {
-        if self.screen != 1 && self.screen != 2 {
+        if self.screen != 1 && self.screen != 2 && self.screen != 3 {
             return;
         }
         let form = host_form::add_form(&self.inventory, &crate::paths::local_user());
@@ -710,7 +779,7 @@ impl App {
     }
 
     fn open_edit(&mut self) {
-        if self.screen != 1 && self.screen != 2 {
+        if self.screen != 1 && self.screen != 2 && self.screen != 3 {
             return;
         }
         let Some(host) = self.raw_host().cloned() else {
@@ -722,7 +791,7 @@ impl App {
     }
 
     fn open_duplicate(&mut self) {
-        if self.screen != 1 && self.screen != 2 {
+        if self.screen != 1 && self.screen != 2 && self.screen != 3 {
             return;
         }
         let Some(host) = self.raw_host().cloned() else {
@@ -734,7 +803,7 @@ impl App {
     }
 
     fn open_delete(&mut self) {
-        if self.screen != 1 && self.screen != 2 {
+        if self.screen != 1 && self.screen != 2 && self.screen != 3 {
             return;
         }
         let Some(name) = self.active_cursor_name() else {
@@ -753,7 +822,7 @@ impl App {
     }
 
     fn open_import(&mut self) {
-        if self.screen != 1 && self.screen != 2 {
+        if self.screen != 1 && self.screen != 2 && self.screen != 3 {
             return;
         }
         let path = ssh_config::default_path();
@@ -770,6 +839,11 @@ impl App {
     fn active_cursor_name(&self) -> Option<String> {
         if self.screen == 2 {
             self.health.cursor_name.clone()
+        } else if self.screen == 3 {
+            self.files
+                .host
+                .clone()
+                .or_else(|| self.view.cursor_name.clone())
         } else {
             self.view.cursor_name.clone()
         }
@@ -1228,7 +1302,8 @@ impl App {
                         | Action::ImportHosts
                         | Action::EditInventory
                         | Action::ToggleFavorite
-                        | Action::CopySshCommand),
+                        | Action::CopySshCommand
+                        | Action::OpenFiles),
                     ) = self.keymap.lookup(code, modifiers)
                 {
                     return self.update(action);
@@ -1296,6 +1371,254 @@ impl App {
         self.show_error(format!("could not start ssh: {error}"));
     }
 
+    /// Apply a directory listing to one files pane.
+    pub fn apply_files_listing(&mut self, focus: PaneFocus, path: String, entries: Vec<DirEntry>) {
+        self.files.set_listing(focus, path, entries);
+        self.dirty = true;
+    }
+
+    /// Fold one transfer event into the queue panel.
+    pub fn apply_transfer_event(&mut self, event: TransferEvent) {
+        self.files.queue.apply(event);
+        self.dirty = true;
+    }
+
+    /// Open the read-only file viewer with loaded text.
+    pub fn apply_view_text(&mut self, path: String, text: String) {
+        self.files.viewer = Some(Viewer {
+            title: path,
+            lines: text.lines().map(str::to_string).collect(),
+            offset: 0,
+        });
+        self.dirty = true;
+    }
+
+    fn files_key(&mut self, code: KeyCode, modifiers: KeyModifiers) -> Vec<UiCommand> {
+        let overlay = self.files.viewer.is_some()
+            || self.files.conflict.is_some()
+            || self.files.delete.is_some()
+            || self.files.prompt.is_some()
+            || self.files.picker.is_some();
+        if !overlay && !self.files.focused_ref().filtering {
+            match code {
+                KeyCode::Char('q') => return self.update(Action::Quit),
+                KeyCode::Char('?') => return self.update(Action::ToggleHelp),
+                KeyCode::Char('v') => return self.update(Action::ToggleProblems),
+                KeyCode::Char(digit @ '1'..='5') => {
+                    let screen = digit.to_digit(10).unwrap_or(0) as u8;
+                    return self.update(Action::SwitchScreen(screen));
+                }
+                _ => {}
+            }
+            if let Some(
+                action @ (Action::AddHost
+                | Action::EditHost
+                | Action::DuplicateHost
+                | Action::DeleteHost
+                | Action::ImportHosts
+                | Action::EditInventory
+                | Action::ToggleFavorite
+                | Action::CopySshCommand
+                | Action::Connect
+                | Action::Exec
+                | Action::OpenFiles),
+            ) = self.keymap.lookup(code, modifiers)
+            {
+                return self.update(action);
+            }
+        }
+        match files_ui::on_key(&mut self.files, code, &self.hosts) {
+            FilesEvent::None => {
+                self.dirty = true;
+                Vec::new()
+            }
+            FilesEvent::ReloadFocus => {
+                let local = self.files.focus == PaneFocus::Local;
+                vec![UiCommand::Files(FilesCommand::Refresh {
+                    local,
+                    remote: !local && self.files.host.is_some(),
+                })]
+            }
+            FilesEvent::ReloadBoth => vec![UiCommand::Files(FilesCommand::Refresh {
+                local: true,
+                remote: self.files.host.is_some(),
+            })],
+            FilesEvent::Activate => self.files_activate(),
+            FilesEvent::Parent => self.files_parent(),
+            FilesEvent::Copy => self.files_copy(),
+            FilesEvent::ConfirmDelete => {
+                self.dirty = true;
+                Vec::new()
+            }
+            FilesEvent::DoDelete => {
+                let Some(delete) = self.files.delete.clone() else {
+                    return Vec::new();
+                };
+                self.files.delete = None;
+                vec![UiCommand::Files(FilesCommand::Delete {
+                    paths: delete.paths,
+                    remote: delete.remote,
+                })]
+            }
+            FilesEvent::SubmitName => self.files_submit_name(),
+            FilesEvent::CancelOverlay => {
+                self.files.conflict = None;
+                self.files.delete = None;
+                self.files.prompt = None;
+                self.files.picker = None;
+                self.dirty = true;
+                Vec::new()
+            }
+            FilesEvent::PickHost => self.files_pick_host(),
+            FilesEvent::Conflict(action) => {
+                self.files.conflict = None;
+                self.dirty = true;
+                let _ = action;
+                Vec::new()
+            }
+            FilesEvent::CancelTransfers => vec![UiCommand::Files(FilesCommand::CancelTransfers)],
+            FilesEvent::ToggleQueue => {
+                self.files.queue_collapsed = !self.files.queue_collapsed;
+                self.dirty = true;
+                Vec::new()
+            }
+        }
+    }
+
+    fn files_activate(&mut self) -> Vec<UiCommand> {
+        let focus = self.files.focus;
+        let pane = self.files.focused_ref();
+        let Some(entry) = pane.current() else {
+            return Vec::new();
+        };
+        if entry.is_dir() {
+            let path = join(&pane.path, &entry.name);
+            match focus {
+                PaneFocus::Local => self.files.local.path = path.clone(),
+                PaneFocus::Remote => self.files.remote.path = path.clone(),
+            }
+            let local = focus == PaneFocus::Local;
+            vec![UiCommand::Files(FilesCommand::Refresh {
+                local,
+                remote: !local,
+            })]
+        } else {
+            let path = join(&pane.path, &entry.name);
+            vec![UiCommand::Files(FilesCommand::View {
+                path,
+                remote: focus == PaneFocus::Remote,
+            })]
+        }
+    }
+
+    fn files_parent(&mut self) -> Vec<UiCommand> {
+        let focus = self.files.focus;
+        let parent = files_ui::go_parent(&self.files.focused_ref().path);
+        match focus {
+            PaneFocus::Local => self.files.local.path = parent,
+            PaneFocus::Remote => self.files.remote.path = parent,
+        }
+        let local = focus == PaneFocus::Local;
+        vec![UiCommand::Files(FilesCommand::Refresh {
+            local,
+            remote: !local && self.files.host.is_some(),
+        })]
+    }
+
+    fn files_copy(&mut self) -> Vec<UiCommand> {
+        let Some(host) = self.files.host.clone() else {
+            self.toast("Choose a remote host (H)");
+            return Vec::new();
+        };
+        let sources = self.files.selected_paths();
+        if sources.is_empty() {
+            self.toast("Nothing selected to copy");
+            return Vec::new();
+        }
+        let dest_dir = self.files.other().path.clone();
+        let direction = match self.files.focus {
+            PaneFocus::Local => crate::services::files::TransferDirection::Upload,
+            PaneFocus::Remote => crate::services::files::TransferDirection::Download,
+        };
+        vec![UiCommand::Files(FilesCommand::Copy {
+            direction,
+            sources,
+            dest_dir,
+            host,
+        })]
+    }
+
+    fn files_submit_name(&mut self) -> Vec<UiCommand> {
+        let Some(prompt) = self.files.prompt.take() else {
+            return Vec::new();
+        };
+        let remote = self.files.focus == PaneFocus::Remote;
+        let pane_path = self.files.focused_ref().path.clone();
+        match prompt.kind {
+            NameKind::Mkdir => {
+                let path = join(&pane_path, &prompt.value);
+                vec![
+                    UiCommand::Files(FilesCommand::Mkdir { path, remote }),
+                    UiCommand::Files(FilesCommand::Refresh {
+                        local: !remote,
+                        remote,
+                    }),
+                ]
+            }
+            NameKind::Rename => {
+                let Some(entry) = self.files.focused_ref().current() else {
+                    return Vec::new();
+                };
+                let from = join(&pane_path, &entry.name);
+                let to = join(&pane_path, &prompt.value);
+                vec![
+                    UiCommand::Files(FilesCommand::Rename { from, to, remote }),
+                    UiCommand::Files(FilesCommand::Refresh {
+                        local: !remote,
+                        remote,
+                    }),
+                ]
+            }
+            NameKind::Goto => {
+                let path = normalize(&prompt.value);
+                match self.files.focus {
+                    PaneFocus::Local => self.files.local.path = path.clone(),
+                    PaneFocus::Remote => self.files.remote.path = path.clone(),
+                }
+                vec![UiCommand::Files(FilesCommand::Refresh {
+                    local: !remote,
+                    remote,
+                })]
+            }
+        }
+    }
+
+    fn files_pick_host(&mut self) -> Vec<UiCommand> {
+        let Some(picker) = self.files.picker.take() else {
+            return Vec::new();
+        };
+        let query = picker.query.to_ascii_lowercase();
+        let names: Vec<String> = self
+            .hosts
+            .iter()
+            .map(|host| host.name.clone())
+            .filter(|name| query.is_empty() || name.to_ascii_lowercase().contains(&query))
+            .collect();
+        let Some(name) = names.get(picker.cursor).cloned() else {
+            self.toast("No host selected");
+            return Vec::new();
+        };
+        self.files.host = Some(name.clone());
+        vec![
+            UiCommand::Files(FilesCommand::Disconnect),
+            UiCommand::Files(FilesCommand::Connect(name)),
+            UiCommand::Files(FilesCommand::Refresh {
+                local: false,
+                remote: true,
+            }),
+        ]
+    }
+
     /// Open an error modal. Esc dismisses it.
     pub fn show_error(&mut self, message: impl Into<String>) {
         self.modal = Some(Modal::Error(message.into()));
@@ -1311,6 +1634,32 @@ impl App {
     pub fn state_path(&self) -> &std::path::Path {
         &self.state_path
     }
+
+    /// Inventory hosts for SFTP argv building.
+    pub fn effective_hosts(&self) -> &[EffectiveHost] {
+        &self.hosts
+    }
+
+    /// Located `ssh` binary, if any.
+    pub fn ssh_program(&self) -> Option<&PathBuf> {
+        self.ssh.as_ref()
+    }
+
+    /// Whether ControlMaster paths are enabled.
+    pub fn multiplexing_enabled(&self) -> bool {
+        self.multiplexing
+    }
+
+    /// Directory for ssh control sockets.
+    pub fn control_dir_path(&self) -> &std::path::Path {
+        &self.control_dir
+    }
+}
+
+fn files_home() -> PathBuf {
+    directories::UserDirs::new()
+        .map(|dirs| dirs.home_dir().to_path_buf())
+        .unwrap_or_else(|| PathBuf::from("/tmp"))
 }
 
 fn screen_name(screen: u8) -> &'static str {
@@ -1438,6 +1787,7 @@ mod tests {
             health_config: HealthConfig::default(),
             health_history: 60,
             health_refresh: Duration::from_secs(30),
+            files: files_ui::FilesView::new(files_home()),
         }
     }
 
