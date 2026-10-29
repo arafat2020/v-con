@@ -16,12 +16,17 @@ mod widgets;
 
 use crate::config::Config;
 use crate::error::Error;
+use crate::infra::ssh::backend::SshBackend;
+use crate::infra::ssh::system::SystemSsh;
+use crate::infra::state_store;
 use crate::paths::Paths;
 use crate::services::inventory::InventoryBundle;
-use crate::tui::action::{Action, UiCommand};
+use crate::tui::action::{Action, Handoff, UiCommand};
 use crate::tui::app::App;
 use crossterm::event::{Event, EventStream, KeyEventKind};
 use futures::StreamExt;
+use std::io::{self, Write};
+use std::process::{Command, Stdio};
 use std::time::Duration;
 use tokio::time::MissedTickBehavior;
 
@@ -61,13 +66,14 @@ async fn event_loop(
         if app.quit() {
             break;
         }
+        let mut handoff = None;
         tokio::select! {
             biased;
             event = events.next() => {
                 match event {
                     Some(Ok(Event::Key(key))) if key.kind == KeyEventKind::Press || key.kind == KeyEventKind::Repeat => {
                         let commands = app.on_key(key.code, key.modifiers);
-                        apply_commands(app, commands);
+                        handoff = apply_commands(app, commands);
                     }
                     Some(Ok(Event::Resize(width, height))) => app.note_size(width, height),
                     Some(Ok(_)) => {}
@@ -85,17 +91,87 @@ async fn event_loop(
                 app.dirty = false;
             }
         }
+        if let Some(handoff) = handoff {
+            drop(events);
+            run_handoff(terminal, app, handoff).await?;
+            events = EventStream::new();
+            app.dirty = true;
+        }
     }
     Ok(())
 }
 
-fn apply_commands(app: &mut App, commands: Vec<UiCommand>) {
+fn apply_commands(app: &mut App, commands: Vec<UiCommand>) -> Option<Handoff> {
+    let mut handoff = None;
     for command in commands {
         match command {
             UiCommand::Copy(text) => match copy_to_clipboard(&text) {
                 Ok(()) => app.toast("Copied ssh command"),
                 Err(error) => app.toast(error),
             },
+            UiCommand::Persist => {
+                if let Err(error) = state_store::save(app.state_path(), app.state()) {
+                    app.toast(format!("could not save state: {error}"));
+                }
+            }
+            UiCommand::Suspend(next) => handoff = Some(next),
+        }
+    }
+    handoff
+}
+
+async fn run_handoff(
+    terminal: &mut terminal::Tui,
+    app: &mut App,
+    handoff: Handoff,
+) -> Result<(), Error> {
+    terminal::suspend(terminal).map_err(|error| Error::Message(error.to_string()))?;
+    let mouse = app.mouse();
+    let joined = tokio::task::spawn_blocking(move || execute_handoff(handoff)).await;
+    terminal::resume(terminal, mouse).map_err(|error| Error::Message(error.to_string()))?;
+    drain_keys();
+    match joined {
+        Ok(SessionEnd::Connect(Ok(status))) => app.note_session_exit(&status),
+        Ok(SessionEnd::Connect(Err(error))) => app.note_session_error(&error),
+        Ok(SessionEnd::Editor(Ok(_))) => app.reload_inventory(),
+        Ok(SessionEnd::Editor(Err(error))) => {
+            app.show_error(format!("could not start editor: {error}"))
+        }
+        Err(error) => app.show_error(format!("session task failed: {error}")),
+    }
+    Ok(())
+}
+
+enum SessionEnd {
+    Connect(io::Result<std::process::ExitStatus>),
+    Editor(io::Result<std::process::ExitStatus>),
+}
+
+fn execute_handoff(handoff: Handoff) -> SessionEnd {
+    match handoff {
+        Handoff::Connect(spec) => {
+            println!("{}", spec.banner);
+            let _ = io::stdout().flush();
+            let ssh = SystemSsh::new(spec.program);
+            SessionEnd::Connect(ssh.interactive(&spec.args))
+        }
+        Handoff::Editor(spec) => {
+            let status = Command::new(spec.program)
+                .args(spec.args)
+                .stdin(Stdio::inherit())
+                .stdout(Stdio::inherit())
+                .stderr(Stdio::inherit())
+                .status();
+            SessionEnd::Editor(status)
+        }
+    }
+}
+
+fn drain_keys() {
+    let timeout = Duration::from_millis(0);
+    while crossterm::event::poll(timeout).unwrap_or(false) {
+        if crossterm::event::read().is_err() {
+            break;
         }
     }
 }

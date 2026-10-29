@@ -2,7 +2,7 @@
 
 pub mod check;
 mod completions;
-mod connect;
+pub mod connect;
 mod doctor;
 mod exec;
 mod import;

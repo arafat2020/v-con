@@ -1,7 +1,7 @@
 //! Command-line entry point.
 //!
-//! No subcommand starts the TUI. `init`, `list` (`ls`), and `check` are the
-//! phase 1 commands. They share [`crate::services::inventory`] with the Hosts screen.
+//! No subcommand starts the TUI. `init`, `list` (`ls`), `check`, and `connect`
+//! (`c`) share [`crate::services::inventory`] and the state file with the Hosts screen.
 
 mod commands;
 
@@ -11,6 +11,7 @@ use crate::services::inventory;
 use clap::{Parser, Subcommand};
 use std::path::PathBuf;
 use std::process::ExitCode;
+use std::sync::Mutex;
 
 /// Global flags and the optional subcommand. No subcommand opens the TUI.
 #[derive(Debug, Parser)]
@@ -36,7 +37,7 @@ pub struct Cli {
     pub command: Option<Command>,
 }
 
-/// Phase 1 subcommands. Later commands stay out of this enum until their phase.
+/// Subcommands that are implemented. Later commands stay out until their phase.
 #[derive(Debug, Subcommand)]
 pub enum Command {
     /// Create the config directory and a commented example `hosts.toml`.
@@ -49,12 +50,19 @@ pub enum Command {
     },
     /// Validate the inventory. Exits non-zero when any problem is found.
     Check,
+    /// Open an interactive SSH session. `c` is an alias.
+    #[command(alias = "c")]
+    Connect {
+        /// Host name, for example `web-1`.
+        name: String,
+    },
 }
 
 /// Parse argv and run the selected command. The process exit code is the return value.
 pub fn run() -> ExitCode {
     let cli = Cli::parse();
     let _ = cli.yes;
+    init_logging(&Paths::resolve(cli.config_dir.as_deref()), cli.verbose);
     match dispatch(&cli) {
         Ok(code) => code,
         Err(error) => {
@@ -101,6 +109,11 @@ fn dispatch(cli: &Cli) -> Result<ExitCode, Error> {
                 }
             }
         }
+        Some(Command::Connect { name }) => {
+            let (bundle, config) = inventory::load(&paths, &paths::local_user())?;
+            commands::connect::run(&bundle, &config, &paths, name)?;
+            Ok(ExitCode::SUCCESS)
+        }
         None => {
             if !std::io::IsTerminal::is_terminal(&std::io::stdout()) {
                 eprintln!("vcon's TUI needs a terminal; use subcommands for scripting");
@@ -115,6 +128,36 @@ fn dispatch(cli: &Cli) -> Result<ExitCode, Error> {
             Ok(ExitCode::SUCCESS)
         }
     }
+}
+
+/// Write logs to the state directory. `-v` is debug and `-vv` is trace.
+///
+/// With no `-v`, `VCON_LOG` selects the filter and the default is `info`.
+/// A log file that cannot be opened is skipped so connecting still works.
+fn init_logging(paths: &Paths, verbose: u8) {
+    let _ = std::fs::create_dir_all(&paths.state_dir);
+    let directive = if verbose >= 2 {
+        "trace".to_string()
+    } else if verbose == 1 {
+        "debug".to_string()
+    } else {
+        std::env::var("VCON_LOG").unwrap_or_else(|_| "info".to_string())
+    };
+    let Ok(filter) = tracing_subscriber::EnvFilter::try_new(directive) else {
+        return;
+    };
+    let Ok(file) = std::fs::OpenOptions::new()
+        .create(true)
+        .append(true)
+        .open(paths.log_file())
+    else {
+        return;
+    };
+    let _ = tracing_subscriber::fmt()
+        .with_ansi(false)
+        .with_env_filter(filter)
+        .with_writer(Mutex::new(file))
+        .try_init();
 }
 
 #[cfg(test)]

@@ -54,8 +54,14 @@ pub enum Action {
     ClearSelection,
     /// Ask the event loop to copy the cursor host's ssh command.
     CopySshCommand,
-    /// Interactive connect. Phase 2. Phase 1 shows a toast.
+    /// Hand the terminal to ssh for the cursor host.
     Connect,
+    /// Toggle the favorite flag on the cursor host.
+    ToggleFavorite,
+    /// Switch the table between inventory order and frecency.
+    ToggleSort,
+    /// Open `hosts.toml` in `$EDITOR`, then reload it.
+    EditInventory,
 }
 
 /// Work the event loop performs after `update` returns.
@@ -63,4 +69,39 @@ pub enum Action {
 pub enum UiCommand {
     /// Copy this shell command to the clipboard.
     Copy(String),
+    /// Write the in-memory state file.
+    Persist,
+    /// Leave the TUI, run a child with the real terminal, then come back.
+    Suspend(Handoff),
+}
+
+/// A child process that needs the real terminal.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub enum Handoff {
+    /// Interactive ssh. The banner is printed before the process starts.
+    Connect(ConnectHandoff),
+    /// `$EDITOR` opened on `hosts.toml`.
+    Editor(EditorHandoff),
+}
+
+/// ssh invocation produced by the connect service.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct ConnectHandoff {
+    /// Host that was recorded in the state file.
+    pub host_name: String,
+    /// Line printed on the normal screen before ssh starts.
+    pub banner: String,
+    /// `ssh` binary.
+    pub program: std::path::PathBuf,
+    /// Arguments after the binary.
+    pub args: Vec<String>,
+}
+
+/// Editor invocation. `args` already includes the file path.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct EditorHandoff {
+    /// `$EDITOR` program.
+    pub program: std::path::PathBuf,
+    /// Arguments, including the inventory path.
+    pub args: Vec<String>,
 }

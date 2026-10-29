@@ -1,5 +1,5 @@
 //! SSH command building and the `SshBackend` trait.
 
-mod backend;
+pub mod backend;
 pub mod command;
-mod system;
+pub mod system;
