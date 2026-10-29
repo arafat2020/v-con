@@ -5,6 +5,7 @@
 //! version starts from an empty state and never blocks connecting.
 
 use crate::domain::activity::{self, RECENT_LIMIT};
+use crate::domain::health::HealthReport;
 use crate::error::Error;
 use chrono::{DateTime, SecondsFormat, Utc};
 use serde::{Deserialize, Serialize};
@@ -15,7 +16,7 @@ use std::path::Path;
 pub const VERSION: u32 = 1;
 
 /// The whole state file.
-#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+#[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
 pub struct AppState {
     /// Schema version. Missing values load as [`VERSION`].
     #[serde(default = "current_version")]
@@ -28,8 +29,8 @@ pub struct AppState {
     pub ui: UiState,
 }
 
-/// One host's connection history. Health samples arrive in a later phase.
-#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize, Default)]
+/// One host's connection history and last health sample.
+#[derive(Debug, Clone, PartialEq, Serialize, Deserialize, Default)]
 pub struct HostRecord {
     /// RFC3339 time of the last connect attempt.
     #[serde(default, skip_serializing_if = "Option::is_none")]
@@ -40,6 +41,9 @@ pub struct HostRecord {
     /// Shown in the favorites group.
     #[serde(default)]
     pub favorite: bool,
+    /// Latest health report, shown stale on the next launch.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub last_health: Option<HealthReport>,
 }
 
 /// UI fields that survive a restart.
@@ -151,6 +155,12 @@ impl AppState {
     pub fn remember_ui(&mut self, screen: &str, filter: &str) {
         self.ui.last_screen = screen.to_string();
         self.ui.last_filter = filter.to_string();
+    }
+
+    /// Cache the latest health report for a host.
+    pub fn remember_health(&mut self, name: &str, report: HealthReport) {
+        let record = self.hosts.entry(name.to_string()).or_default();
+        record.last_health = Some(report);
     }
 }
 

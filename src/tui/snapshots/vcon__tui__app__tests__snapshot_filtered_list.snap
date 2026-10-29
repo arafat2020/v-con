@@ -4,9 +4,9 @@ expression: screen
 ---
  vcon  1 Hosts  2 Health  3 Files  4 Sessions  5 Log
 ┌ Tags ────────────────┐┌ Hosts ─ 2 ─ /pr ng───────────────────────────────────┐
-│  all (5)             ││NAME           ADDRESS        USER       TAGS     LAST│
-│  db (2)              ││>  web-1       203.0.113.10   deploy     web,prod —   │
-│  infra (1)           ││   web-2       203.0.113.11   deploy     web,prod —   │
+│  all (5)             ││NAME           UP  ADDRESS    USER       TAGS     LAST│
+│  db (2)              ││>  web-1       ·   203.0.113. deploy     web,prod —   │
+│  infra (1)           ││   web-2       ·   203.0.113. deploy     web,prod —   │
 │  prod (4)            ││                                                      │
 │  web (2)             ││                                                      │
 │  recent (0)          ││                                                      │

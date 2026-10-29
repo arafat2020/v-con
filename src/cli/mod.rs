@@ -1,8 +1,8 @@
 //! Command-line entry point.
 //!
 //! No subcommand starts the TUI. `init`, `list` (`ls`), `check`, `connect`
-//! (`c`), `import`, and `exec` (`x`) share [`crate::services::inventory`] and the
-//! state file with the Hosts screen.
+//! (`c`), `import`, `exec` (`x`), `status` (`st`), and `ping` share
+//! [`crate::services::inventory`] and the state file with the Hosts screen.
 
 mod commands;
 
@@ -100,6 +100,29 @@ pub enum Command {
         /// Prefix the remote command with `sudo -n`.
         #[arg(long)]
         sudo: bool,
+    },
+    /// One-shot health table. `st` is an alias.
+    #[command(alias = "st")]
+    Status {
+        /// Selector such as `web-1` or `@web`. Absent means every host.
+        selector: Option<String>,
+        /// Sort by host, status, cpu, load, mem, disk, net, or up.
+        #[arg(long, default_value = "host")]
+        sort: String,
+        /// Skip the second sample. CPU % and network rates stay empty.
+        #[arg(long)]
+        no_cpu: bool,
+    },
+    /// Measure ssh latency with a remote `true`.
+    Ping {
+        /// Selector such as `web-1` or `@web`. Absent means every host.
+        selector: Option<String>,
+        /// Max concurrent hosts. The default is `parallel` from config.toml.
+        #[arg(short = 'p', long)]
+        parallel: Option<usize>,
+        /// Per-host timeout in seconds. The default is 10.
+        #[arg(short = 't', long)]
+        timeout: Option<u64>,
     },
 }
 
@@ -210,6 +233,41 @@ fn dispatch(cli: &Cli) -> Result<ExitCode, Error> {
                     sudo: *sudo,
                     json: cli.json,
                     yes: cli.yes,
+                },
+            )
+        }
+        Some(Command::Status {
+            selector,
+            sort,
+            no_cpu,
+        }) => {
+            let (bundle, config) = inventory::load(&paths, &paths::local_user())?;
+            commands::status::run(
+                &bundle,
+                &config,
+                &paths,
+                &commands::status::StatusRequest {
+                    selector: selector.as_deref(),
+                    sort,
+                    json: cli.json,
+                    sample_cpu: !*no_cpu,
+                },
+            )
+        }
+        Some(Command::Ping {
+            selector,
+            parallel,
+            timeout,
+        }) => {
+            let (bundle, config) = inventory::load(&paths, &paths::local_user())?;
+            commands::ping::run(
+                &bundle,
+                &config,
+                &paths,
+                &commands::ping::PingRequest {
+                    selector: selector.as_deref(),
+                    parallel: *parallel,
+                    timeout: *timeout,
                 },
             )
         }

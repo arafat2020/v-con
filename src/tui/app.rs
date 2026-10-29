@@ -5,7 +5,8 @@
 //! anything it does not recognise (quit, help, copy) is handled here.
 //! Other tabs are placeholders until their phases.
 
-use crate::config::Config;
+use crate::config::{Config, HealthConfig};
+use crate::domain::health::{HealthStatus, now_secs};
 use crate::domain::host::{EffectiveHost, Host, Inventory, Problem};
 use crate::error::Error;
 use crate::infra::ssh::command::{
@@ -17,11 +18,16 @@ use crate::infra::state_store::{self, AppState};
 use crate::paths::Paths;
 use crate::services::connect::{self, ConnectPlan};
 use crate::services::exec::{self as job, ExecSettings};
+use crate::services::health::{
+    self as health_svc, HealthControl, HealthEvent, HealthSettings, HostHealth,
+};
 use crate::services::inventory::{self, InventoryBundle};
 use crate::tui::action::{Action, ConnectHandoff, EditorHandoff, Handoff, UiCommand};
 use crate::tui::keymap::Keymap;
 use crate::tui::screens::exec as exec_ui;
 use crate::tui::screens::exec::{Confirm, Prompt, PromptEvent, Results, ResultsEvent};
+use crate::tui::screens::health as health_ui;
+use crate::tui::screens::health::{HealthEvent as HealthKey, HealthView};
 use crate::tui::screens::host_form::{self, HostFormEvent};
 use crate::tui::screens::hosts::{self, HostsView, ViewOptions};
 use crate::tui::screens::import::{self, ImportEvent};
@@ -88,6 +94,10 @@ pub struct App {
     exec_confirm: Option<Confirm>,
     exec_results: Option<Results>,
     exec_visible: bool,
+    health: HealthView,
+    health_config: HealthConfig,
+    health_history: usize,
+    health_refresh: Duration,
 }
 
 impl App {
@@ -137,7 +147,12 @@ impl App {
             exec_confirm: None,
             exec_results: None,
             exec_visible: false,
+            health: HealthView::new(config.health.refresh_seconds.max(5)),
+            health_config: config.health.clone(),
+            health_history: config.health.history_samples.max(2),
+            health_refresh: Duration::from_secs(config.health.refresh_seconds.max(5)),
         };
+        app.seed_health_cache();
         app.refresh_groups();
         app.apply_start_screen(&config.tui.start_screen);
         if app.ssh.is_none() {
@@ -201,6 +216,9 @@ impl App {
         }
         if self.exec_visible {
             return self.exec_results_key(code);
+        }
+        if self.screen == 2 && self.modal.is_none() {
+            return self.health_key(code, modifiers);
         }
         if self.screen == 1 && self.view.editing && self.modal.is_none() {
             return match code {
@@ -349,6 +367,7 @@ impl App {
             let theme = self.theme.clone();
             let hosts_path = self.hosts_path.clone();
             let control_dir = self.control_dir.clone();
+            let health_status = self.health_status_map();
             let options = ViewOptions {
                 theme: &theme,
                 hosts_path: &hosts_path,
@@ -357,11 +376,13 @@ impl App {
                 terminal_height,
                 multiplexing,
                 control_dir: &control_dir,
+                health: &health_status,
             };
             hosts::draw(frame, chunks[1], &mut self.view, &self.hosts, &options);
+        } else if self.screen == 2 {
+            health_ui::draw(frame, chunks[1], &mut self.health, &self.hosts, &self.theme);
         } else {
             let message = match self.screen {
-                2 => "Health arrives in a later phase.",
                 3 => "Files arrives in a later phase.",
                 4 => "Sessions arrives in a later phase.",
                 _ => "Log arrives in a later phase.",
@@ -402,12 +423,27 @@ impl App {
                 self.theme.warning(),
             ));
         }
+        let (_ok, warn, crit, down) = self.health.counts();
+        if warn > 0 {
+            spans.push(Span::styled(format!(" ⚠{warn} "), self.theme.warning()));
+        }
+        if crit + down > 0 {
+            spans.push(Span::styled(
+                format!(" ✖{} ", crit + down),
+                self.theme.error(),
+            ));
+        }
         frame.render_widget(Paragraph::new(Line::from(spans)), area);
     }
 
     fn draw_hints(&self, frame: &mut Frame, area: Rect) {
         let text = if let Some((message, _)) = &self.toast {
             message.clone()
+        } else if self.screen == 2 {
+            let pause = if self.health.paused { "  paused" } else { "" };
+            format!(
+                " ⏎ details   s sort   p pause   r refresh   R all   / filter   c connect   x exec   q quit{pause}"
+            )
         } else {
             let mut hint =
                 " ⏎ connect   x exec   a add   e edit   d del   ? help   q quit".to_string();
@@ -535,7 +571,16 @@ impl App {
             self.modal = Some(Modal::Error(missing_ssh_message().to_string()));
             return Vec::new();
         };
-        let Some(host) = self.view.cursor(&self.hosts).cloned() else {
+        let host = if self.screen == 2 {
+            self.health
+                .cursor_name
+                .as_ref()
+                .and_then(|name| self.hosts.iter().find(|host| &host.name == name))
+                .cloned()
+        } else {
+            self.view.cursor(&self.hosts).cloned()
+        };
+        let Some(host) = host else {
             self.toast("No host selected");
             return Vec::new();
         };
@@ -657,7 +702,7 @@ impl App {
     }
 
     fn open_add(&mut self) {
-        if self.screen != 1 {
+        if self.screen != 1 && self.screen != 2 {
             return;
         }
         let form = host_form::add_form(&self.inventory, &crate::paths::local_user());
@@ -665,7 +710,7 @@ impl App {
     }
 
     fn open_edit(&mut self) {
-        if self.screen != 1 {
+        if self.screen != 1 && self.screen != 2 {
             return;
         }
         let Some(host) = self.raw_host().cloned() else {
@@ -677,7 +722,7 @@ impl App {
     }
 
     fn open_duplicate(&mut self) {
-        if self.screen != 1 {
+        if self.screen != 1 && self.screen != 2 {
             return;
         }
         let Some(host) = self.raw_host().cloned() else {
@@ -689,10 +734,10 @@ impl App {
     }
 
     fn open_delete(&mut self) {
-        if self.screen != 1 {
+        if self.screen != 1 && self.screen != 2 {
             return;
         }
-        let Some(name) = self.view.cursor_name.clone() else {
+        let Some(name) = self.active_cursor_name() else {
             self.toast("No host selected");
             return;
         };
@@ -708,7 +753,7 @@ impl App {
     }
 
     fn open_import(&mut self) {
-        if self.screen != 1 {
+        if self.screen != 1 && self.screen != 2 {
             return;
         }
         let path = ssh_config::default_path();
@@ -722,8 +767,16 @@ impl App {
         ))));
     }
 
+    fn active_cursor_name(&self) -> Option<String> {
+        if self.screen == 2 {
+            self.health.cursor_name.clone()
+        } else {
+            self.view.cursor_name.clone()
+        }
+    }
+
     fn raw_host(&self) -> Option<&Host> {
-        let name = self.view.cursor_name.as_deref()?;
+        let name = self.active_cursor_name()?;
         self.inventory.hosts.iter().find(|host| host.name == name)
     }
 
@@ -872,7 +925,7 @@ impl App {
     }
 
     fn open_exec(&mut self) {
-        if self.screen != 1 {
+        if self.screen != 1 && self.screen != 2 {
             return;
         }
         if self
@@ -905,6 +958,16 @@ impl App {
     }
 
     fn exec_targets(&self) -> Vec<EffectiveHost> {
+        if self.screen == 2 {
+            return self
+                .health
+                .cursor_name
+                .as_ref()
+                .and_then(|name| self.hosts.iter().find(|host| &host.name == name))
+                .cloned()
+                .into_iter()
+                .collect();
+        }
         if !self.view.selected.is_empty() {
             return self
                 .hosts
@@ -1081,6 +1144,138 @@ impl App {
         self.exec_visible
     }
 
+    /// Fold one health update into the table and the state-file cache.
+    pub fn apply_health_event(&mut self, event: HealthEvent) {
+        let mut report = event.report;
+        health_svc::mark_stale(&mut report, now_secs(), self.health_refresh * 2);
+        self.health.apply(
+            event.host.clone(),
+            report.clone(),
+            event.point,
+            self.health_history,
+        );
+        self.state.remember_health(&event.host, report);
+        self.dirty = true;
+    }
+
+    /// Targets, settings, and cache used to start the background scheduler.
+    pub fn health_bootstrap(
+        &self,
+    ) -> Option<(
+        Vec<job::HostTarget>,
+        HealthSettings,
+        BTreeMap<String, HostHealth>,
+    )> {
+        let program = self.ssh.clone()?;
+        let settings = HealthSettings::from_config(&self.health_config, self.parallel, program);
+        let targets =
+            health_svc::health_targets(&self.hosts, None, self.multiplexing, &self.control_dir);
+        Some((targets, settings, self.health.hosts.clone()))
+    }
+
+    fn health_status_map(&self) -> BTreeMap<String, HealthStatus> {
+        self.health
+            .hosts
+            .iter()
+            .filter_map(|(name, host)| {
+                host.report
+                    .as_ref()
+                    .map(|report| (name.clone(), report.status))
+            })
+            .collect()
+    }
+
+    fn seed_health_cache(&mut self) {
+        let mut cache = BTreeMap::new();
+        for (name, record) in &self.state.hosts {
+            if let Some(mut report) = record.last_health.clone() {
+                report.stale = true;
+                cache.insert(
+                    name.clone(),
+                    HostHealth {
+                        report: Some(report),
+                        ..HostHealth::default()
+                    },
+                );
+            }
+        }
+        self.health.load_cache(cache, &self.hosts);
+    }
+
+    fn health_key(&mut self, code: KeyCode, modifiers: KeyModifiers) -> Vec<UiCommand> {
+        if !self.health.editing && self.health.detail.is_none() {
+            match code {
+                KeyCode::Char('q') => return self.update(Action::Quit),
+                KeyCode::Char('?') => return self.update(Action::ToggleHelp),
+                KeyCode::Char('v') => return self.update(Action::ToggleProblems),
+                KeyCode::Char(digit @ '1'..='5') => {
+                    let screen = digit.to_digit(10).unwrap_or(0) as u8;
+                    return self.update(Action::SwitchScreen(screen));
+                }
+                _ => {}
+            }
+        }
+        match health_ui::on_key(&mut self.health, code, &self.hosts) {
+            HealthKey::None => {
+                // Hosts actions such as `a` add still work from the Health tab.
+                if !self.health.editing
+                    && self.health.detail.is_none()
+                    && let Some(
+                        action @ (Action::AddHost
+                        | Action::EditHost
+                        | Action::DuplicateHost
+                        | Action::DeleteHost
+                        | Action::ImportHosts
+                        | Action::EditInventory
+                        | Action::ToggleFavorite
+                        | Action::CopySshCommand),
+                    ) = self.keymap.lookup(code, modifiers)
+                {
+                    return self.update(action);
+                }
+                self.dirty = true;
+                Vec::new()
+            }
+            HealthKey::CloseDetail
+            | HealthKey::OpenDetail
+            | HealthKey::OpenSearch
+            | HealthKey::SearchSubmit
+            | HealthKey::SearchClear
+            | HealthKey::SearchInsert(_)
+            | HealthKey::SearchBackspace => {
+                self.dirty = true;
+                Vec::new()
+            }
+            HealthKey::TogglePause => {
+                self.dirty = true;
+                vec![UiCommand::Health(if self.health.paused {
+                    HealthControl::Pause
+                } else {
+                    HealthControl::Resume
+                })]
+            }
+            HealthKey::RefreshOne => {
+                self.dirty = true;
+                let names = self
+                    .health
+                    .cursor_name
+                    .clone()
+                    .into_iter()
+                    .collect::<Vec<_>>();
+                vec![UiCommand::Health(HealthControl::Refresh(names))]
+            }
+            HealthKey::RefreshAll => {
+                self.dirty = true;
+                vec![UiCommand::Health(HealthControl::Refresh(Vec::new()))]
+            }
+            HealthKey::Connect => self.connect_command(),
+            HealthKey::Exec => {
+                self.open_exec();
+                Vec::new()
+            }
+        }
+    }
+
     /// Show a modal when ssh could not start a shell.
     pub fn note_session_exit(&mut self, status: &ExitStatus) {
         match status.code() {
@@ -1239,6 +1434,10 @@ mod tests {
             exec_confirm: None,
             exec_results: None,
             exec_visible: false,
+            health: HealthView::new(30),
+            health_config: HealthConfig::default(),
+            health_history: 60,
+            health_refresh: Duration::from_secs(30),
         }
     }
 

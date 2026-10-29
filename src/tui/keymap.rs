@@ -41,6 +41,9 @@ impl Keymap {
 
     /// Find the action for this key. Uppercase letters ignore the Shift modifier
     /// because the shifted character is already in `code` (`G` rather than Shift+`g`).
+    ///
+    /// Caps Lock sends `A` with no Shift. When there is no exact binding for that
+    /// uppercase letter, the lowercase binding is tried so `a` still adds a host.
     pub fn lookup(&self, code: KeyCode, modifiers: KeyModifiers) -> Option<Action> {
         let modifiers = match code {
             KeyCode::Char(ch) if ch.is_ascii_uppercase() => {
@@ -50,7 +53,22 @@ impl Keymap {
         };
         let modifiers =
             modifiers.intersection(KeyModifiers::CONTROL | KeyModifiers::ALT | KeyModifiers::SHIFT);
-        self.bindings.get(&Binding { code, modifiers }).cloned()
+        if let Some(action) = self.bindings.get(&Binding { code, modifiers }).cloned() {
+            return Some(action);
+        }
+        if modifiers.is_empty()
+            && let KeyCode::Char(ch) = code
+            && ch.is_ascii_uppercase()
+        {
+            return self
+                .bindings
+                .get(&Binding {
+                    code: KeyCode::Char(ch.to_ascii_lowercase()),
+                    modifiers: KeyModifiers::NONE,
+                })
+                .cloned();
+        }
+        None
     }
 }
 
@@ -205,5 +223,27 @@ mod tests {
             Some(Action::Connect)
         );
         assert_eq!(keymap.lookup(KeyCode::Enter, KeyModifiers::NONE), None);
+    }
+
+    #[test]
+    fn caps_lock_a_still_adds_a_host() {
+        let keymap = Keymap::from_config(&KeyConfig::default()).unwrap();
+        assert_eq!(
+            keymap.lookup(KeyCode::Char('a'), KeyModifiers::NONE),
+            Some(Action::AddHost)
+        );
+        assert_eq!(
+            keymap.lookup(KeyCode::Char('A'), KeyModifiers::NONE),
+            Some(Action::AddHost)
+        );
+        // Exact uppercase bindings win over the lowercase fallback.
+        assert_eq!(
+            keymap.lookup(KeyCode::Char('E'), KeyModifiers::NONE),
+            Some(Action::EditInventory)
+        );
+        assert_eq!(
+            keymap.lookup(KeyCode::Char('e'), KeyModifiers::NONE),
+            Some(Action::EditHost)
+        );
     }
 }

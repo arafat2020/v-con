@@ -7,6 +7,7 @@
 //! recorded in the state file. `recent` is ordered newest first.
 
 use crate::domain::filter::{Field, FilterOutput, Scope, cursor_position, filter};
+use crate::domain::health::HealthStatus;
 use crate::domain::host::EffectiveHost;
 use crate::infra::ssh::command::{SshCommandOptions, build_ssh_command, command_line, jump_chain};
 use crate::tui::action::Action;
@@ -114,6 +115,8 @@ pub struct ViewOptions<'a> {
     pub multiplexing: bool,
     /// Control socket directory used in that command.
     pub control_dir: &'a Path,
+    /// Latest health status per host for the UP column.
+    pub health: &'a BTreeMap<String, HealthStatus>,
 }
 
 impl HostsView {
@@ -478,6 +481,11 @@ fn draw_table(
     let rows = output.matches.iter().map(|matched| {
         let host = &hosts[matched.index];
         let gutter = gutter(&host.name, cursor, &view.selected);
+        let up = options
+            .health
+            .get(&host.name)
+            .map(|status| status.symbol())
+            .unwrap_or("·");
         if compact {
             Row::new(vec![
                 Cell::from(Line::from(highlighted(
@@ -485,6 +493,7 @@ fn draw_table(
                     &[],
                     options.theme,
                 ))),
+                Cell::from(up),
                 Cell::from(field_line(host, matched, Field::Address, options.theme)),
             ])
         } else {
@@ -496,6 +505,7 @@ fn draw_table(
                     view.favorites.contains(&host.name),
                     options.theme,
                 ))),
+                Cell::from(up),
                 Cell::from(field_line(host, matched, Field::Address, options.theme)),
                 Cell::from(host.user.as_str()),
                 Cell::from(field_line(host, matched, Field::Tags, options.theme)),
@@ -509,10 +519,15 @@ fn draw_table(
         }
     });
     let widths: Vec<Constraint> = if compact {
-        vec![Constraint::Min(8), Constraint::Min(8)]
+        vec![
+            Constraint::Min(8),
+            Constraint::Length(3),
+            Constraint::Min(8),
+        ]
     } else {
         vec![
-            Constraint::Length(20),
+            Constraint::Length(18),
+            Constraint::Length(3),
             Constraint::Length(16),
             Constraint::Length(10),
             Constraint::Min(8),
@@ -520,9 +535,9 @@ fn draw_table(
         ]
     };
     let header = if compact {
-        Row::new(vec!["NAME", "ADDRESS"])
+        Row::new(vec!["NAME", "UP", "ADDRESS"])
     } else {
-        Row::new(vec!["NAME", "ADDRESS", "USER", "TAGS", "LAST"])
+        Row::new(vec!["NAME", "UP", "ADDRESS", "USER", "TAGS", "LAST"])
     };
     let table = Table::new(rows, widths)
         .header(header.style(options.theme.muted()))

@@ -23,7 +23,7 @@ pub struct Config {
     pub multiplexing: bool,
     /// Terminal UI preferences.
     pub tui: TuiConfig,
-    /// Health-screen thresholds. Unused until phase 5, but loaded so the file is valid.
+    /// Health-screen refresh interval, history length, and thresholds.
     pub health: HealthConfig,
     /// Embedded-session preferences. Unused until phase 7.
     pub sessions: SessionConfig,
