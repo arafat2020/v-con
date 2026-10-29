@@ -142,6 +142,7 @@ fn defaults() -> HashMap<Binding, Action> {
     bind(KeyCode::Char('i'), KeyModifiers::NONE, Action::ImportHosts);
     bind(KeyCode::Char('x'), KeyModifiers::NONE, Action::Exec);
     bind(KeyCode::Char('X'), KeyModifiers::NONE, Action::ShowExec);
+    bind(KeyCode::Char('f'), KeyModifiers::NONE, Action::OpenFiles);
     map
 }
 
@@ -165,6 +166,7 @@ fn action_by_name(name: &str) -> Option<Action> {
         "import" => Action::ImportHosts,
         "exec" => Action::Exec,
         "show_exec" => Action::ShowExec,
+        "files" | "open_files" => Action::OpenFiles,
         "up" => Action::MoveUp,
         "down" => Action::MoveDown,
         _ => return None,

@@ -1,7 +1,7 @@
 //! One module per screen.
 
 pub mod exec;
-mod files;
+pub mod files;
 pub mod health;
 pub mod host_form;
 pub mod hosts;

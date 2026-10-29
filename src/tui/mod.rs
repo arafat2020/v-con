@@ -16,15 +16,21 @@ mod widgets;
 
 use crate::config::Config;
 use crate::error::Error;
+use crate::infra::remote_fs::{LocalFs, RemoteFs, SftpFs, normalize, parent_of, sftp_arguments};
 use crate::infra::ssh::backend::SshBackend;
 use crate::infra::ssh::system::SystemSsh;
 use crate::infra::state_store;
 use crate::paths::Paths;
 use crate::services::exec::{self as job, ExecLaunch};
+use crate::services::files::{
+    TransferDirection, TransferEvent, TransferJob, TransferState, collect_tree, map_destinations,
+    run_queue,
+};
 use crate::services::health::{self as health_svc, HealthControl, HealthEvent};
 use crate::services::inventory::InventoryBundle;
-use crate::tui::action::{Action, Handoff, UiCommand};
+use crate::tui::action::{Action, FilesCommand, Handoff, UiCommand};
 use crate::tui::app::App;
+use crate::tui::screens::files::PaneFocus;
 use crossterm::event::{Event, EventStream, KeyEventKind};
 use futures::StreamExt;
 use std::io::{self, Write};
@@ -63,6 +69,7 @@ async fn event_loop(
     let mut render = tokio::time::interval(frame);
     let mut job: Option<LiveExec> = None;
     let mut health = spawn_health(app);
+    let mut live_files = LiveFiles::new();
     tick.set_missed_tick_behavior(MissedTickBehavior::Skip);
     render.set_missed_tick_behavior(MissedTickBehavior::Skip);
     if let Ok(size) = terminal.size() {
@@ -79,6 +86,7 @@ async fn event_loop(
                 live.cancel.cancel();
                 let _ = tokio::time::timeout(Duration::from_secs(2), live.task).await;
             }
+            live_files.shutdown().await;
             break;
         }
         let mut effects = Effects::default();
@@ -88,7 +96,7 @@ async fn event_loop(
                 match event {
                     Some(Ok(Event::Key(key))) if key.kind == KeyEventKind::Press || key.kind == KeyEventKind::Repeat => {
                         let commands = app.on_key(key.code, key.modifiers);
-                        effects = apply_commands(app, commands, health.as_ref());
+                        effects = apply_commands(app, commands, health.as_ref(), &mut live_files);
                     }
                     Some(Ok(Event::Resize(width, height))) => app.note_size(width, height),
                     Some(Ok(_)) => {}
@@ -113,6 +121,14 @@ async fn event_loop(
                         if let Some(live) = job.take() {
                             let _ = live.task.await;
                         }
+                    }
+                }
+            }
+            transfer_event = recv_transfer(&mut live_files) => {
+                if let Some(event) = transfer_event {
+                    app.apply_transfer_event(event);
+                    while let Ok(event) = live_files.events.try_recv() {
+                        app.apply_transfer_event(event);
                     }
                 }
             }
@@ -167,8 +183,48 @@ async fn event_loop(
             events = EventStream::new();
             app.dirty = true;
         }
+        for command in effects.files {
+            if let Err(error) = handle_files_command(app, &mut live_files, command).await {
+                app.show_error(error.to_string());
+            }
+        }
     }
     Ok(())
+}
+
+const VIEW_CAP: usize = 1024 * 1024;
+const SFTP_CONNECT_TIMEOUT: u64 = 30;
+
+struct LiveFiles {
+    remote: Option<Arc<SftpFs>>,
+    cancel: CancellationToken,
+    events: mpsc::Receiver<TransferEvent>,
+    events_tx: mpsc::Sender<TransferEvent>,
+}
+
+impl LiveFiles {
+    fn new() -> Self {
+        let (events_tx, events) = mpsc::channel(256);
+        Self {
+            remote: None,
+            cancel: CancellationToken::new(),
+            events,
+            events_tx,
+        }
+    }
+
+    async fn shutdown(&mut self) {
+        self.cancel.cancel();
+        if let Some(remote) = self.remote.take()
+            && let Ok(sftp) = Arc::try_unwrap(remote)
+        {
+            let _ = sftp.close().await;
+        }
+    }
+}
+
+async fn recv_transfer(live: &mut LiveFiles) -> Option<TransferEvent> {
+    live.events.recv().await
 }
 
 struct LiveExec {
@@ -189,6 +245,7 @@ struct Effects {
     handoff: Option<Handoff>,
     start: Option<ExecLaunch>,
     cancel: bool,
+    files: Vec<FilesCommand>,
 }
 
 fn spawn_exec(launch: ExecLaunch) -> LiveExec {
@@ -250,7 +307,12 @@ fn spawn_health(app: &App) -> Option<LiveHealth> {
     })
 }
 
-fn apply_commands(app: &mut App, commands: Vec<UiCommand>, health: Option<&LiveHealth>) -> Effects {
+fn apply_commands(
+    app: &mut App,
+    commands: Vec<UiCommand>,
+    health: Option<&LiveHealth>,
+    _live_files: &mut LiveFiles,
+) -> Effects {
     let mut effects = Effects::default();
     for command in commands {
         match command {
@@ -278,9 +340,403 @@ fn apply_commands(app: &mut App, commands: Vec<UiCommand>, health: Option<&LiveH
                     let _ = live.control.try_send(control);
                 }
             }
+            UiCommand::Files(files) => effects.files.push(files),
         }
     }
     effects
+}
+
+async fn handle_files_command(
+    app: &mut App,
+    live: &mut LiveFiles,
+    command: FilesCommand,
+) -> Result<(), crate::error::Error> {
+    match command {
+        FilesCommand::Refresh { local, remote } => {
+            refresh_files_listings(app, live, local, remote).await?;
+        }
+        FilesCommand::Connect(host) => {
+            connect_files_host(app, live, &host).await?;
+        }
+        FilesCommand::Disconnect => {
+            disconnect_files(live).await;
+            app.files.host = None;
+            app.dirty = true;
+        }
+        FilesCommand::Copy {
+            direction,
+            sources,
+            dest_dir,
+            host,
+        } => {
+            start_files_copy(app, live, direction, sources, dest_dir, host).await?;
+        }
+        FilesCommand::CancelTransfers => {
+            live.cancel.cancel();
+            live.cancel = CancellationToken::new();
+            app.toast("cancelled transfers");
+        }
+        FilesCommand::Delete { paths, remote } => {
+            delete_files_paths(live, &paths, remote).await?;
+            refresh_files_listings(app, live, !remote, remote).await?;
+        }
+        FilesCommand::Mkdir { path, remote } => {
+            files_fs(live, remote).await?.mkdir(&path).await?;
+            app.toast(format!("created {path}"));
+        }
+        FilesCommand::Rename { from, to, remote } => {
+            files_fs(live, remote).await?.rename(&from, &to).await?;
+            app.toast(format!("renamed to {to}"));
+        }
+        FilesCommand::View { path, remote } => {
+            view_files_path(app, live, &path, remote).await?;
+        }
+    }
+    Ok(())
+}
+
+async fn refresh_files_listings(
+    app: &mut App,
+    live: &LiveFiles,
+    local: bool,
+    remote: bool,
+) -> Result<(), crate::error::Error> {
+    if local {
+        let path = app.files.local.path.clone();
+        let local_fs = LocalFs;
+        match local_fs.list(&path).await {
+            Ok(entries) => {
+                app.files.status = None;
+                app.apply_files_listing(PaneFocus::Local, path, entries);
+            }
+            Err(error) => {
+                app.files.status = Some(error.to_string());
+                app.toast(error.to_string());
+            }
+        }
+    }
+    if remote {
+        let Some(sftp) = live.remote.as_ref() else {
+            return Ok(());
+        };
+        let path = app.files.remote.path.clone();
+        match sftp.list(&path).await {
+            Ok(entries) => {
+                app.files.status = None;
+                app.apply_files_listing(PaneFocus::Remote, path, entries);
+            }
+            Err(error) => {
+                app.files.status = Some(error.to_string());
+                app.toast(error.to_string());
+            }
+        }
+    }
+    Ok(())
+}
+
+async fn connect_files_host(
+    app: &mut App,
+    live: &mut LiveFiles,
+    host_name: &str,
+) -> Result<(), crate::error::Error> {
+    let Some(program) = app.ssh_program().cloned() else {
+        return Err(crate::error::Error::Message(
+            crate::infra::ssh::system::missing_ssh_message().to_string(),
+        ));
+    };
+    let Some(host) = app
+        .effective_hosts()
+        .iter()
+        .find(|host| host.name == host_name)
+        .cloned()
+    else {
+        return Err(crate::error::Error::Message(format!(
+            "unknown host `{host_name}`"
+        )));
+    };
+    disconnect_files(live).await;
+    let control = app
+        .multiplexing_enabled()
+        .then(|| app.control_dir_path().display().to_string());
+    let args = sftp_arguments(
+        &host,
+        app.effective_hosts(),
+        Some(SFTP_CONNECT_TIMEOUT),
+        app.multiplexing_enabled(),
+        control.as_deref(),
+    );
+    match SftpFs::connect(program, args).await {
+        Ok(session) => {
+            live.remote = Some(Arc::new(session));
+            if let Some(sftp) = live.remote.as_ref()
+                && let Ok(home) = sftp.realpath("~").await
+            {
+                app.files.remote.path = home;
+            }
+            app.toast(format!("connected to {host_name}"));
+        }
+        Err(error) => {
+            app.toast(error.to_string());
+            return Err(error);
+        }
+    }
+    Ok(())
+}
+
+async fn disconnect_files(live: &mut LiveFiles) {
+    if let Some(remote) = live.remote.take()
+        && let Ok(sftp) = Arc::try_unwrap(remote)
+    {
+        let _ = sftp.close().await;
+    }
+}
+
+async fn files_fs(live: &LiveFiles, remote: bool) -> Result<FilesFs<'_>, crate::error::Error> {
+    if remote {
+        let Some(sftp) = live.remote.as_ref() else {
+            return Err(crate::error::Error::Message(
+                "not connected to a remote host".to_string(),
+            ));
+        };
+        Ok(FilesFs::Remote(sftp))
+    } else {
+        Ok(FilesFs::Local)
+    }
+}
+
+enum FilesFs<'a> {
+    Local,
+    Remote(&'a SftpFs),
+}
+
+impl RemoteFs for FilesFs<'_> {
+    async fn list(
+        &self,
+        dir: &str,
+    ) -> Result<Vec<crate::infra::remote_fs::DirEntry>, crate::error::Error> {
+        match self {
+            Self::Local => LocalFs.list(dir).await,
+            Self::Remote(fs) => fs.list(dir).await,
+        }
+    }
+
+    async fn stat(
+        &self,
+        path: &str,
+    ) -> Result<crate::infra::remote_fs::DirEntry, crate::error::Error> {
+        match self {
+            Self::Local => LocalFs.stat(path).await,
+            Self::Remote(fs) => fs.stat(path).await,
+        }
+    }
+
+    async fn mkdir(&self, path: &str) -> Result<(), crate::error::Error> {
+        match self {
+            Self::Local => LocalFs.mkdir(path).await,
+            Self::Remote(fs) => fs.mkdir(path).await,
+        }
+    }
+
+    async fn rename(&self, from: &str, to: &str) -> Result<(), crate::error::Error> {
+        match self {
+            Self::Local => LocalFs.rename(from, to).await,
+            Self::Remote(fs) => fs.rename(from, to).await,
+        }
+    }
+
+    async fn remove_file(&self, path: &str) -> Result<(), crate::error::Error> {
+        match self {
+            Self::Local => LocalFs.remove_file(path).await,
+            Self::Remote(fs) => fs.remove_file(path).await,
+        }
+    }
+
+    async fn remove_dir(&self, path: &str) -> Result<(), crate::error::Error> {
+        match self {
+            Self::Local => LocalFs.remove_dir(path).await,
+            Self::Remote(fs) => fs.remove_dir(path).await,
+        }
+    }
+
+    async fn realpath(&self, path: &str) -> Result<String, crate::error::Error> {
+        match self {
+            Self::Local => LocalFs.realpath(path).await,
+            Self::Remote(fs) => fs.realpath(path).await,
+        }
+    }
+
+    async fn read_at(
+        &self,
+        path: &str,
+        offset: u64,
+        len: usize,
+    ) -> Result<Vec<u8>, crate::error::Error> {
+        match self {
+            Self::Local => LocalFs.read_at(path, offset, len).await,
+            Self::Remote(fs) => fs.read_at(path, offset, len).await,
+        }
+    }
+
+    async fn create(&self, path: &str) -> Result<(), crate::error::Error> {
+        match self {
+            Self::Local => LocalFs.create(path).await,
+            Self::Remote(fs) => fs.create(path).await,
+        }
+    }
+
+    async fn write_at(
+        &self,
+        path: &str,
+        offset: u64,
+        data: &[u8],
+    ) -> Result<(), crate::error::Error> {
+        match self {
+            Self::Local => LocalFs.write_at(path, offset, data).await,
+            Self::Remote(fs) => fs.write_at(path, offset, data).await,
+        }
+    }
+
+    async fn set_meta(
+        &self,
+        path: &str,
+        mode: Option<u32>,
+        mtime: Option<std::time::SystemTime>,
+    ) -> Result<(), crate::error::Error> {
+        match self {
+            Self::Local => LocalFs.set_meta(path, mode, mtime).await,
+            Self::Remote(fs) => fs.set_meta(path, mode, mtime).await,
+        }
+    }
+}
+
+async fn delete_files_paths(
+    live: &LiveFiles,
+    paths: &[String],
+    remote: bool,
+) -> Result<(), crate::error::Error> {
+    let fs = files_fs(live, remote).await?;
+    for path in paths {
+        let meta = fs.stat(path).await?;
+        if meta.is_dir() {
+            fs.remove_dir(path).await?;
+        } else {
+            fs.remove_file(path).await?;
+        }
+    }
+    Ok(())
+}
+
+async fn view_files_path(
+    app: &mut App,
+    live: &LiveFiles,
+    path: &str,
+    remote: bool,
+) -> Result<(), crate::error::Error> {
+    let fs = files_fs(live, remote).await?;
+    let meta = fs.stat(path).await?;
+    if meta.is_dir() {
+        return Err(crate::error::Error::Message(
+            "cannot view a directory".to_string(),
+        ));
+    }
+    if meta.size > VIEW_CAP as u64 {
+        return Err(crate::error::Error::Message(format!(
+            "file is larger than {} bytes",
+            VIEW_CAP
+        )));
+    }
+    let bytes = fs.read_at(path, 0, VIEW_CAP).await?;
+    let text = String::from_utf8(bytes).map_err(|_| {
+        crate::error::Error::Message("refusing to view non-text (non-UTF-8) file".to_string())
+    })?;
+    app.apply_view_text(path.to_string(), text);
+    Ok(())
+}
+
+async fn start_files_copy(
+    app: &mut App,
+    live: &mut LiveFiles,
+    direction: TransferDirection,
+    sources: Vec<String>,
+    dest_dir: String,
+    host: String,
+) -> Result<(), crate::error::Error> {
+    let remote = live.remote.clone().ok_or_else(|| {
+        crate::error::Error::Message("not connected to a remote host".to_string())
+    })?;
+    let local = Arc::new(LocalFs);
+    let dest_dir = normalize(&dest_dir);
+    let mut jobs = Vec::new();
+    for source in sources {
+        let source = normalize(&source);
+        let (entries, root) = match direction {
+            TransferDirection::Upload => {
+                let meta = LocalFs.stat(&source).await?;
+                let root = if meta.is_dir() {
+                    source.clone()
+                } else {
+                    parent_of(&source).unwrap_or_else(|| "/".to_string())
+                };
+                let entries = collect_tree(&LocalFs, &source).await?;
+                (entries, root)
+            }
+            TransferDirection::Download => {
+                let meta = remote.stat(&source).await?;
+                let root = if meta.is_dir() {
+                    source.clone()
+                } else {
+                    parent_of(&source).unwrap_or_else(|| "/".to_string())
+                };
+                let entries = collect_tree(remote.as_ref(), &source).await?;
+                (entries, root)
+            }
+        };
+        let mapped = map_destinations(&entries, &root, &dest_dir);
+        for (src_path, destination, size) in mapped {
+            let id = app.files.queue.ids.next();
+            let job = TransferJob {
+                id,
+                direction,
+                source: src_path,
+                destination,
+                host: host.clone(),
+                total: size,
+                done: 0,
+                state: TransferState::Queued,
+                error: None,
+                started: None,
+            };
+            let _ = live
+                .events_tx
+                .send(TransferEvent::Queued(job.clone()))
+                .await;
+            app.apply_transfer_event(TransferEvent::Queued(job.clone()));
+            jobs.push(job);
+        }
+    }
+    if jobs.is_empty() {
+        app.toast("nothing to copy");
+        return Ok(());
+    }
+    let cancel = live.cancel.clone();
+    let events_tx = live.events_tx.clone();
+    match direction {
+        TransferDirection::Upload => {
+            let src = Arc::clone(&local);
+            let dst = Arc::clone(&remote);
+            tokio::spawn(async move {
+                run_queue(src, dst, jobs, cancel, events_tx).await;
+            });
+        }
+        TransferDirection::Download => {
+            let src = Arc::clone(&remote);
+            let dst = Arc::clone(&local);
+            tokio::spawn(async move {
+                run_queue(src, dst, jobs, cancel, events_tx).await;
+            });
+        }
+    }
+    Ok(())
 }
 
 async fn run_handoff(

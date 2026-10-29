@@ -5,7 +5,7 @@
 mod audit;
 pub mod connect;
 pub mod exec;
-mod files;
+pub mod files;
 pub mod health;
 pub mod inventory;
 mod sessions;
