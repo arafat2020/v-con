@@ -71,6 +71,16 @@ impl Paths {
     pub fn state_file(&self) -> PathBuf {
         self.data_dir.join("state.json")
     }
+
+    /// Saved command snippets (`snippets.toml`).
+    pub fn snippets_file(&self) -> PathBuf {
+        self.config_dir.join("snippets.toml")
+    }
+
+    /// Append-only audit log (`audit.jsonl`).
+    pub fn audit_file(&self) -> PathBuf {
+        self.state_dir.join("audit.jsonl")
+    }
 }
 
 fn home_dir() -> PathBuf {

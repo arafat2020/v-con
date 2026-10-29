@@ -144,6 +144,8 @@ fn defaults() -> HashMap<Binding, Action> {
     bind(KeyCode::Char('X'), KeyModifiers::NONE, Action::ShowExec);
     bind(KeyCode::Char('f'), KeyModifiers::NONE, Action::OpenFiles);
     bind(KeyCode::Char('o'), KeyModifiers::NONE, Action::OpenSession);
+    bind(KeyCode::Char('s'), KeyModifiers::NONE, Action::OpenSnippets);
+    bind(KeyCode::Char('t'), KeyModifiers::NONE, Action::OpenTunnels);
     map
 }
 
@@ -169,6 +171,8 @@ fn action_by_name(name: &str) -> Option<Action> {
         "show_exec" => Action::ShowExec,
         "files" | "open_files" => Action::OpenFiles,
         "open_session" | "session" => Action::OpenSession,
+        "snippets" | "open_snippets" => Action::OpenSnippets,
+        "tunnels" | "open_tunnels" => Action::OpenTunnels,
         "up" => Action::MoveUp,
         "down" => Action::MoveDown,
         _ => return None,

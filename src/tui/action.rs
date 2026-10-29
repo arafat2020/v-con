@@ -80,6 +80,10 @@ pub enum Action {
     OpenFiles,
     /// Open an embedded PTY session for the cursor host (or each selection).
     OpenSession,
+    /// Open the snippet picker.
+    OpenSnippets,
+    /// Open the tunnels panel for the cursor host.
+    OpenTunnels,
 }
 
 /// Work the event loop performs after `update` returns.
@@ -101,6 +105,26 @@ pub enum UiCommand {
     Files(FilesCommand),
     /// Embedded-session work for the event loop.
     Sessions(SessionsCommand),
+    /// Tunnel manager work for the event loop.
+    Tunnels(TunnelsCommand),
+}
+
+/// Side effects for background SSH tunnels.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub enum TunnelsCommand {
+    /// Start a forward on `host`.
+    Start {
+        /// Inventory host.
+        host: String,
+        /// Display label.
+        label: String,
+        /// Parsed forward.
+        spec: crate::domain::tunnel::TunnelSpec,
+    },
+    /// Stop one tunnel.
+    Stop(crate::services::tunnels::TunnelId),
+    /// Kill every tunnel (quit).
+    StopAll,
 }
 
 /// Side effects for embedded PTY sessions.
