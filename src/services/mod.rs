@@ -8,6 +8,6 @@ pub mod exec;
 pub mod files;
 pub mod health;
 pub mod inventory;
-mod sessions;
+pub mod sessions;
 mod snippets;
 mod tunnels;

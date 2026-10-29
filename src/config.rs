@@ -25,7 +25,7 @@ pub struct Config {
     pub tui: TuiConfig,
     /// Health-screen refresh interval, history length, and thresholds.
     pub health: HealthConfig,
-    /// Embedded-session preferences. Unused until phase 7.
+    /// Embedded-session preferences (prefix key and scrollback).
     pub sessions: SessionConfig,
     /// Keybinding overrides. Unknown action names are ignored so later keys do not break phase 1.
     pub keys: KeyConfig,
