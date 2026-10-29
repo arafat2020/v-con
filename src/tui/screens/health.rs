@@ -414,58 +414,30 @@ pub fn draw(
     view.offset = state.offset();
 }
 
+/// How to scale a history chart's Y axis.
+#[derive(Debug, Clone, Copy)]
+enum ChartScale {
+    /// Always 0–100 so low usage still reads as “almost idle”.
+    Percent,
+    /// Fit the observed peak (network rates, etc.).
+    AutoRate,
+}
+
 fn draw_detail(frame: &mut Frame, area: Rect, view: &HealthView, name: &str, theme: &Theme) {
     let host = view.hosts.get(name);
     let report = host.and_then(|host| host.report.as_ref());
     let history = host.map(|host| &host.history);
     let chunks = Layout::vertical([
-        Constraint::Length(6),
+        Constraint::Length(9),
         Constraint::Percentage(34),
         Constraint::Percentage(33),
         Constraint::Percentage(33),
     ])
     .split(area);
 
-    let summary = match report {
-        Some(report) if report.reachable => {
-            let mut lines = vec![format!(
-                "{name}  {}  {}",
-                report.status.symbol(),
-                report.os.as_deref().unwrap_or("—")
-            )];
-            lines.push(format!(
-                "cpu {:>5}  load {:>5}  mem {:>5}  disk {:>5}  up {}",
-                pct(report.cpu_pct),
-                load(report.load1),
-                pct(report.mem_pct),
-                pct(report.disk_pct),
-                report.uptime.as_deref().unwrap_or("—")
-            ));
-            if let Some(failed) = report.failed_units {
-                lines.push(format!("failed units: {failed}"));
-            }
-            if report.reboot_required == Some(true) {
-                lines.push("reboot required".to_string());
-            }
-            for disk in &report.disks {
-                lines.push(format!(
-                    "  {:<12} {:>5}  {}",
-                    disk.mount,
-                    format!("{:.0}%", disk.used_pct),
-                    bar(disk.used_pct, 10)
-                ));
-            }
-            lines.join("\n")
-        }
-        Some(report) => format!(
-            "{name}  ✖  {}",
-            report.error.as_deref().unwrap_or("unreachable")
-        ),
-        None => format!("{name}  —  waiting for first sample"),
-    };
+    let summary = detail_summary(name, report, theme);
     frame.render_widget(
         Paragraph::new(summary)
-            .style(theme.text())
             .block(
                 Block::bordered()
                     .title(Span::styled(format!(" {name} "), theme.title()))
@@ -478,71 +450,195 @@ fn draw_detail(frame: &mut Frame, area: Rect, view: &HealthView, name: &str, the
     draw_history_chart(
         frame,
         chunks[1],
-        " CPU % ",
+        "CPU",
         history,
         |point| point.cpu_pct,
         theme.ok(),
         theme,
+        ChartScale::Percent,
     );
     draw_history_chart(
         frame,
         chunks[2],
-        " MEM % ",
+        "MEM",
         history,
         |point| point.mem_pct,
         theme.warning(),
         theme,
+        ChartScale::Percent,
     );
     draw_history_chart(
         frame,
         chunks[3],
-        " NET rx ",
+        "NET rx",
         history,
         |point| point.net_rx_bps,
-        theme.selected(),
+        theme.title(),
         theme,
+        ChartScale::AutoRate,
     );
 }
 
+fn detail_summary(name: &str, report: Option<&HealthReport>, theme: &Theme) -> Vec<Line<'static>> {
+    match report {
+        Some(report) if report.reachable => {
+            let mut lines = vec![Line::from(vec![
+                Span::styled(name.to_string(), theme.title()),
+                Span::raw("  "),
+                Span::styled(
+                    report.status.symbol().to_string(),
+                    status_style(report.status, theme),
+                ),
+                Span::styled(
+                    format!("  {}", report.os.as_deref().unwrap_or("—")),
+                    theme.muted(),
+                ),
+            ])];
+            lines.push(usage_bar_line("cpu", report.cpu_pct, theme));
+            lines.push(usage_bar_line("mem", report.mem_pct, theme));
+            lines.push(usage_bar_line("disk", report.disk_pct, theme));
+            lines.push(Line::from(vec![
+                Span::styled("load ", theme.muted()),
+                Span::styled(load(report.load1), theme.text()),
+                Span::styled("   up ", theme.muted()),
+                Span::styled(
+                    report.uptime.clone().unwrap_or_else(|| "—".into()),
+                    theme.text(),
+                ),
+                if let Some(failed) = report.failed_units {
+                    Span::styled(format!("   failed units: {failed}"), theme.muted())
+                } else {
+                    Span::raw("")
+                },
+            ]));
+            if report.reboot_required == Some(true) {
+                lines.push(Line::styled("reboot required", theme.warning()));
+            }
+            for disk in &report.disks {
+                lines.push(Line::from(vec![
+                    Span::styled(format!("  {:<10} ", disk.mount), theme.muted()),
+                    Span::styled(
+                        format!("{:<16}", bar(disk.used_pct, 16)),
+                        usage_style(disk.used_pct, theme),
+                    ),
+                    Span::styled(
+                        format!(" {:>3.0}%", disk.used_pct),
+                        usage_style(disk.used_pct, theme),
+                    ),
+                ]));
+            }
+            lines
+        }
+        Some(report) => vec![Line::from(vec![
+            Span::styled(name.to_string(), theme.title()),
+            Span::styled("  ✖  ", theme.error()),
+            Span::styled(
+                report
+                    .error
+                    .clone()
+                    .unwrap_or_else(|| "unreachable".into()),
+                theme.error(),
+            ),
+        ])],
+        None => vec![Line::from(vec![
+            Span::styled(name.to_string(), theme.title()),
+            Span::styled("  —  waiting for first sample", theme.muted()),
+        ])],
+    }
+}
+
+fn usage_bar_line(label: &str, value: Option<f64>, theme: &Theme) -> Line<'static> {
+    let pct_val = value.unwrap_or(0.0);
+    let style = usage_style(pct_val, theme);
+    Line::from(vec![
+        Span::styled(format!("{label:<4} "), theme.muted()),
+        Span::styled(format!("{:<24}", bar(pct_val, 24)), style),
+        Span::styled(format!(" {:>4}", pct(value)), style),
+    ])
+}
+
+fn usage_style(pct: f64, theme: &Theme) -> Style {
+    if pct >= 90.0 {
+        theme.error()
+    } else if pct >= 75.0 {
+        theme.warning()
+    } else {
+        theme.ok()
+    }
+}
+
+#[allow(clippy::too_many_arguments)]
 fn draw_history_chart(
     frame: &mut Frame,
     area: Rect,
-    title: &str,
+    label: &str,
     history: Option<&VecDeque<HistoryPoint>>,
     pick: impl Fn(&HistoryPoint) -> Option<f64>,
     style: Style,
     theme: &Theme,
+    scale: ChartScale,
 ) {
     let values: Vec<f64> = history
         .map(|points| points.iter().filter_map(pick).collect())
         .unwrap_or_default();
-    let block = Block::bordered()
-        .title(Span::styled(title.to_string(), theme.title()))
-        .border_style(theme.border());
     if values.is_empty() {
         frame.render_widget(
             Paragraph::new("no samples yet")
                 .style(theme.muted())
-                .block(block),
+                .block(
+                    Block::bordered()
+                        .title(Span::styled(format!(" {label} "), theme.title()))
+                        .border_style(theme.border()),
+                ),
             area,
         );
         return;
     }
+    let current = values.last().copied().unwrap_or(0.0);
+    let peak = values.iter().cloned().fold(0.0_f64, f64::max);
+    let (y_max, y_labels, headline): (f64, Vec<Line<'static>>, String) = match scale {
+        ChartScale::Percent => (
+            100.0,
+            vec![Line::from("0%"), Line::from("50%"), Line::from("100%")],
+            format!("now {current:.0}%  peak {peak:.0}%"),
+        ),
+        ChartScale::AutoRate => {
+            let max = peak.max(1.0) * 1.05;
+            (
+                max,
+                vec![
+                    Line::from("0"),
+                    Line::from(format_rate(max / 2.0)),
+                    Line::from(format_rate(max)),
+                ],
+                format!("now {}  peak {}", format_rate(current), format_rate(peak)),
+            )
+        }
+    };
+    let title = format!(" {label}  ·  {headline} ");
     let data: Vec<(f64, f64)> = values
         .iter()
         .enumerate()
         .map(|(index, value)| (index as f64, *value))
         .collect();
-    let max = values.iter().cloned().fold(1.0_f64, f64::max).max(1.0);
     let dataset = Dataset::default()
         .marker(ratatui::symbols::Marker::Braille)
         .graph_type(GraphType::Line)
         .style(style)
         .data(&data);
     let chart = Chart::new(vec![dataset])
-        .block(block)
+        .block(
+            Block::bordered()
+                .title(Span::styled(title, theme.title()))
+                .border_style(theme.border()),
+        )
         .x_axis(Axis::default().bounds([0.0, (data.len().saturating_sub(1).max(1)) as f64]))
-        .y_axis(Axis::default().bounds([0.0, max * 1.05]));
+        .y_axis(
+            Axis::default()
+                .bounds([0.0, y_max])
+                .labels(y_labels)
+                .style(theme.muted()),
+        );
     frame.render_widget(chart, area);
 }
 

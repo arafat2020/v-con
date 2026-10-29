@@ -178,9 +178,21 @@ async fn event_loop(
             }
             transfer_event = recv_transfer(&mut live_files) => {
                 if let Some(event) = transfer_event {
-                    app.apply_transfer_event(event);
+                    let mut refreshes = Vec::new();
+                    if let Some(refresh) = app.apply_transfer_event(event) {
+                        refreshes.push(refresh);
+                    }
                     while let Ok(event) = live_files.events.try_recv() {
-                        app.apply_transfer_event(event);
+                        if let Some(refresh) = app.apply_transfer_event(event) {
+                            refreshes.push(refresh);
+                        }
+                    }
+                    for refresh in refreshes {
+                        if let Err(error) =
+                            handle_files_command(app, &mut live_files, refresh).await
+                        {
+                            app.show_error(error.to_string());
+                        }
                     }
                 }
             }
@@ -942,10 +954,9 @@ async fn start_files_copy(
                 error: None,
                 started: None,
             };
-            let _ = live
-                .events_tx
-                .send(TransferEvent::Queued(job.clone()))
-                .await;
+            // Apply locally only — sending Queued on the channel too would
+            // duplicate the job when the event loop drains the receiver, leaving
+            // a forever-Queued ghost that makes transfers look stuck.
             app.apply_transfer_event(TransferEvent::Queued(job.clone()));
             jobs.push(job);
         }

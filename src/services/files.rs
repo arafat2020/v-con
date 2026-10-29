@@ -240,7 +240,7 @@ pub async fn collect_tree<F: RemoteFs>(
 ) -> Result<Vec<(String, DirEntry)>, Error> {
     let root = normalize(root);
     let meta = fs.stat(&root).await?;
-    if meta.is_file() || meta.kind == EntryKind::Symlink {
+    if !meta.is_dir() {
         return Ok(vec![(root, meta)]);
     }
     let mut out = Vec::new();
@@ -252,11 +252,10 @@ pub async fn collect_tree<F: RemoteFs>(
         }
         for entry in fs.list(&dir).await? {
             let path = join(&dir, &entry.name);
-            match entry.kind {
-                EntryKind::Dir => stack.push(path),
-                EntryKind::File | EntryKind::Symlink | EntryKind::Other => {
-                    out.push((path, entry));
-                }
+            if entry.is_dir() {
+                stack.push(path);
+            } else {
+                out.push((path, entry));
             }
         }
     }
@@ -276,7 +275,7 @@ pub async fn copy_file<S: RemoteFs, D: RemoteFs>(
     let total = meta.size;
     let part = format!("{destination}.part");
     if let Some(parent) = parent_of(destination) {
-        let _ = dst.mkdir(&parent).await;
+        ensure_dir(dst, &parent).await?;
     }
     dst.create(&part).await?;
     let mut offset = 0_u64;
@@ -300,6 +299,25 @@ pub async fn copy_file<S: RemoteFs, D: RemoteFs>(
     let _ = dst.set_meta(destination, meta.mode, meta.mtime).await;
     on_progress(total, total);
     Ok(())
+}
+
+/// Create `path` and any missing parents (best-effort if a race creates them).
+async fn ensure_dir<F: RemoteFs>(fs: &F, path: &str) -> Result<(), Error> {
+    let path = normalize(path);
+    if path.is_empty() || path == "/" || path == "." {
+        return Ok(());
+    }
+    if fs.stat(&path).await.is_ok() {
+        return Ok(());
+    }
+    if let Some(parent) = parent_of(&path) {
+        Box::pin(ensure_dir(fs, &parent)).await?;
+    }
+    match fs.mkdir(&path).await {
+        Ok(()) => Ok(()),
+        Err(_error) if fs.stat(&path).await.is_ok() => Ok(()),
+        Err(error) => Err(error),
+    }
 }
 
 /// Destination path that does not yet exist, using `.1`, `.2`, …
@@ -439,7 +457,12 @@ impl TransferQueue {
     /// Apply a transfer event.
     pub fn apply(&mut self, event: TransferEvent) {
         match event {
-            TransferEvent::Queued(job) => self.jobs.push_back(job),
+            TransferEvent::Queued(job) => {
+                if self.jobs.iter().any(|existing| existing.id == job.id) {
+                    return;
+                }
+                self.jobs.push_back(job);
+            }
             TransferEvent::Progress { id, done, total } => {
                 if let Some(job) = self.jobs.iter_mut().find(|job| job.id == id) {
                     job.done = done;
@@ -536,5 +559,47 @@ mod tests {
         assert!(err.to_string().contains("cancelled"));
         assert!(dst.stat("/dest/big.bin").await.is_err());
         assert!(dst.stat("/dest/big.bin.part").await.is_err());
+    }
+
+    #[tokio::test]
+    async fn copy_file_creates_missing_parent_dirs() {
+        let src = FakeFs::new();
+        let dst = FakeFs::new();
+        src.insert_file("/a.txt", b"nested");
+        dst.insert_dir("/dest");
+        copy_file(
+            &src,
+            &dst,
+            "/a.txt",
+            "/dest/deep/down/a.txt",
+            &CancellationToken::new(),
+            |_, _| {},
+        )
+        .await
+        .unwrap();
+        assert_eq!(
+            dst.read_at("/dest/deep/down/a.txt", 0, 16).await.unwrap(),
+            b"nested"
+        );
+    }
+
+    #[test]
+    fn queued_event_does_not_duplicate_the_same_id() {
+        let mut queue = TransferQueue::default();
+        let job = TransferJob {
+            id: 1,
+            direction: TransferDirection::Upload,
+            source: "/a".into(),
+            destination: "/b".into(),
+            host: "web-1".into(),
+            total: 1,
+            done: 0,
+            state: TransferState::Queued,
+            error: None,
+            started: None,
+        };
+        queue.apply(TransferEvent::Queued(job.clone()));
+        queue.apply(TransferEvent::Queued(job));
+        assert_eq!(queue.jobs.len(), 1);
     }
 }

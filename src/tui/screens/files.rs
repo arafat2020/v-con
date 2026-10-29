@@ -924,4 +924,11 @@ mod tests {
         assert_eq!(on_key(&mut view, KeyCode::Right, &[]), FilesEvent::Activate);
         assert_eq!(on_key(&mut view, KeyCode::Left, &[]), FilesEvent::Parent);
     }
+
+    #[test]
+    fn c_and_f5_request_copy() {
+        let mut view = FilesView::new(PathBuf::from("/tmp"));
+        assert_eq!(on_key(&mut view, KeyCode::Char('c'), &[]), FilesEvent::Copy);
+        assert_eq!(on_key(&mut view, KeyCode::F(5), &[]), FilesEvent::Copy);
+    }
 }
