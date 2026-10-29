@@ -33,7 +33,8 @@ to add once the matching TUI feature exists.
 | `vcon snippet run <name> <selector> [--var k=v]` | 8 | Run a saved snippet |
 | `vcon log [--host h] [--since 1d]` | 8 | Print the audit log |
 | `vcon doctor` | 9 | Check ssh/rsync, config validity, agent keys |
-| `vcon completions <shell>` | 9 | Shell completion script |
+| `vcon completions <shell>` | 9 | Shell completion script (bash/zsh/fish/powershell/elvish) |
+| `vcon man` | 9 | Print the man page (troff) to stdout |
 
 ## `exec` flags
 

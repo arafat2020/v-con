@@ -345,4 +345,12 @@ mod tests {
     fn set(names: &[&str]) -> BTreeSet<String> {
         names.iter().map(|name| (*name).to_string()).collect()
     }
+
+    #[test]
+    fn parse_selector_never_panics_on_random_strings() {
+        use proptest::prelude::*;
+        proptest!(|(input in ".*")| {
+            let _ = parse_selector(&input);
+        });
+    }
 }

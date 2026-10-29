@@ -1,8 +1,8 @@
 //! Command-line entry point.
 //!
 //! No subcommand starts the TUI. `init`, `list` (`ls`), `check`, `connect`
-//! (`c`), `import`, `exec` (`x`), `status` (`st`), and `ping` share
-//! [`crate::services::inventory`] and the state file with the Hosts screen.
+//! (`c`), `import`, `exec` (`x`), `status` (`st`), `ping`, `doctor`,
+//! `completions`, and `man` share [`crate::services::inventory`] where needed.
 
 mod commands;
 
@@ -10,6 +10,7 @@ use crate::error::Error;
 use crate::paths::{self, Paths};
 use crate::services::inventory;
 use clap::{Parser, Subcommand};
+use clap_complete::Shell;
 use std::path::PathBuf;
 use std::process::ExitCode;
 use std::sync::Mutex;
@@ -169,6 +170,15 @@ pub enum Command {
         #[arg(long)]
         failed: bool,
     },
+    /// Check ssh, config, agent, control dir, and terminal.
+    Doctor,
+    /// Print a shell completion script.
+    Completions {
+        /// Shell to generate for: bash, zsh, fish, powershell, elvish.
+        shell: Shell,
+    },
+    /// Print the man page (troff) to stdout.
+    Man,
 }
 
 /// `vcon snippet` subcommands.
@@ -412,6 +422,9 @@ fn dispatch(cli: &Cli) -> Result<ExitCode, Error> {
                 json: cli.json,
             },
         ),
+        Some(Command::Doctor) => commands::doctor::run(&paths),
+        Some(Command::Completions { shell }) => commands::completions::run(*shell),
+        Some(Command::Man) => commands::man::run(),
         None => {
             if !std::io::IsTerminal::is_terminal(&std::io::stdout()) {
                 eprintln!("vcon's TUI needs a terminal; use subcommands for scripting");
@@ -433,7 +446,7 @@ fn dispatch(cli: &Cli) -> Result<ExitCode, Error> {
 /// With no `-v`, `VCON_LOG` selects the filter and the default is `info`.
 /// A log file that cannot be opened is skipped so connecting still works.
 fn init_logging(paths: &Paths, verbose: u8) {
-    let _ = std::fs::create_dir_all(&paths.state_dir);
+    let _ = crate::infra::fsutil::create_dir_secure(&paths.state_dir);
     let directive = if verbose >= 2 {
         "trace".to_string()
     } else if verbose == 1 {

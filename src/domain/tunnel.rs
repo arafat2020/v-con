@@ -160,17 +160,19 @@ fn parse_port(raw: &str, label: &str) -> Result<u16, ParseError> {
             message: format!("{label} is missing"),
         });
     }
-    raw.parse::<u16>().map_err(|_| ParseError {
-        message: format!("{label} `{raw}` is not a valid port (1–65535)"),
-    }).and_then(|port| {
-        if port == 0 {
-            Err(ParseError {
-                message: format!("{label} must not be 0"),
-            })
-        } else {
-            Ok(port)
-        }
-    })
+    raw.parse::<u16>()
+        .map_err(|_| ParseError {
+            message: format!("{label} `{raw}` is not a valid port (1–65535)"),
+        })
+        .and_then(|port| {
+            if port == 0 {
+                Err(ParseError {
+                    message: format!("{label} must not be 0"),
+                })
+            } else {
+                Ok(port)
+            }
+        })
 }
 
 #[cfg(test)]
@@ -276,5 +278,13 @@ mod tests {
             assert_eq!(spec.to_compact(), raw);
             assert_eq!(TunnelSpec::parse(&spec.to_compact()).unwrap(), spec);
         }
+    }
+
+    #[test]
+    fn parse_never_panics_on_random_strings() {
+        use proptest::prelude::*;
+        proptest!(|(input in ".*")| {
+            let _ = TunnelSpec::parse(&input);
+        });
     }
 }

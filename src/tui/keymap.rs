@@ -70,6 +70,182 @@ impl Keymap {
         }
         None
     }
+
+    /// Human-readable help lines derived from the current bindings.
+    ///
+    /// Actions are listed in a stable grouped order. Each line is
+    /// `keys` padded then the action description, so `?` stays in sync
+    /// with `[keys.hosts]` overrides.
+    pub fn help_lines(&self) -> Vec<String> {
+        let mut lines = Vec::new();
+        for (heading, actions) in HELP_GROUPS {
+            if !lines.is_empty() {
+                lines.push(String::new());
+            }
+            lines.push((*heading).to_string());
+            for action in *actions {
+                let keys = self.keys_for(action);
+                if keys.is_empty() {
+                    continue;
+                }
+                let label = action_help_label(action);
+                lines.push(format!("{:<16} {label}", keys.join(" / ")));
+            }
+        }
+        lines
+    }
+
+    fn keys_for(&self, action: &Action) -> Vec<String> {
+        let mut keys: Vec<String> = self
+            .bindings
+            .iter()
+            .filter(|(_, bound)| *bound == action)
+            .map(|(binding, _)| format_binding(*binding))
+            .collect();
+        keys.sort();
+        keys.dedup();
+        // Prefer letter chords before arrow aliases when both exist.
+        keys.sort_by(|left, right| {
+            let left_special = left.len() > 1;
+            let right_special = right.len() > 1;
+            left_special
+                .cmp(&right_special)
+                .then_with(|| left.cmp(right))
+        });
+        keys
+    }
+}
+
+/// Help sections shown in the `?` modal.
+const HELP_GROUPS: &[(&str, &[Action])] = &[
+    (
+        "Navigation",
+        &[
+            Action::MoveUp,
+            Action::MoveDown,
+            Action::MoveTop,
+            Action::MoveBottom,
+            Action::PageUp,
+            Action::PageDown,
+            Action::FocusTree,
+            Action::FocusTable,
+            Action::OpenSearch,
+            Action::SwitchScreen(1),
+            Action::SwitchScreen(2),
+            Action::SwitchScreen(3),
+            Action::SwitchScreen(4),
+            Action::SwitchScreen(5),
+        ],
+    ),
+    (
+        "Selection",
+        &[
+            Action::ToggleSelect,
+            Action::SelectAll,
+            Action::ClearSelection,
+        ],
+    ),
+    (
+        "Hosts",
+        &[
+            Action::Connect,
+            Action::OpenSession,
+            Action::CopySshCommand,
+            Action::ToggleFavorite,
+            Action::ToggleSort,
+            Action::AddHost,
+            Action::EditHost,
+            Action::DuplicateHost,
+            Action::DeleteHost,
+            Action::ImportHosts,
+            Action::EditInventory,
+            Action::OpenFiles,
+            Action::OpenSnippets,
+            Action::OpenTunnels,
+            Action::Exec,
+            Action::ShowExec,
+        ],
+    ),
+    (
+        "General",
+        &[Action::ToggleHelp, Action::ToggleProblems, Action::Quit],
+    ),
+];
+
+fn action_help_label(action: &Action) -> &'static str {
+    match action {
+        Action::Quit => "quit",
+        Action::ToggleHelp => "this help",
+        Action::ToggleProblems => "validation problems",
+        Action::SwitchScreen(1) => "Hosts tab",
+        Action::SwitchScreen(2) => "Health tab",
+        Action::SwitchScreen(3) => "Files tab",
+        Action::SwitchScreen(4) => "Sessions tab",
+        Action::SwitchScreen(5) => "Log tab",
+        Action::SwitchScreen(_) => "switch tab",
+        Action::FocusTree => "focus tag tree",
+        Action::FocusTable => "focus host table",
+        Action::MoveUp => "move up",
+        Action::MoveDown => "move down",
+        Action::MoveTop => "top",
+        Action::MoveBottom => "bottom",
+        Action::PageUp => "page up",
+        Action::PageDown => "page down",
+        Action::OpenSearch => "search; Esc clears, Enter keeps it",
+        Action::ToggleSelect => "toggle select",
+        Action::SelectAll => "select visible hosts",
+        Action::ClearSelection => "clear selection",
+        Action::CopySshCommand => "copy the ssh command",
+        Action::Connect => "connect",
+        Action::ToggleFavorite => "toggle favorite",
+        Action::ToggleSort => "sort by frecency",
+        Action::EditInventory => "edit hosts.toml",
+        Action::AddHost => "add a host",
+        Action::EditHost => "edit the cursor host",
+        Action::DuplicateHost => "duplicate the cursor host",
+        Action::DeleteHost => "delete the cursor host",
+        Action::ImportHosts => "import ~/.ssh/config",
+        Action::Exec => "run a command on the selection",
+        Action::ShowExec => "reopen exec results",
+        Action::OpenFiles => "open files for the cursor host",
+        Action::OpenSession => "open an embedded session",
+        Action::OpenSnippets => "snippet picker",
+        Action::OpenTunnels => "tunnels for the cursor host",
+        Action::Tick
+        | Action::CloseModal
+        | Action::SearchInsert(_)
+        | Action::SearchBackspace
+        | Action::SearchSubmit
+        | Action::SearchClear => "",
+    }
+}
+
+fn format_binding(binding: Binding) -> String {
+    // Shift+/ is the usual way to type `?`; show the character users expect.
+    if binding.code == KeyCode::Char('/') && binding.modifiers.contains(KeyModifiers::SHIFT) {
+        return "?".to_string();
+    }
+    let key = match binding.code {
+        KeyCode::Enter => "Enter".to_string(),
+        KeyCode::Esc => "Esc".to_string(),
+        KeyCode::Up => "Up".to_string(),
+        KeyCode::Down => "Down".to_string(),
+        KeyCode::Left => "Left".to_string(),
+        KeyCode::Right => "Right".to_string(),
+        KeyCode::PageUp => "PgUp".to_string(),
+        KeyCode::PageDown => "PgDn".to_string(),
+        KeyCode::Tab => "Tab".to_string(),
+        KeyCode::Char(' ') => "space".to_string(),
+        KeyCode::Char(ch) => ch.to_string(),
+        other => format!("{other:?}"),
+    };
+    if binding.modifiers.contains(KeyModifiers::CONTROL) {
+        format!("ctrl-{key}")
+    } else if binding.modifiers.contains(KeyModifiers::ALT) {
+        format!("alt-{key}")
+    } else {
+        key
+    }
 }
 
 fn defaults() -> HashMap<Binding, Action> {
@@ -266,6 +442,29 @@ mod tests {
         assert_eq!(
             keymap.lookup(KeyCode::Char('e'), KeyModifiers::NONE),
             Some(Action::EditHost)
+        );
+    }
+
+    #[test]
+    fn help_lines_include_bound_actions() {
+        let keymap = Keymap::from_config(&KeyConfig::default()).unwrap();
+        let text = keymap.help_lines().join("\n");
+        assert!(text.contains("Navigation"), "{text}");
+        assert!(text.contains("connect"), "{text}");
+        assert!(text.contains('q'), "{text}");
+        assert!(text.contains('?'), "{text}");
+    }
+
+    #[test]
+    fn help_lines_reflect_overrides() {
+        let mut hosts = BTreeMap::new();
+        hosts.insert("connect".into(), "c".into());
+        let keymap = Keymap::from_config(&KeyConfig { hosts }).unwrap();
+        let text = keymap.help_lines().join("\n");
+        assert!(text.contains('c'), "{text}");
+        assert!(
+            !text.lines().any(|line| line.starts_with("Enter ")),
+            "{text}"
         );
     }
 }

@@ -274,4 +274,30 @@ mod tests {
         assert_eq!(encode_paste("hi", false), b"hi");
         assert_eq!(encode_paste("hi", true), b"\x1b[200~hi\x1b[201~");
     }
+
+    #[test]
+    fn encode_key_never_panics_on_random_inputs() {
+        use proptest::prelude::*;
+        proptest!(|(byte in any::<u8>(), mods in 0u8..8, app in any::<bool>())| {
+            let code = match byte % 12 {
+                0 => KeyCode::Enter,
+                1 => KeyCode::Esc,
+                2 => KeyCode::Backspace,
+                3 => KeyCode::Tab,
+                4 => KeyCode::Up,
+                5 => KeyCode::Down,
+                6 => KeyCode::Left,
+                7 => KeyCode::Right,
+                8 => KeyCode::Home,
+                9 => KeyCode::End,
+                10 => KeyCode::F((byte % 12) + 1),
+                _ => KeyCode::Char(char::from(byte)),
+            };
+            let modifiers = KeyModifiers::from_bits_truncate(mods);
+            let modes = KeyModes {
+                application_cursor: app,
+            };
+            let _ = encode_key(code, modifiers, &modes);
+        });
+    }
 }

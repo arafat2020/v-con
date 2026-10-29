@@ -123,13 +123,11 @@ pub fn run(
 fn parse_vars(pairs: &[String]) -> Result<BTreeMap<String, String>, Error> {
     let mut vars = BTreeMap::new();
     for pair in pairs {
-        let (key, value) = pair.split_once('=').ok_or_else(|| {
-            Error::Message(format!("invalid --var `{pair}`; expected key=value"))
-        })?;
+        let (key, value) = pair
+            .split_once('=')
+            .ok_or_else(|| Error::Message(format!("invalid --var `{pair}`; expected key=value")))?;
         if key.is_empty() {
-            return Err(Error::Message(format!(
-                "invalid --var `{pair}`; empty key"
-            )));
+            return Err(Error::Message(format!("invalid --var `{pair}`; empty key")));
         }
         vars.insert(key.to_string(), value.to_string());
     }

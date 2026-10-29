@@ -21,12 +21,12 @@ use crate::infra::ssh::backend::SshBackend;
 use crate::infra::ssh::system::{self, SystemSsh};
 use crate::infra::state_store;
 use crate::paths::Paths;
+use crate::services::connect::{self};
 use crate::services::exec::{self as job, ExecLaunch};
 use crate::services::files::{
     TransferDirection, TransferEvent, TransferJob, TransferState, collect_tree, map_destinations,
     run_queue,
 };
-use crate::services::connect::{self};
 use crate::services::health::{self as health_svc, HealthControl, HealthEvent};
 use crate::services::inventory::InventoryBundle;
 use crate::services::sessions::{SessionEvent, SessionManager};
@@ -445,11 +445,7 @@ fn apply_commands(
     effects
 }
 
-fn apply_session_side_effects(
-    app: &mut App,
-    live: &LiveSessions,
-    event: &SessionEvent,
-) {
+fn apply_session_side_effects(app: &mut App, live: &LiveSessions, event: &SessionEvent) {
     if let SessionEvent::Output(id) = event {
         live.manager.clear_pending(*id);
         let modes = live.manager.key_modes(*id);
@@ -569,8 +565,7 @@ fn open_session(
         .cloned()
         .or_else(|| system::find_program("ssh", std::env::var_os("PATH").as_deref()))
         .ok_or_else(|| Error::Message(system::missing_ssh_message().to_string()))?;
-    let options =
-        connect::session_options(app.multiplexing_enabled(), app.control_dir_path());
+    let options = connect::session_options(app.multiplexing_enabled(), app.control_dir_path());
     let plan = connect::prepare(app.effective_hosts(), app.state_path(), &options, host)?;
     let _ = state_store::save(app.state_path(), app.state());
     live.manager.open(host, &program, &plan.args, rows, cols)

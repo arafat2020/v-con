@@ -7,6 +7,7 @@
 use crate::domain::activity::{self, RECENT_LIMIT};
 use crate::domain::health::HealthReport;
 use crate::error::Error;
+use crate::infra::fsutil::{self, FILE_MODE};
 use chrono::{DateTime, SecondsFormat, Utc};
 use serde::{Deserialize, Serialize};
 use std::collections::BTreeMap;
@@ -202,12 +203,12 @@ pub fn load(path: &Path) -> (AppState, Option<String>) {
     }
 }
 
-/// Write `state` atomically. The parent directory is created when needed.
+/// Write `state` atomically. The parent directory is created `0700` when needed.
 pub fn save(path: &Path, state: &AppState) -> Result<(), Error> {
     if let Some(parent) = path.parent()
         && !parent.as_os_str().is_empty()
     {
-        std::fs::create_dir_all(parent).map_err(|source| Error::Write {
+        fsutil::create_dir_secure(parent).map_err(|source| Error::Write {
             path: parent.to_path_buf(),
             source,
         })?;
@@ -220,6 +221,10 @@ pub fn save(path: &Path, state: &AppState) -> Result<(), Error> {
         source,
     })?;
     std::fs::rename(&temporary, path).map_err(|source| Error::Write {
+        path: path.to_path_buf(),
+        source,
+    })?;
+    fsutil::set_mode(path, FILE_MODE).map_err(|source| Error::Write {
         path: path.to_path_buf(),
         source,
     })?;

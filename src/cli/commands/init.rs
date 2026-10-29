@@ -4,7 +4,7 @@
 //! valid file, with one example host and the other fields shown as comments.
 
 use crate::error::Error;
-use std::fs;
+use crate::infra::fsutil;
 use std::path::Path;
 
 const TEMPLATE: &str = r#"# vcon inventory.
@@ -39,8 +39,9 @@ notes = "Replace this example with your servers."
 /// Create `config_dir/hosts.toml` when it does not already exist.
 ///
 /// Returns the success message. An existing file is [`Error::Message`].
+/// The directory is `0700` and `hosts.toml` is `0600` on unix.
 pub fn run(config_dir: &Path) -> Result<String, Error> {
-    fs::create_dir_all(config_dir).map_err(|source| Error::Write {
+    fsutil::create_dir_secure(config_dir).map_err(|source| Error::Write {
         path: config_dir.to_path_buf(),
         source,
     })?;
@@ -51,7 +52,7 @@ pub fn run(config_dir: &Path) -> Result<String, Error> {
             path.display()
         )));
     }
-    fs::write(&path, TEMPLATE).map_err(|source| Error::Write {
+    fsutil::write_secure(&path, TEMPLATE).map_err(|source| Error::Write {
         path: path.clone(),
         source,
     })?;
@@ -68,11 +69,11 @@ mod tests {
         let message = run(dir.path()).unwrap();
         let path = dir.path().join("hosts.toml");
         assert!(message.contains(&path.display().to_string()));
-        let text = fs::read_to_string(&path).unwrap();
+        let text = std::fs::read_to_string(&path).unwrap();
         assert!(text.contains("# vcon inventory"));
         assert!(text.contains("[[hosts]]"));
         let error = run(dir.path()).unwrap_err();
         assert!(error.to_string().contains("already exists"));
-        assert!(fs::read_to_string(&path).unwrap().contains("example"));
+        assert!(std::fs::read_to_string(&path).unwrap().contains("example"));
     }
 }

@@ -95,7 +95,10 @@ impl LogView {
                     .map(|results| format!("{results:?}"))
                     .unwrap_or_default()
             );
-            if !hay.to_ascii_lowercase().contains(&self.search.to_ascii_lowercase()) {
+            if !hay
+                .to_ascii_lowercase()
+                .contains(&self.search.to_ascii_lowercase())
+            {
                 return false;
             }
         }
@@ -193,8 +196,8 @@ pub fn draw(frame: &mut Frame, area: Rect, view: &mut LogView, theme: &Theme) {
         }
         format!(" {} ", parts.join(" · "))
     };
-    let header = Row::new(vec!["TIME", "ACTION", "HOSTS", "COMMAND", "RESULT"])
-        .style(theme.muted());
+    let header =
+        Row::new(vec!["TIME", "ACTION", "HOSTS", "COMMAND", "RESULT"]).style(theme.muted());
     let rows = view.visible.iter().map(|index| {
         let entry = &view.entries[*index];
         let time = entry.ts.format("%m-%d %H:%M").to_string();

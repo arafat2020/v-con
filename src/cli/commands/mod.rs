@@ -1,14 +1,15 @@
 //! One module per subcommand.
 
 pub mod check;
-mod completions;
+pub mod completions;
 pub mod connect;
-mod doctor;
+pub mod doctor;
 pub mod exec;
 pub mod import;
 pub mod init;
 pub mod list;
 pub mod log;
+pub mod man;
 pub mod ping;
 pub mod pull;
 pub mod push;

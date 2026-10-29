@@ -138,12 +138,7 @@ fn next_placeholder(input: &str) -> Option<(&str, String, Option<String>, &str)>
     let inner = input[after_open..end].trim();
     if inner.is_empty() {
         return next_placeholder(&input[end + 2..]).map(|(before, name, default, after)| {
-            (
-                &input[..start + 2 + before.len()],
-                name,
-                default,
-                after,
-            )
+            (&input[..start + 2 + before.len()], name, default, after)
         });
     }
     let (name, default) = match inner.split_once('|') {
@@ -190,7 +185,7 @@ mod tests {
 
     #[test]
     fn escapes_embedded_single_quotes() {
-        let rendered = render("echo {{msg}}", &vars(&[("msg", "it's")]) ).unwrap();
+        let rendered = render("echo {{msg}}", &vars(&[("msg", "it's")])).unwrap();
         assert_eq!(rendered, "echo 'it'\\''s'");
     }
 
@@ -222,5 +217,19 @@ mod tests {
     fn map_overrides_default() {
         let rendered = render("n={{lines|100}}", &vars(&[("lines", "20")])).unwrap();
         assert_eq!(rendered, "n='20'");
+    }
+
+    #[test]
+    fn list_variables_and_render_never_panic_on_random_templates() {
+        use proptest::prelude::*;
+        proptest!(|(template in ".*", key in "[a-z]{0,8}", value in ".*")| {
+            let specs = list_variables(&template);
+            let mut map = BTreeMap::new();
+            if !key.is_empty() {
+                map.insert(key, value);
+            }
+            let _ = render(&template, &map);
+            let _ = specs.len();
+        });
     }
 }

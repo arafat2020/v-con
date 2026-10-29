@@ -23,8 +23,7 @@ pub struct LogRequest<'a> {
 
 /// Print matching audit entries.
 pub fn run(paths: &Paths, request: &LogRequest<'_>) -> Result<ExitCode, Error> {
-    let entries = audit::read_recent(&paths.audit_file(), 10_000)
-        .map_err(Error::Message)?;
+    let entries = audit::read_recent(&paths.audit_file(), 10_000).map_err(Error::Message)?;
     let since = request
         .since
         .map(parse_since)

@@ -36,9 +36,17 @@ pub enum SnippetEvent {
 #[derive(Debug, Clone, PartialEq, Eq)]
 enum Mode {
     Picker,
-    Vars { snippet: Snippet, form: Form },
-    Edit { original: Option<String>, form: Form },
-    ConfirmDelete { name: String },
+    Vars {
+        snippet: Snippet,
+        form: Form,
+    },
+    Edit {
+        original: Option<String>,
+        form: Form,
+    },
+    ConfirmDelete {
+        name: String,
+    },
 }
 
 /// Snippet picker / editor state.
@@ -77,37 +85,33 @@ impl SnippetsView {
 }
 
 /// Handle a key. Returns the event for the app.
-pub fn on_key(
-    view: &mut SnippetsView,
-    code: KeyCode,
-    modifiers: KeyModifiers,
-) -> SnippetEvent {
+pub fn on_key(view: &mut SnippetsView, code: KeyCode, modifiers: KeyModifiers) -> SnippetEvent {
     match &mut view.mode {
         Mode::Picker => picker_key(view, code, modifiers),
-        Mode::Vars { snippet, form } => {
-            match form.on_key(code, modifiers) {
-                FormEffect::Continue => SnippetEvent::Continue,
-                FormEffect::Cancel => {
-                    view.mode = Mode::Picker;
-                    SnippetEvent::Continue
-                }
-                FormEffect::Submit => {
-                    let snippet = snippet.clone();
-                    let vars = form_vars(form, &snippet);
-                    match snippet::render(&snippet.command, &vars) {
-                        Ok(command) => SnippetEvent::Run { snippet, command },
-                        Err(missing) => {
-                            if let Some(field) = form.fields.iter_mut().find(|field| {
-                                missing.names.iter().any(|name| name == &field.id)
-                            }) {
-                                field.error = Some("required".into());
-                            }
-                            SnippetEvent::Continue
+        Mode::Vars { snippet, form } => match form.on_key(code, modifiers) {
+            FormEffect::Continue => SnippetEvent::Continue,
+            FormEffect::Cancel => {
+                view.mode = Mode::Picker;
+                SnippetEvent::Continue
+            }
+            FormEffect::Submit => {
+                let snippet = snippet.clone();
+                let vars = form_vars(form, &snippet);
+                match snippet::render(&snippet.command, &vars) {
+                    Ok(command) => SnippetEvent::Run { snippet, command },
+                    Err(missing) => {
+                        if let Some(field) = form
+                            .fields
+                            .iter_mut()
+                            .find(|field| missing.names.iter().any(|name| name == &field.id))
+                        {
+                            field.error = Some("required".into());
                         }
+                        SnippetEvent::Continue
                     }
                 }
             }
-        }
+        },
         Mode::Edit { original, form } => match form.on_key(code, modifiers) {
             FormEffect::Continue => SnippetEvent::Continue,
             FormEffect::Cancel => {
@@ -251,12 +255,7 @@ fn edit_form(snippet: Option<&Snippet>) -> Form {
     let mut name = Field::text("name", "Name");
     let mut description = Field::text("description", "Description");
     let mut command = Field::multiline("command", "Command");
-    let mut confirm = Field::select(
-        "confirm",
-        "Confirm",
-        vec!["no".into(), "yes".into()],
-        "no",
-    );
+    let mut confirm = Field::select("confirm", "Confirm", vec!["no".into(), "yes".into()], "no");
     let mut selector = Field::text("selector", "Selector");
     if let Some(snippet) = snippet {
         name.value = snippet.name.clone();
@@ -373,17 +372,18 @@ pub fn draw(frame: &mut Frame, area: Rect, view: &SnippetsView, theme: &Theme) {
 }
 
 fn draw_picker(frame: &mut Frame, area: Rect, view: &SnippetsView, theme: &Theme) {
-    let chunks = Layout::vertical([Constraint::Length(1), Constraint::Min(0), Constraint::Length(1)])
-        .split(area);
+    let chunks = Layout::vertical([
+        Constraint::Length(1),
+        Constraint::Min(0),
+        Constraint::Length(1),
+    ])
+    .split(area);
     let filter = if view.filter.is_empty() {
         " / filter   ⏎ run   a add   e edit   d del   Esc close".to_string()
     } else {
         format!(" /{} ", view.filter)
     };
-    frame.render_widget(
-        Paragraph::new(filter).style(theme.muted()),
-        chunks[0],
-    );
+    frame.render_widget(Paragraph::new(filter).style(theme.muted()), chunks[0]);
     let items: Vec<ListItem> = view
         .filtered()
         .into_iter()

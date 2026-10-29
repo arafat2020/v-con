@@ -3,6 +3,7 @@
 //! Entries never include command output — only the command string, hosts, and
 //! per-host exit codes.
 
+use crate::infra::fsutil::{self, FILE_MODE};
 use chrono::{DateTime, Utc};
 use regex::Regex;
 use serde::{Deserialize, Serialize};
@@ -54,7 +55,7 @@ pub fn append(
         *command = redact_command(command, redact);
     }
     if let Some(parent) = path.parent() {
-        fs::create_dir_all(parent).map_err(|error| error.to_string())?;
+        fsutil::create_dir_secure(parent).map_err(|error| error.to_string())?;
     }
     rotate_if_needed(path, max_bytes)?;
     let line = serde_json::to_string(&entry).map_err(|error| error.to_string())?;
@@ -64,6 +65,7 @@ pub fn append(
         .open(path)
         .map_err(|error| error.to_string())?;
     writeln!(file, "{line}").map_err(|error| error.to_string())?;
+    let _ = fsutil::set_mode(path, FILE_MODE);
     Ok(())
 }
 
@@ -129,7 +131,9 @@ fn rotated_path(path: &Path) -> PathBuf {
 fn compile_regex(pattern: &str) -> Result<Regex, String> {
     static CACHE: OnceLock<Mutex<BTreeMap<String, Regex>>> = OnceLock::new();
     let cache = CACHE.get_or_init(|| Mutex::new(BTreeMap::new()));
-    let mut guard = cache.lock().unwrap_or_else(|poisoned| poisoned.into_inner());
+    let mut guard = cache
+        .lock()
+        .unwrap_or_else(|poisoned| poisoned.into_inner());
     if let Some(re) = guard.get(pattern) {
         return Ok(re.clone());
     }
@@ -204,10 +208,12 @@ mod tests {
             duration_ms: None,
         };
         append(&path, entry, 32, &[]).unwrap();
-        assert!(path.with_extension("jsonl.1").exists() || {
-            // rotated_path appends ".1" to the full name
-            PathBuf::from(format!("{}.1", path.display())).exists()
-        });
+        assert!(
+            path.with_extension("jsonl.1").exists() || {
+                // rotated_path appends ".1" to the full name
+                PathBuf::from(format!("{}.1", path.display())).exists()
+            }
+        );
         let text = fs::read_to_string(&path).unwrap();
         assert!(text.contains("session_open"));
     }

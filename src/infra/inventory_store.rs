@@ -10,7 +10,9 @@
 
 use crate::domain::host::{Host, Inventory, Problem, ProblemSite, validate_inventory};
 use crate::error::{Error, line_number};
-use std::fs;
+use crate::infra::fsutil::{self, FILE_MODE};
+use fs4::fs_std::FileExt;
+use std::fs::{self, OpenOptions};
 use std::path::{Path, PathBuf};
 use std::str::FromStr;
 use toml_edit::{Array, ArrayOfTables, DocumentMut, Item, Table, Value};
@@ -178,16 +180,61 @@ fn mutate(
     path: &Path,
     edit: impl FnOnce(&mut LoadedInventory) -> Result<(), Error>,
 ) -> Result<LoadedInventory, Error> {
-    let mut loaded = load(path)?;
-    edit(&mut loaded)?;
-    let text = loaded.document.to_string();
-    let reparsed = parse_text(path, &text)?;
-    let problems = validate_inventory(&reparsed.inventory);
-    if !problems.is_empty() {
-        return Err(Error::Message(format_problems(&problems)));
+    with_inventory_lock(path, || {
+        let mut loaded = load(path)?;
+        edit(&mut loaded)?;
+        let text = loaded.document.to_string();
+        let reparsed = parse_text(path, &text)?;
+        let problems = validate_inventory(&reparsed.inventory);
+        if !problems.is_empty() {
+            return Err(Error::Message(format_problems(&problems)));
+        }
+        write_atomic(path, &text)?;
+        parse_text(path, &text)
+    })
+}
+
+/// Exclusive lock around inventory read-modify-write so two processes cannot clobber the file.
+fn with_inventory_lock<T>(
+    path: &Path,
+    body: impl FnOnce() -> Result<T, Error>,
+) -> Result<T, Error> {
+    let lock_path = inventory_lock_path(path);
+    if let Some(parent) = lock_path.parent()
+        && !parent.as_os_str().is_empty()
+    {
+        fsutil::create_dir_secure(parent).map_err(|source| Error::Write {
+            path: parent.to_path_buf(),
+            source,
+        })?;
     }
-    write_atomic(path, &text)?;
-    parse_text(path, &text)
+    let file = OpenOptions::new()
+        .create(true)
+        .read(true)
+        .write(true)
+        .truncate(false)
+        .open(&lock_path)
+        .map_err(|source| Error::Write {
+            path: lock_path.clone(),
+            source,
+        })?;
+    file.lock_exclusive().map_err(|source| Error::Write {
+        path: lock_path.clone(),
+        source,
+    })?;
+    let result = body();
+    let _ = FileExt::unlock(&file);
+    let _ = file;
+    result
+}
+
+fn inventory_lock_path(path: &Path) -> PathBuf {
+    let parent = path.parent().unwrap_or_else(|| Path::new("."));
+    let name = path
+        .file_name()
+        .map(|name| name.to_string_lossy().into_owned())
+        .unwrap_or_else(|| "hosts.toml".to_string());
+    parent.join(format!(".{name}.lock"))
 }
 
 fn format_problems(problems: &[Problem]) -> String {
@@ -335,11 +382,13 @@ fn table_str<'a>(table: &'a Table, key: &str) -> Option<&'a str> {
 }
 
 /// Write `text` by renaming a temporary file. The previous file becomes `*.bak`.
+///
+/// Parent directories are created `0700`. The final file is set to `0600`.
 pub fn write_atomic(path: &Path, text: &str) -> Result<(), Error> {
     if let Some(parent) = path.parent()
         && !parent.as_os_str().is_empty()
     {
-        fs::create_dir_all(parent).map_err(|source| Error::Write {
+        fsutil::create_dir_secure(parent).map_err(|source| Error::Write {
             path: parent.to_path_buf(),
             source,
         })?;
@@ -364,7 +413,12 @@ pub fn write_atomic(path: &Path, text: &str) -> Result<(), Error> {
     fs::rename(&temporary, path).map_err(|source| Error::Write {
         path: path.to_path_buf(),
         source,
-    })
+    })?;
+    fsutil::set_mode(path, FILE_MODE).map_err(|source| Error::Write {
+        path: path.to_path_buf(),
+        source,
+    })?;
+    Ok(())
 }
 
 #[cfg(test)]

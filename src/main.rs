@@ -1,8 +1,7 @@
 //! vcon browses an SSH host inventory from the terminal and from scripts.
 //!
-//! With no arguments, [`tui::run`] opens the Hosts screen. `vcon init`,
-//! `vcon ls`, `vcon check`, `vcon connect`, `vcon import`, `vcon exec`,
-//! `vcon status`, and `vcon ping` share one inventory.
+//! With no arguments, [`tui::run`] opens the Hosts screen. Subcommands share
+//! the same inventory, config, and services as the TUI.
 
 mod cli;
 mod config;

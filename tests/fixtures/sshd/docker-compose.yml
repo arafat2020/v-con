@@ -1,0 +1,15 @@
+# Minimal OpenSSH server for ignored integration tests.
+# Not started by default CI; use with DOCKER=1 cargo test -- --ignored.
+services:
+  sshd:
+    image: lscr.io/linuxserver/openssh-server:latest
+    environment:
+      PUID: "1000"
+      PGID: "1000"
+      TZ: Utc
+      PASSWORD_ACCESS: "true"
+      USER_PASSWORD: "test"
+      USER_NAME: test
+    ports:
+      - "2222:2222"
+    # Replace with a generated key + authorized_keys volume for real suites.
