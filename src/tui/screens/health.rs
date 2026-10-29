@@ -392,17 +392,19 @@ pub fn draw(
         "NET ↓/↑",
         "UP",
     ])
-    .style(theme.muted());
+    .style(theme.header_row());
     let selected = view
         .cursor_name
         .as_ref()
         .and_then(|name| names.iter().position(|row| row == name));
     let table = Table::new(rows, widths)
         .header(header)
+        .style(theme.text())
         .block(
             Block::bordered()
-                .title(title)
-                .title_bottom(Line::from(filter_note)),
+                .title(Span::styled(title, theme.title()))
+                .title_bottom(Line::styled(filter_note, theme.muted()))
+                .border_style(theme.border()),
         )
         .row_highlight_style(theme.selected());
     let mut state = TableState::new()
@@ -463,7 +465,12 @@ fn draw_detail(frame: &mut Frame, area: Rect, view: &HealthView, name: &str, the
     };
     frame.render_widget(
         Paragraph::new(summary)
-            .block(Block::bordered().title(format!(" {name} ")))
+            .style(theme.text())
+            .block(
+                Block::bordered()
+                    .title(Span::styled(format!(" {name} "), theme.title()))
+                    .border_style(theme.border()),
+            )
             .wrap(Wrap { trim: false }),
         chunks[0],
     );
@@ -475,6 +482,7 @@ fn draw_detail(frame: &mut Frame, area: Rect, view: &HealthView, name: &str, the
         history,
         |point| point.cpu_pct,
         theme.ok(),
+        theme,
     );
     draw_history_chart(
         frame,
@@ -483,6 +491,7 @@ fn draw_detail(frame: &mut Frame, area: Rect, view: &HealthView, name: &str, the
         history,
         |point| point.mem_pct,
         theme.warning(),
+        theme,
     );
     draw_history_chart(
         frame,
@@ -491,6 +500,7 @@ fn draw_detail(frame: &mut Frame, area: Rect, view: &HealthView, name: &str, the
         history,
         |point| point.net_rx_bps,
         theme.selected(),
+        theme,
     );
 }
 
@@ -501,13 +511,19 @@ fn draw_history_chart(
     history: Option<&VecDeque<HistoryPoint>>,
     pick: impl Fn(&HistoryPoint) -> Option<f64>,
     style: Style,
+    theme: &Theme,
 ) {
     let values: Vec<f64> = history
         .map(|points| points.iter().filter_map(pick).collect())
         .unwrap_or_default();
+    let block = Block::bordered()
+        .title(Span::styled(title.to_string(), theme.title()))
+        .border_style(theme.border());
     if values.is_empty() {
         frame.render_widget(
-            Paragraph::new("no samples yet").block(Block::bordered().title(title)),
+            Paragraph::new("no samples yet")
+                .style(theme.muted())
+                .block(block),
             area,
         );
         return;
@@ -524,7 +540,7 @@ fn draw_history_chart(
         .style(style)
         .data(&data);
     let chart = Chart::new(vec![dataset])
-        .block(Block::bordered().title(title))
+        .block(block)
         .x_axis(Axis::default().bounds([0.0, (data.len().saturating_sub(1).max(1)) as f64]))
         .y_axis(Axis::default().bounds([0.0, max * 1.05]));
     frame.render_widget(chart, area);

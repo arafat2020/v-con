@@ -10,9 +10,8 @@ use crate::tui::theme::Theme;
 use crossterm::event::KeyCode;
 use ratatui::Frame;
 use ratatui::layout::{Constraint, Layout, Rect};
-use ratatui::style::{Modifier, Style};
 use ratatui::text::{Line, Span};
-use ratatui::widgets::{Block, Gauge, List, ListItem, ListState, Paragraph, Wrap};
+use ratatui::widgets::{Block, Clear, Gauge, List, ListItem, ListState, Paragraph, Wrap};
 use std::collections::BTreeSet;
 use std::path::PathBuf;
 use std::time::SystemTime;
@@ -277,9 +276,13 @@ impl FilesView {
             PaneFocus::Local => &mut self.local,
             PaneFocus::Remote => &mut self.remote,
         };
+        let path_changed = pane.path != path;
         pane.path = path;
         pane.entries = file_svc::prepare_listing(entries, self.sort, self.show_hidden);
         pane.marks.clear();
+        if path_changed {
+            pane.cursor = 0;
+        }
         pane.clamp();
     }
 
@@ -453,8 +456,9 @@ pub fn on_key(view: &mut FilesView, code: KeyCode, hosts: &[EffectiveHost]) -> F
             view.focused().move_by(20);
             FilesEvent::None
         }
-        KeyCode::Enter => FilesEvent::Activate,
-        KeyCode::Backspace | KeyCode::Char('h') => FilesEvent::Parent,
+        // Enter / l / → open (dirs navigate, files view). h / ← go up.
+        KeyCode::Enter | KeyCode::Right | KeyCode::Char('l') => FilesEvent::Activate,
+        KeyCode::Backspace | KeyCode::Left | KeyCode::Char('h') => FilesEvent::Parent,
         KeyCode::Char(' ') => {
             if let Some(name) = view.focused().current().map(|entry| entry.name.clone()) {
                 let pane = view.focused();
@@ -716,18 +720,18 @@ fn draw_pane(
             let style = if cursor && focused {
                 theme.selected()
             } else if entry.is_dir() {
-                Style::new().add_modifier(Modifier::BOLD)
+                theme.directory()
+            } else if matches!(entry.kind, EntryKind::Symlink) {
+                theme.symlink()
             } else {
-                Style::new()
+                theme.text()
             };
             ListItem::new(Line::from(Span::styled(line, style)))
         })
         .collect();
-    let block = Block::bordered().title(title).border_style(if focused {
-        theme.selected()
-    } else {
-        Style::new()
-    });
+    let block = Block::bordered()
+        .title(Span::styled(title, theme.title()))
+        .border_style(theme.pane_border(focused));
     let mut state = ListState::default().with_selected(Some(pane.cursor));
     frame.render_stateful_widget(List::new(items).block(block), area, &mut state);
 }
@@ -750,7 +754,12 @@ fn draw_queue(frame: &mut Frame, area: Rect, view: &FilesView, theme: &Theme) {
             } else {
                 "t expand"
             })
-            .block(Block::bordered().title(title)),
+            .style(theme.muted())
+            .block(
+                Block::bordered()
+                    .title(Span::styled(title, theme.title()))
+                    .border_style(theme.border()),
+            ),
             area,
         );
         return;
@@ -759,8 +768,18 @@ fn draw_queue(frame: &mut Frame, area: Rect, view: &FilesView, theme: &Theme) {
         std::iter::repeat_n(Constraint::Length(1), view.queue.jobs.len().min(4))
             .collect::<Vec<_>>(),
     )
-    .split(Block::bordered().title(title.clone()).inner(area));
-    frame.render_widget(Block::bordered().title(title), area);
+    .split(
+        Block::bordered()
+            .title(Span::styled(title.clone(), theme.title()))
+            .border_style(theme.border())
+            .inner(area),
+    );
+    frame.render_widget(
+        Block::bordered()
+            .title(Span::styled(title, theme.title()))
+            .border_style(theme.border()),
+        area,
+    );
     for (index, job) in view.queue.jobs.iter().rev().take(4).enumerate() {
         if let Some(row) = rows.get(index) {
             draw_job(frame, *row, job, theme);
@@ -790,7 +809,7 @@ fn draw_job(frame: &mut Frame, area: Rect, job: &TransferJob, theme: &Theme) {
         TransferState::Failed => theme.error(),
         TransferState::Done => theme.ok(),
         TransferState::Cancelled => theme.muted(),
-        _ => Style::new(),
+        _ => theme.text(),
     };
     frame.render_widget(
         Gauge::default()
@@ -814,6 +833,9 @@ fn draw_viewer(frame: &mut Frame, area: Rect, viewer: &Viewer, theme: &Theme) {
 }
 
 fn draw_message(frame: &mut Frame, area: Rect, title: &str, body: &str, theme: &Theme) {
+    if area.width < 8 || area.height < 4 {
+        return;
+    }
     let width = area.width.saturating_mul(80) / 100;
     let height = area.height.saturating_mul(70) / 100;
     let x = area.x + (area.width.saturating_sub(width)) / 2;
@@ -821,15 +843,25 @@ fn draw_message(frame: &mut Frame, area: Rect, title: &str, body: &str, theme: &
     let rect = Rect {
         x,
         y,
-        width,
-        height,
+        width: width.max(10),
+        height: height.max(5),
     };
+    // Clear first so the dual-pane list does not bleed through the popup.
+    frame.render_widget(Clear, rect);
     frame.render_widget(
-        Paragraph::new(body).wrap(Wrap { trim: false }).block(
-            Block::bordered()
-                .title(format!(" {title} "))
-                .border_style(theme.selected()),
-        ),
+        Paragraph::new(body)
+            .wrap(Wrap { trim: false })
+            .style(theme.text())
+            .block(
+                Block::bordered()
+                    .title(Span::styled(format!(" {title} "), theme.title()))
+                    .title_bottom(Line::styled(
+                        " Esc close  ↑↓ scroll ",
+                        theme.muted(),
+                    ))
+                    .border_style(theme.border_focus())
+                    .style(theme.bar()),
+            ),
         rect,
     );
 }
@@ -880,5 +912,16 @@ mod tests {
         view.focus = PaneFocus::Local;
         assert_eq!(on_key(&mut view, KeyCode::Char(' '), &[]), FilesEvent::None);
         assert!(view.local.marks.contains("a.txt"));
+    }
+
+    #[test]
+    fn l_and_right_activate_left_goes_up() {
+        let mut view = FilesView::new(PathBuf::from("/tmp"));
+        assert_eq!(
+            on_key(&mut view, KeyCode::Char('l'), &[]),
+            FilesEvent::Activate
+        );
+        assert_eq!(on_key(&mut view, KeyCode::Right, &[]), FilesEvent::Activate);
+        assert_eq!(on_key(&mut view, KeyCode::Left, &[]), FilesEvent::Parent);
     }
 }

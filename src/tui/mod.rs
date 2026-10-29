@@ -59,6 +59,12 @@ pub async fn run(
     let mouse = app.mouse();
     let frame = app.frame_time();
     let mut terminal = terminal::setup(mouse).map_err(|error| Error::Message(error.to_string()))?;
+    // Paint immediately so `cargo run` does not leave a blank alternate screen
+    // until the first fps tick (which feels like you need to scroll to "wake" it).
+    terminal
+        .draw(|frame| app.draw(frame, None))
+        .map_err(|error| Error::Message(error.to_string()))?;
+    app.dirty = false;
     let result = event_loop(&mut terminal, &mut app, frame).await;
     let _ = terminal::restore();
     result
@@ -635,8 +641,11 @@ async fn refresh_files_listings(
                 app.apply_files_listing(PaneFocus::Local, path, entries);
             }
             Err(error) => {
+                // Roll back to the parent so a failed Enter does not strand the pane.
+                app.files.local.path = parent_of(&path).unwrap_or_else(|| path.clone());
                 app.files.status = Some(error.to_string());
                 app.toast(error.to_string());
+                app.dirty = true;
             }
         }
     }
@@ -651,8 +660,10 @@ async fn refresh_files_listings(
                 app.apply_files_listing(PaneFocus::Remote, path, entries);
             }
             Err(error) => {
+                app.files.remote.path = parent_of(&path).unwrap_or_else(|| path.clone());
                 app.files.status = Some(error.to_string());
                 app.toast(error.to_string());
+                app.dirty = true;
             }
         }
     }

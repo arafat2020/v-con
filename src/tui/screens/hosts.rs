@@ -14,7 +14,6 @@ use crate::tui::action::Action;
 use crate::tui::theme::Theme;
 use ratatui::Frame;
 use ratatui::layout::{Constraint, Layout, Rect};
-use ratatui::style::Style;
 use ratatui::text::{Line, Span};
 use ratatui::widgets::{
     Block, Cell, Paragraph, Row, Scrollbar, ScrollbarOrientation, ScrollbarState, Table,
@@ -410,13 +409,18 @@ fn draw_tree(
         .iter()
         .map(|(id, label)| TreeItem::new_leaf(id.clone(), label.clone()))
         .collect();
+    let focused = view.focus == Focus::Tree;
     let tree = Tree::new(&items)
         .expect("tag identifiers are unique")
-        .block(Block::bordered().title(" Tags "))
-        .highlight_style(if view.focus == Focus::Tree {
+        .block(
+            Block::bordered()
+                .title(Span::styled(" Tags ", options.theme.title()))
+                .border_style(options.theme.pane_border(focused)),
+        )
+        .highlight_style(if focused {
             options.theme.selected()
         } else {
-            Style::new().add_modifier(ratatui::style::Modifier::BOLD)
+            options.theme.title()
         })
         .highlight_symbol("");
     frame.render_stateful_widget(tree, area, &mut view.tree);
@@ -443,7 +447,10 @@ fn draw_table(
         .selector_error
         .clone()
         .or_else(|| output.warnings.first().cloned());
-    let mut block = Block::bordered().title(title);
+    let focused = view.focus == Focus::Table;
+    let mut block = Block::bordered()
+        .title(Span::styled(title, options.theme.title()))
+        .border_style(options.theme.pane_border(focused));
     if let Some(notice) = notice.as_ref() {
         block = block.title_bottom(Line::styled(format!(" {notice} "), options.theme.error()));
     }
@@ -542,9 +549,10 @@ fn draw_table(
         Row::new(vec!["NAME", "UP", "ADDRESS", "USER", "TAGS", "LAST"])
     };
     let table = Table::new(rows, widths)
-        .header(header.style(options.theme.muted()))
+        .header(header.style(options.theme.header_row()))
         .block(block)
-        .row_highlight_style(options.theme.selected());
+        .row_highlight_style(options.theme.selected())
+        .style(options.theme.text());
     let mut state = TableState::new()
         .with_offset(view.table_offset)
         .with_selected(position);
@@ -571,7 +579,13 @@ fn draw_detail(
 ) {
     let Some(host) = view.cursor(hosts) else {
         frame.render_widget(
-            Paragraph::new("No host selected.").block(Block::bordered().title(" Detail ")),
+            Paragraph::new("No host selected.")
+                .style(options.theme.muted())
+                .block(
+                    Block::bordered()
+                        .title(Span::styled(" Detail ", options.theme.title()))
+                        .border_style(options.theme.border()),
+                ),
             area,
         );
         return;
@@ -613,7 +627,12 @@ fn draw_detail(
     );
     frame.render_widget(
         Paragraph::new(text)
-            .block(Block::bordered().title(" Detail "))
+            .style(options.theme.text())
+            .block(
+                Block::bordered()
+                    .title(Span::styled(" Detail ", options.theme.title()))
+                    .border_style(options.theme.border()),
+            )
             .wrap(Wrap { trim: true }),
         area,
     );
@@ -703,7 +722,7 @@ fn highlighted<'a>(text: &str, indices: &[u32], theme: &Theme) -> Vec<Span<'a>> 
             let style = if active {
                 theme.match_style()
             } else {
-                Style::new()
+                theme.text()
             };
             spans.push(Span::styled(std::mem::take(&mut buf), style));
         }
@@ -714,7 +733,7 @@ fn highlighted<'a>(text: &str, indices: &[u32], theme: &Theme) -> Vec<Span<'a>> 
         let style = if active {
             theme.match_style()
         } else {
-            Style::new()
+            theme.text()
         };
         spans.push(Span::styled(buf, style));
     }

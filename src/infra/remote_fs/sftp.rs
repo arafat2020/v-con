@@ -248,16 +248,19 @@ fn sftp_err(op: &str, path: &str, error: openssh_sftp_client::Error) -> Error {
 }
 
 fn from_meta(name: String, meta: MetaData, target: Option<String>) -> DirEntry {
+    let mode = meta.permissions().map(|perms| perms.as_raw().bits());
     let kind = match meta.file_type() {
         Some(ft) if ft.is_dir() => EntryKind::Dir,
         Some(ft) if ft.is_symlink() => EntryKind::Symlink,
         Some(ft) if ft.is_file() => EntryKind::File,
         Some(_) => EntryKind::Other,
-        None => EntryKind::Other,
+        None => match mode.map(|m| m & 0o170_000) {
+            Some(0o040_000) => EntryKind::Dir,
+            Some(0o120_000) => EntryKind::Symlink,
+            Some(0o100_000) => EntryKind::File,
+            _ => EntryKind::Other,
+        },
     };
-    let mode = meta
-        .permissions()
-        .map(|perms| u32::from(perms.as_raw().bits() as u16));
     let mtime = meta.modified().map(|stamp| stamp.as_system_time());
     DirEntry {
         name,

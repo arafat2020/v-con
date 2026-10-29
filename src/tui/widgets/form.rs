@@ -169,7 +169,8 @@ impl Form {
             }
             return FormEffect::Cancel;
         }
-        if code == KeyCode::Char('s') && modifiers.contains(KeyModifiers::CONTROL) {
+        // Caps Lock can deliver `S` with CONTROL; accept both.
+        if matches!(code, KeyCode::Char('s' | 'S')) && modifiers.contains(KeyModifiers::CONTROL) {
             return FormEffect::Submit;
         }
         match code {
@@ -461,6 +462,15 @@ mod tests {
         form.focus = 2;
         assert_eq!(
             form.on_key(KeyCode::Enter, KeyModifiers::NONE),
+            FormEffect::Submit
+        );
+    }
+
+    #[test]
+    fn caps_lock_ctrl_s_still_submits() {
+        let mut form = sample();
+        assert_eq!(
+            form.on_key(KeyCode::Char('S'), KeyModifiers::CONTROL),
             FormEffect::Submit
         );
     }

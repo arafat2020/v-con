@@ -3,7 +3,7 @@
 use crate::tui::theme::Theme;
 use ratatui::Frame;
 use ratatui::layout::Rect;
-use ratatui::text::Line;
+use ratatui::text::{Line, Span};
 use ratatui::widgets::{Block, Clear, Paragraph, Wrap};
 
 /// Draw a bordered popup in the middle of `area`.
@@ -30,9 +30,11 @@ pub fn render(
     };
     frame.render_widget(Clear, popup);
     let block = Block::bordered()
-        .title(format!(" {title} "))
-        .border_style(theme.selected());
+        .title(Span::styled(format!(" {title} "), theme.title()))
+        .border_style(theme.border_focus())
+        .style(theme.bar());
     let paragraph = Paragraph::new(lines)
+        .style(theme.text())
         .block(block)
         .wrap(Wrap { trim: false });
     frame.render_widget(paragraph, popup);

@@ -569,13 +569,16 @@ fn draw_tab_bar(frame: &mut Frame, area: Rect, view: &SessionsView, theme: &Them
             text.push('*');
         }
         let style = if index == view.active_tab {
-            theme.selected()
+            theme.tab_active()
         } else {
-            Style::default()
+            theme.tab_inactive()
         };
         spans.push(Span::styled(format!(" {text} "), style));
     }
-    frame.render_widget(Paragraph::new(Line::from(spans)), area);
+    frame.render_widget(
+        Paragraph::new(Line::from(spans)).style(theme.bar()),
+        area,
+    );
 }
 
 #[allow(clippy::too_many_arguments)]
@@ -649,17 +652,10 @@ fn draw_pane(
     } else {
         format!(" {host} ")
     };
-    let border = if focused {
-        Style::default()
-            .fg(theme.highlight)
-            .add_modifier(Modifier::BOLD)
-    } else {
-        Style::default()
-    };
     let block = Block::default()
         .borders(Borders::ALL)
-        .title(title)
-        .border_style(border);
+        .title(Span::styled(title, theme.title()))
+        .border_style(theme.pane_border(focused));
     let inner = block.inner(area);
     frame.render_widget(block, area);
 

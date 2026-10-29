@@ -6,13 +6,13 @@
 //! A panic hook calls restore before the default hook prints, so a panic does
 //! not leave the terminal in raw mode.
 
-use crossterm::cursor::{Hide, Show};
+use crossterm::cursor::{Hide, MoveTo, Show};
 use crossterm::event::{
     DisableBracketedPaste, DisableMouseCapture, EnableBracketedPaste, EnableMouseCapture,
 };
 use crossterm::execute;
 use crossterm::terminal::{
-    EnterAlternateScreen, LeaveAlternateScreen, disable_raw_mode, enable_raw_mode,
+    Clear, ClearType, EnterAlternateScreen, LeaveAlternateScreen, disable_raw_mode, enable_raw_mode,
 };
 use ratatui::Terminal;
 use ratatui::backend::CrosstermBackend;
@@ -29,13 +29,25 @@ pub type Tui = Terminal<CrosstermBackend<Stdout>>;
 pub fn setup(mouse: bool) -> io::Result<Tui> {
     enable_raw_mode()?;
     let mut stdout = io::stdout();
-    execute!(stdout, EnterAlternateScreen, EnableBracketedPaste, Hide)?;
+    // Clear after entering the alternate screen so cargo/build scrollback does
+    // not leave the viewport scrolled away from the first frame.
+    execute!(
+        stdout,
+        EnterAlternateScreen,
+        Clear(ClearType::All),
+        MoveTo(0, 0),
+        EnableBracketedPaste,
+        Hide
+    )?;
     if mouse {
         execute!(stdout, EnableMouseCapture)?;
     }
+    let _ = stdout.flush();
     RESTORED.store(false, Ordering::SeqCst);
     install_panic_hook();
-    Terminal::new(CrosstermBackend::new(stdout))
+    let mut terminal = Terminal::new(CrosstermBackend::new(stdout))?;
+    terminal.clear()?;
+    Ok(terminal)
 }
 
 /// Leave the TUI. A second call does nothing.

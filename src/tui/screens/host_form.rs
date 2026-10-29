@@ -11,6 +11,7 @@ use crate::tui::widgets::form::{Field, Form, FormEffect};
 use crossterm::event::{KeyCode, KeyModifiers};
 use ratatui::Frame;
 use ratatui::layout::Rect;
+use ratatui::text::Span;
 use ratatui::widgets::{Block, Clear, Paragraph, Wrap};
 use std::path::Path;
 
@@ -163,12 +164,17 @@ pub fn draw(frame: &mut Frame, area: Rect, form: &HostForm, theme: &Theme) {
     if let Some(status) = &form.status {
         lines.push(status.clone());
     }
-    lines.push("Tab moves  Ctrl+S saves  Esc cancels".to_string());
+    lines.push("Tab/↑↓ move  Ctrl+S or Save+Enter  Esc cancels".to_string());
     let paragraph = Paragraph::new(lines.join("\n"))
+        .style(theme.text())
         .block(
             Block::bordered()
-                .title(format!(" {} ", form.title))
-                .border_style(theme.selected()),
+                .title(Span::styled(
+                    format!(" {} ", form.title),
+                    theme.title(),
+                ))
+                .border_style(theme.border_focus())
+                .style(theme.bar()),
         )
         .wrap(Wrap { trim: false });
     frame.render_widget(paragraph, popup);
