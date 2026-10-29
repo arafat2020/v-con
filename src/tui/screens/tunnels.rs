@@ -65,11 +65,7 @@ impl TunnelsView {
 }
 
 /// Handle a key given the currently running tunnels for this host.
-pub fn on_key(
-    view: &mut TunnelsView,
-    code: KeyCode,
-    running: &[RunningTunnel],
-) -> TunnelUiEvent {
+pub fn on_key(view: &mut TunnelsView, code: KeyCode, running: &[RunningTunnel]) -> TunnelUiEvent {
     match code {
         KeyCode::Esc => TunnelUiEvent::Close,
         KeyCode::Up | KeyCode::Char('k') => {

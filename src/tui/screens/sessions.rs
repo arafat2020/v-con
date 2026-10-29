@@ -684,8 +684,7 @@ fn draw_pane(
             let (row, col) = screen.cursor_position();
             let x = inner.x.saturating_add(col);
             let y = inner.y.saturating_add(row);
-            if x < inner.x.saturating_add(inner.width) && y < inner.y.saturating_add(inner.height)
-            {
+            if x < inner.x.saturating_add(inner.width) && y < inner.y.saturating_add(inner.height) {
                 frame.set_cursor_position((x, y));
             }
         }

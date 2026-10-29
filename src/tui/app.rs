@@ -10,6 +10,7 @@ use crate::domain::health::{HealthStatus, now_secs};
 use crate::domain::host::{EffectiveHost, Host, Inventory, Problem};
 use crate::domain::tunnel::TunnelSpec;
 use crate::error::Error;
+use crate::infra::pty::{KeyModes, encode_key, encode_paste};
 use crate::infra::remote_fs::{DirEntry, join, normalize};
 use crate::infra::ssh::command::{
     SshCommandOptions, build_ssh_command, command_line, exec_arguments,
@@ -26,7 +27,6 @@ use crate::services::health::{
     self as health_svc, HealthControl, HealthEvent, HealthSettings, HostHealth,
 };
 use crate::services::inventory::{self, InventoryBundle};
-use crate::infra::pty::{KeyModes, encode_key, encode_paste};
 use crate::services::sessions::{SessionEvent, SessionId};
 use crate::services::snippets::SnippetStore;
 use crate::services::tunnels::{RunningTunnel, TunnelEvent};
@@ -286,7 +286,9 @@ impl App {
         }
         if self.screen == 4 && self.modal.is_none() {
             let session_cmds = self.sessions_key(code, modifiers);
-            if !session_cmds.is_empty() || self.sessions.focused || self.sessions.prefix_until.is_some()
+            if !session_cmds.is_empty()
+                || self.sessions.focused
+                || self.sessions.prefix_until.is_some()
             {
                 return session_cmds;
             }
@@ -442,7 +444,7 @@ impl App {
             | Action::SearchClear
             | Action::ToggleSelect
             | Action::SelectAll
-            |             Action::ClearSelection => {}
+            | Action::ClearSelection => {}
         }
         Vec::new()
     }
@@ -740,35 +742,18 @@ impl App {
     }
 
     fn help_lines(&self) -> Vec<Line<'static>> {
-        let mut lines = vec![
-            Line::from("j/k or arrows    move"),
-            Line::from("g / G            top / bottom"),
-            Line::from("PgUp / PgDn      page"),
-            Line::from("h/l              tag tree / table"),
-            Line::from("/                search; Esc clears, Enter keeps it"),
-            Line::from("space            toggle select"),
-            Line::from("ctrl-a           select visible hosts"),
-            Line::from("Esc              clear selection"),
-            Line::from("y                copy the ssh command"),
-            Line::from("Enter            connect"),
-            Line::from("o                open an embedded session"),
-            Line::from("s                snippet picker"),
-            Line::from("t                tunnels for the cursor host"),
-            Line::from("f                open files for the cursor host"),
-            Line::from("a                add a host"),
-            Line::from("e                edit the cursor host"),
-            Line::from("D                duplicate the cursor host"),
-            Line::from("d                delete the cursor host"),
-            Line::from("i                import ~/.ssh/config"),
-            Line::from("x                run a command on the selection"),
-            Line::from("X                reopen exec results"),
-            Line::from("*                toggle favorite"),
-            Line::from("S                sort by frecency"),
-            Line::from("E                edit hosts.toml"),
-            Line::from("v                validation problems"),
-            Line::from("?                this help"),
-            Line::from("q                quit"),
-        ];
+        let mut lines: Vec<Line<'static>> = self
+            .keymap
+            .help_lines()
+            .into_iter()
+            .map(|line| match line.as_str() {
+                "" => Line::from(""),
+                "Navigation" | "Selection" | "Hosts" | "General" => {
+                    Line::styled(line, self.theme.warning())
+                }
+                _ => Line::from(line),
+            })
+            .collect();
         if !self.problems.is_empty() {
             lines.push(Line::from(""));
             lines.push(Line::styled("Validation problems", self.theme.warning()));
@@ -1708,16 +1693,9 @@ impl App {
                 };
                 self.files.delete = None;
                 if delete.remote {
-                    let host = self
-                        .files
-                        .host
-                        .clone()
-                        .unwrap_or_else(|| "remote".into());
-                    let entry = audit::entry(
-                        "delete_remote",
-                        vec![host],
-                        Some(delete.paths.join(", ")),
-                    );
+                    let host = self.files.host.clone().unwrap_or_else(|| "remote".into());
+                    let entry =
+                        audit::entry("delete_remote", vec![host], Some(delete.paths.join(", ")));
                     self.write_audit(entry);
                 }
                 vec![UiCommand::Files(FilesCommand::Delete {
@@ -1922,9 +1900,7 @@ impl App {
                 .map(|host| host.name.clone())
                 .collect();
         }
-        self.active_cursor_name()
-            .into_iter()
-            .collect()
+        self.active_cursor_name().into_iter().collect()
     }
 
     fn default_session_size(&self) -> (u16, u16) {
@@ -2068,23 +2044,13 @@ impl App {
     }
 
     /// Refresh key/paste modes from the live parser after output.
-    pub fn refresh_session_modes(
-        &mut self,
-        id: SessionId,
-        modes: KeyModes,
-        bracketed_paste: bool,
-    ) {
+    pub fn refresh_session_modes(&mut self, id: SessionId, modes: KeyModes, bracketed_paste: bool) {
         self.sessions.key_modes.insert(id, modes);
         self.sessions.bracketed_paste.insert(id, bracketed_paste);
     }
 
     /// Record a newly opened session in the UI.
-    pub fn session_opened(
-        &mut self,
-        id: SessionId,
-        host: String,
-        place: SessionPlace,
-    ) {
+    pub fn session_opened(&mut self, id: SessionId, host: String, place: SessionPlace) {
         match place {
             SessionPlace::NewTab => self.sessions.open_tab(id, host),
             SessionPlace::Split(dir) => {
@@ -2176,18 +2142,14 @@ impl App {
             SnippetEvent::Run { snippet, command } => {
                 let hosts = if let Some(selector) = &snippet.selector {
                     match crate::domain::selector::parse_selector(selector).and_then(|terms| {
-                            let selection =
-                                crate::domain::selector::evaluate_selector(&terms, &self.hosts);
-                            if let Some(error) = selection.error {
-                                Err(error)
-                            } else {
-                                Ok(selection
-                                    .hosts
-                                    .into_iter()
-                                    .cloned()
-                                    .collect::<Vec<_>>())
-                            }
-                        }) {
+                        let selection =
+                            crate::domain::selector::evaluate_selector(&terms, &self.hosts);
+                        if let Some(error) = selection.error {
+                            Err(error)
+                        } else {
+                            Ok(selection.hosts.into_iter().cloned().collect::<Vec<_>>())
+                        }
+                    }) {
                         Ok(hosts) if !hosts.is_empty() => hosts,
                         Ok(_) => {
                             self.toast("snippet selector matched no hosts");
@@ -2247,17 +2209,15 @@ impl App {
             }
             SnippetEvent::Delete(name) => {
                 match SnippetStore::load(&self.snippets_path) {
-                    Ok(mut store) => {
-                        match store.delete(&name) {
-                            Ok(true) => {
-                                view.set_snippets(store.list().to_vec());
-                                view.mode_picker();
-                                self.toast(format!("deleted snippet `{name}`"));
-                            }
-                            Ok(false) => self.toast("snippet not found"),
-                            Err(error) => self.show_error(error.to_string()),
+                    Ok(mut store) => match store.delete(&name) {
+                        Ok(true) => {
+                            view.set_snippets(store.list().to_vec());
+                            view.mode_picker();
+                            self.toast(format!("deleted snippet `{name}`"));
                         }
-                    }
+                        Ok(false) => self.toast("snippet not found"),
+                        Err(error) => self.show_error(error.to_string()),
+                    },
                     Err(error) => self.show_error(error.to_string()),
                 }
                 self.modal = Some(Modal::Snippets(view));
@@ -2621,9 +2581,7 @@ mod tests {
     fn render(app: &mut App, width: u16, height: u16) -> String {
         app.note_size(width, height);
         let mut terminal = Terminal::new(TestBackend::new(width, height)).unwrap();
-        terminal
-            .draw(|frame| app.draw(frame, None))
-            .unwrap();
+        terminal.draw(|frame| app.draw(frame, None)).unwrap();
         let buffer = terminal.backend().buffer();
         let mut lines = Vec::new();
         for y in 0..buffer.area.height {

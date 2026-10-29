@@ -7,11 +7,7 @@ use std::collections::BTreeMap;
 use std::path::Path;
 
 /// Build a basic entry with a UTC timestamp.
-pub fn entry(
-    action: impl Into<String>,
-    hosts: Vec<String>,
-    command: Option<String>,
-) -> AuditEntry {
+pub fn entry(action: impl Into<String>, hosts: Vec<String>, command: Option<String>) -> AuditEntry {
     AuditEntry {
         ts: Utc::now(),
         action: action.into(),
