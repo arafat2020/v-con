@@ -2,12 +2,12 @@
 //!
 //! These modules do not know about ratatui.
 
-mod audit;
+pub mod audit;
 pub mod connect;
 pub mod exec;
 pub mod files;
 pub mod health;
 pub mod inventory;
 pub mod sessions;
-mod snippets;
-mod tunnels;
+pub mod snippets;
+pub mod tunnels;

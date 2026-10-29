@@ -51,6 +51,27 @@ impl SshBackend for SystemSsh {
             .stderr(Stdio::inherit())
             .status()
     }
+
+    fn forward(&self, args: &[String]) -> Result<(), Error> {
+        let mut displayed = vec![self.program.display().to_string()];
+        displayed.extend(args.iter().cloned());
+        tracing::debug!(command = %command_line(&displayed), "starting tunnel");
+        let status = Command::new(&self.program)
+            .args(args)
+            .stdin(Stdio::null())
+            .stdout(Stdio::inherit())
+            .stderr(Stdio::inherit())
+            .status()
+            .map_err(|error| Error::Message(format!("ssh forward failed: {error}")))?;
+        if status.success() || status.code().is_none() {
+            Ok(())
+        } else {
+            Err(Error::Message(format!(
+                "ssh forward exited with {}",
+                status.code().unwrap_or(-1)
+            )))
+        }
+    }
 }
 
 impl ExecRunner for SystemSsh {

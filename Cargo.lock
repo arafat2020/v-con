@@ -2857,6 +2857,7 @@ dependencies = [
  "openssh-sftp-client",
  "portable-pty",
  "ratatui",
+ "regex",
  "serde",
  "serde_json",
  "shellexpand",

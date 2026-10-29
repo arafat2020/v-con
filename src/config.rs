@@ -27,10 +27,22 @@ pub struct Config {
     pub health: HealthConfig,
     /// Embedded-session preferences (prefix key and scrollback).
     pub sessions: SessionConfig,
+    /// Audit log rotation and redaction.
+    pub audit: AuditConfig,
     /// Keybinding overrides. Unknown action names are ignored so later keys do not break phase 1.
     pub keys: KeyConfig,
     /// Named colours: black, red, green, yellow, blue, magenta, cyan, gray, and white.
     pub theme: ThemeConfig,
+}
+
+/// `[audit]` section: size limit and command redaction patterns.
+#[derive(Debug, Clone, PartialEq, Eq, Deserialize)]
+#[serde(default, deny_unknown_fields)]
+pub struct AuditConfig {
+    /// Rotate `audit.jsonl` when it reaches this many bytes.
+    pub max_bytes: u64,
+    /// Regexes applied to the command field before writing.
+    pub redact: Vec<String>,
 }
 
 /// `[tui]` section.
@@ -115,8 +127,18 @@ impl Default for Config {
             tui: TuiConfig::default(),
             health: HealthConfig::default(),
             sessions: SessionConfig::default(),
+            audit: AuditConfig::default(),
             keys: KeyConfig::default(),
             theme: ThemeConfig::default(),
+        }
+    }
+}
+
+impl Default for AuditConfig {
+    fn default() -> Self {
+        Self {
+            max_bytes: 10 * 1024 * 1024,
+            redact: Vec::new(),
         }
     }
 }
@@ -243,5 +265,25 @@ mod tests {
         );
         assert_eq!(config.theme.highlight, "magenta");
         assert_eq!(config.theme.ok, "green");
+        assert_eq!(config.audit.max_bytes, 10 * 1024 * 1024);
+        assert!(config.audit.redact.is_empty());
+    }
+
+    #[test]
+    fn audit_section_overrides_defaults() {
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join("config.toml");
+        fs::write(
+            &path,
+            r#"
+            [audit]
+            max_bytes = 1024
+            redact = ["-p\\S+"]
+            "#,
+        )
+        .unwrap();
+        let config = load(&path).unwrap();
+        assert_eq!(config.audit.max_bytes, 1024);
+        assert_eq!(config.audit.redact, vec!["-p\\S+".to_string()]);
     }
 }

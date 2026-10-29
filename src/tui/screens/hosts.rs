@@ -117,6 +117,8 @@ pub struct ViewOptions<'a> {
     pub control_dir: &'a Path,
     /// Latest health status per host for the UP column.
     pub health: &'a BTreeMap<String, HealthStatus>,
+    /// Active tunnels for the cursor host (detail pane).
+    pub active_tunnels: &'a [String],
 }
 
 impl HostsView {
@@ -599,8 +601,13 @@ fn draw_detail(
                 .then(|| options.control_dir.display().to_string()),
         },
     );
+    let tunnels = if options.active_tunnels.is_empty() {
+        String::new()
+    } else {
+        format!("\ntunnels: {}", options.active_tunnels.join(", "))
+    };
     let text = format!(
-        "{via}\nidentity: {identity}\ntags: {}\nnotes: {notes}\n{}",
+        "{via}\nidentity: {identity}\ntags: {}\nnotes: {notes}{tunnels}\n{}",
         host.tags.join(", "),
         command_line(&args)
     );
