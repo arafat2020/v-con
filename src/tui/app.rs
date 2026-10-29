@@ -574,7 +574,8 @@ impl App {
     }
 
     fn draw_header(&self, frame: &mut Frame, area: Rect) {
-        let mut spans = vec![Span::raw(" vcon ")];
+        let bar = self.theme.bar();
+        let mut spans = vec![Span::styled(" vcon ", self.theme.title().bg(self.theme.panel))];
         for (index, name) in TABS.iter().enumerate() {
             let label = if index == 3 && self.sessions.tab_count() > 0 {
                 format!(" {} {}({}) ", index + 1, name, self.sessions.tab_count())
@@ -582,26 +583,29 @@ impl App {
                 format!(" {} {} ", index + 1, name)
             };
             let style = if self.screen == index as u8 + 1 {
-                self.theme.selected()
+                self.theme.tab_active()
             } else {
-                ratatui::style::Style::new()
+                self.theme.tab_inactive()
             };
             spans.push(Span::styled(label, style));
         }
         if !self.problems.is_empty() {
             spans.push(Span::styled(
                 format!("  ⚠ {} ", self.problems.len()),
-                self.theme.warning(),
+                self.theme.warning().bg(self.theme.panel),
             ));
         }
         let (_ok, warn, crit, down) = self.health.counts();
         if warn > 0 {
-            spans.push(Span::styled(format!(" ⚠{warn} "), self.theme.warning()));
+            spans.push(Span::styled(
+                format!(" ⚠{warn} "),
+                self.theme.warning().bg(self.theme.panel),
+            ));
         }
         if crit + down > 0 {
             spans.push(Span::styled(
                 format!(" ✖{} ", crit + down),
-                self.theme.error(),
+                self.theme.error().bg(self.theme.panel),
             ));
         }
         if self.files.queue.active() {
@@ -618,15 +622,18 @@ impl App {
                     )
                 })
                 .count();
-            spans.push(Span::styled(format!(" ↑{active} "), self.theme.ok()));
+            spans.push(Span::styled(
+                format!(" ↑{active} "),
+                self.theme.ok().bg(self.theme.panel),
+            ));
         }
         if !self.running_tunnels.is_empty() {
             spans.push(Span::styled(
                 format!(" ⇄ {} ", self.running_tunnels.len()),
-                self.theme.ok(),
+                self.theme.ok().bg(self.theme.panel),
             ));
         }
-        frame.render_widget(Paragraph::new(Line::from(spans)), area);
+        frame.render_widget(Paragraph::new(Line::from(spans)).style(bar), area);
     }
 
     fn draw_hints(&self, frame: &mut Frame, area: Rect) {
@@ -638,7 +645,7 @@ impl App {
                 " ⏎ details   s sort   p pause   r refresh   R all   / filter   c connect   x exec   q quit{pause}"
             )
         } else if self.screen == 3 {
-            " Tab panes   ⏎ open   h up   space mark   c copy   m mkdir   r rename   d delete   v view   H host   C cancel   q quit".to_string()
+            " Tab panes   ⏎/l open   h/← up   space mark   c copy   m mkdir   r rename   d delete   v view   H host   C cancel   q quit".to_string()
         } else if self.screen == 4 {
             if self.sessions.focused {
                 let host = self
@@ -686,7 +693,12 @@ impl App {
             }
             hint
         };
-        frame.render_widget(Paragraph::new(text).style(self.theme.muted()), area);
+        let style = if self.toast.is_some() {
+            self.theme.warning().bg(self.theme.panel)
+        } else {
+            self.theme.muted().bg(self.theme.panel)
+        };
+        frame.render_widget(Paragraph::new(text).style(style), area);
     }
 
     fn draw_modal(&self, frame: &mut Frame, area: Rect, modal: Modal) {
@@ -1022,6 +1034,8 @@ impl App {
     }
 
     fn host_form_key(&mut self, code: KeyCode, modifiers: KeyModifiers) -> Vec<UiCommand> {
+        // Modal keys bypass `update`, so mark dirty or the form freezes on screen.
+        self.dirty = true;
         let Some(Modal::HostForm(mut form)) = self.modal.take() else {
             return Vec::new();
         };
@@ -1078,6 +1092,7 @@ impl App {
     }
 
     fn import_key(&mut self, code: KeyCode, modifiers: KeyModifiers) -> Vec<UiCommand> {
+        self.dirty = true;
         let Some(Modal::Import(mut view)) = self.modal.take() else {
             return Vec::new();
         };
@@ -1115,6 +1130,7 @@ impl App {
     }
 
     fn delete_key(&mut self, code: KeyCode) -> Vec<UiCommand> {
+        self.dirty = true;
         let Some(Modal::Delete { name }) = self.modal.clone() else {
             return Vec::new();
         };
@@ -1734,19 +1750,20 @@ impl App {
         let Some(entry) = pane.current() else {
             return Vec::new();
         };
-        if entry.is_dir() {
-            let path = join(&pane.path, &entry.name);
+        let path = join(&pane.path, &entry.name);
+        // Dirs and symlinks navigate; only plain files open the viewer.
+        if entry.is_enterable() || !entry.is_file() {
             match focus {
-                PaneFocus::Local => self.files.local.path = path.clone(),
-                PaneFocus::Remote => self.files.remote.path = path.clone(),
+                PaneFocus::Local => self.files.local.path = path,
+                PaneFocus::Remote => self.files.remote.path = path,
             }
             let local = focus == PaneFocus::Local;
+            self.dirty = true;
             vec![UiCommand::Files(FilesCommand::Refresh {
                 local,
-                remote: !local,
+                remote: !local && self.files.host.is_some(),
             })]
         } else {
-            let path = join(&pane.path, &entry.name);
             vec![UiCommand::Files(FilesCommand::View {
                 path,
                 remote: focus == PaneFocus::Remote,
@@ -2130,6 +2147,7 @@ impl App {
     }
 
     fn snippets_key(&mut self, code: KeyCode, modifiers: KeyModifiers) -> Vec<UiCommand> {
+        self.dirty = true;
         let Some(Modal::Snippets(mut view)) = self.modal.take() else {
             return Vec::new();
         };
@@ -2227,6 +2245,7 @@ impl App {
     }
 
     fn tunnels_key(&mut self, code: KeyCode) -> Vec<UiCommand> {
+        self.dirty = true;
         let Some(Modal::Tunnels(mut view)) = self.modal.take() else {
             return Vec::new();
         };
@@ -2885,6 +2904,23 @@ name = "db-1"
 address = "10.0.0.20"
 jump = "web-1"
 "#;
+
+    #[test]
+    fn typing_in_the_add_form_marks_the_ui_dirty() {
+        let (_dir, mut app) = writable(PAIR);
+        app.dirty = false;
+        app.on_key(KeyCode::Char('a'), KeyModifiers::NONE);
+        assert!(matches!(app.modal, Some(Modal::HostForm(_))));
+        app.dirty = false;
+        app.on_key(KeyCode::Char('x'), KeyModifiers::NONE);
+        assert!(app.dirty, "form keystrokes must trigger a redraw");
+        match &app.modal {
+            Some(Modal::HostForm(form)) => {
+                assert_eq!(form.form.field("name").unwrap().value, "x");
+            }
+            other => panic!("expected host form, got {other:?}"),
+        }
+    }
 
     #[test]
     fn add_writes_a_host_and_a_duplicate_name_does_not() {

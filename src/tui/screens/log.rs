@@ -5,6 +5,7 @@ use crate::tui::theme::Theme;
 use crossterm::event::KeyCode;
 use ratatui::Frame;
 use ratatui::layout::{Constraint, Rect};
+use ratatui::text::Span;
 use ratatui::widgets::{Block, Clear, Paragraph, Row, Table, TableState, Wrap};
 
 /// Key result for the log screen.
@@ -197,7 +198,7 @@ pub fn draw(frame: &mut Frame, area: Rect, view: &mut LogView, theme: &Theme) {
         format!(" {} ", parts.join(" · "))
     };
     let header =
-        Row::new(vec!["TIME", "ACTION", "HOSTS", "COMMAND", "RESULT"]).style(theme.muted());
+        Row::new(vec!["TIME", "ACTION", "HOSTS", "COMMAND", "RESULT"]).style(theme.header_row());
     let rows = view.visible.iter().map(|index| {
         let entry = &view.entries[*index];
         let time = entry.ts.format("%m-%d %H:%M").to_string();
@@ -231,7 +232,12 @@ pub fn draw(frame: &mut Frame, area: Rect, view: &mut LogView, theme: &Theme) {
     ];
     let table = Table::new(rows, widths)
         .header(header)
-        .block(Block::bordered().title(title))
+        .style(theme.text())
+        .block(
+            Block::bordered()
+                .title(Span::styled(title, theme.title()))
+                .border_style(theme.border()),
+        )
         .row_highlight_style(theme.selected());
     let mut state = TableState::default()
         .with_selected(Some(view.cursor))
@@ -280,10 +286,12 @@ fn draw_detail(frame: &mut Frame, area: Rect, entry: &AuditEntry, theme: &Theme)
     );
     frame.render_widget(
         Paragraph::new(text)
+            .style(theme.text())
             .block(
                 Block::bordered()
-                    .title(" Audit detail ")
-                    .border_style(theme.selected()),
+                    .title(Span::styled(" Audit detail ", theme.title()))
+                    .border_style(theme.border_focus())
+                    .style(theme.bar()),
             )
             .wrap(Wrap { trim: false }),
         popup,

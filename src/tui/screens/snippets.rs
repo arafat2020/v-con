@@ -359,10 +359,12 @@ pub fn draw(frame: &mut Frame, area: Rect, view: &SnippetsView, theme: &Theme) {
         }
         Mode::ConfirmDelete { name } => {
             let block = Block::bordered()
-                .title(" Delete snippet ")
-                .border_style(theme.selected());
+                .title(Span::styled(" Delete snippet ", theme.title()))
+                .border_style(theme.border_focus())
+                .style(theme.bar());
             frame.render_widget(
                 Paragraph::new(format!("Delete `{name}`? [y/N]"))
+                    .style(theme.text())
                     .block(block)
                     .wrap(Wrap { trim: true }),
                 popup,
@@ -391,13 +393,16 @@ fn draw_picker(frame: &mut Frame, area: Rect, view: &SnippetsView, theme: &Theme
             let desc = snippet.description.as_deref().unwrap_or("");
             let line = if desc.is_empty() {
                 Line::from(vec![
-                    Span::styled(format!("{:<12}", snippet.name), theme.selected()),
-                    Span::raw(format!(" {}", snippet.command)),
+                    Span::styled(format!("{:<12}", snippet.name), theme.title()),
+                    Span::styled(format!(" {}", snippet.command), theme.text()),
                 ])
             } else {
                 Line::from(vec![
-                    Span::styled(format!("{:<12}", snippet.name), theme.selected()),
-                    Span::raw(format!(" {desc}  ·  {}", snippet.command)),
+                    Span::styled(format!("{:<12}", snippet.name), theme.title()),
+                    Span::styled(
+                        format!(" {desc}  ·  {}", snippet.command),
+                        theme.muted(),
+                    ),
                 ])
             };
             ListItem::new(line)
@@ -406,7 +411,11 @@ fn draw_picker(frame: &mut Frame, area: Rect, view: &SnippetsView, theme: &Theme
     let mut state = ListState::default().with_selected(Some(view.cursor));
     frame.render_stateful_widget(
         List::new(items)
-            .block(Block::bordered().title(" Snippets "))
+            .block(
+                Block::bordered()
+                    .title(Span::styled(" Snippets ", theme.title()))
+                    .border_style(theme.border()),
+            )
             .highlight_style(theme.selected()),
         chunks[1],
         &mut state,

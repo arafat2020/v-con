@@ -176,10 +176,15 @@ pub fn draw(
     }
     frame.render_widget(
         Paragraph::new(lines)
+            .style(theme.text())
             .block(
                 Block::bordered()
-                    .title(format!(" Tunnels — {} ", view.host))
-                    .border_style(theme.selected()),
+                    .title(Span::styled(
+                        format!(" Tunnels — {} ", view.host),
+                        theme.title(),
+                    ))
+                    .border_style(theme.border_focus())
+                    .style(theme.bar()),
             )
             .wrap(Wrap { trim: false }),
         chunks[0],

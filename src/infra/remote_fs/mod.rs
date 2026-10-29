@@ -47,14 +47,28 @@ pub struct DirEntry {
 }
 
 impl DirEntry {
-    /// True for directories (symlink-to-dir still reports as symlink).
+    /// True for directories.
+    ///
+    /// Also treats Unix mode `S_IFDIR` as a directory when the SFTP server
+    /// omits an explicit file type (otherwise Enter tries to "view" folders).
     pub fn is_dir(&self) -> bool {
-        self.kind == EntryKind::Dir
+        if self.kind == EntryKind::Dir {
+            return true;
+        }
+        self.mode
+            .is_some_and(|mode| mode & 0o170_000 == 0o040_000)
     }
 
-    /// True for regular files.
+    /// True for regular files (not dirs/symlinks).
     pub fn is_file(&self) -> bool {
-        self.kind == EntryKind::File
+        self.kind == EntryKind::File && !self.is_dir()
+    }
+
+    /// Whether Enter should navigate into this entry.
+    pub fn is_enterable(&self) -> bool {
+        self.is_dir()
+            || self.kind == EntryKind::Symlink
+            || self.mode.is_some_and(|mode| mode & 0o170_000 == 0o120_000)
     }
 }
 
@@ -108,4 +122,33 @@ pub trait RemoteFs: Send + Sync {
         mode: Option<u32>,
         mtime: Option<SystemTime>,
     ) -> impl Future<Output = Result<(), Error>> + Send;
+}
+
+#[cfg(test)]
+mod entry_tests {
+    use super::*;
+
+    #[test]
+    fn mode_bits_mark_directories_enterable() {
+        let dir = DirEntry {
+            name: "etc".into(),
+            kind: EntryKind::Other,
+            size: 0,
+            mtime: None,
+            mode: Some(0o040_755),
+            target: None,
+        };
+        assert!(dir.is_dir());
+        assert!(dir.is_enterable());
+        let file = DirEntry {
+            name: "a".into(),
+            kind: EntryKind::File,
+            size: 1,
+            mtime: None,
+            mode: Some(0o100_644),
+            target: None,
+        };
+        assert!(!file.is_dir());
+        assert!(!file.is_enterable());
+    }
 }

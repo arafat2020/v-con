@@ -9,6 +9,7 @@ use crate::tui::theme::Theme;
 use crossterm::event::{KeyCode, KeyModifiers};
 use ratatui::Frame;
 use ratatui::layout::Rect;
+use ratatui::text::Span;
 use ratatui::widgets::{Block, Clear, Paragraph, Wrap};
 use std::collections::HashSet;
 use std::path::Path;
@@ -159,10 +160,12 @@ pub fn draw(frame: &mut Frame, area: Rect, view: &ImportView, theme: &Theme) {
     }
     lines.push("space toggle  a all  Enter import  Esc cancel".to_string());
     let paragraph = Paragraph::new(lines.join("\n"))
+        .style(theme.text())
         .block(
             Block::bordered()
-                .title(" Import ssh config ")
-                .border_style(theme.selected()),
+                .title(Span::styled(" Import ssh config ", theme.title()))
+                .border_style(theme.border_focus())
+                .style(theme.bar()),
         )
         .wrap(Wrap { trim: false });
     frame.render_widget(paragraph, popup);

@@ -8,7 +8,7 @@ use crate::tui::theme::Theme;
 use crossterm::event::{KeyCode, KeyModifiers};
 use ratatui::Frame;
 use ratatui::layout::{Constraint, Layout, Rect};
-use ratatui::style::{Modifier, Style};
+use ratatui::style::Style;
 use ratatui::text::{Line, Span};
 use ratatui::widgets::{Block, Borders, Clear, Paragraph, Wrap};
 use std::time::{Duration, Instant};
@@ -498,11 +498,13 @@ pub fn draw_prompt(frame: &mut Frame, area: Rect, prompt: &Prompt, theme: &Theme
         prompt.command
     );
     let paragraph = Paragraph::new(body)
+        .style(theme.text())
         .block(
             Block::default()
                 .borders(Borders::ALL)
-                .title(" Exec ")
-                .border_style(theme.selected()),
+                .title(Span::styled(" Exec ", theme.title()))
+                .border_style(theme.border_focus())
+                .style(theme.bar()),
         )
         .wrap(Wrap { trim: false });
     frame.render_widget(paragraph, popup);
@@ -517,12 +519,15 @@ pub fn draw_confirm(frame: &mut Frame, area: Rect, confirm: &Confirm, theme: &Th
         "Run `{remote}`?\n{}\ny confirms   n or Esc cancels",
         confirm.reason
     );
-    let paragraph = Paragraph::new(body).block(
-        Block::default()
-            .borders(Borders::ALL)
-            .title(" Confirm exec ")
-            .border_style(theme.warning()),
-    );
+    let paragraph = Paragraph::new(body)
+        .style(theme.text())
+        .block(
+            Block::default()
+                .borders(Borders::ALL)
+                .title(Span::styled(" Confirm exec ", theme.warning()))
+                .border_style(theme.warning())
+                .style(theme.bar()),
+        );
     frame.render_widget(paragraph, popup);
 }
 
@@ -560,8 +565,9 @@ pub fn draw_results(frame: &mut Frame, area: Rect, results: &Results, theme: &Th
     );
     let block = Block::default()
         .borders(Borders::ALL)
-        .title(title)
-        .border_style(theme.selected());
+        .title(Span::styled(title, theme.title()))
+        .border_style(theme.border_focus())
+        .style(theme.bar());
     let inner = block.inner(popup);
     frame.render_widget(block, popup);
     let chunks = if results.expanded || results.combined {
@@ -641,15 +647,12 @@ fn draw_output(frame: &mut Frame, area: Rect, results: &Results, theme: &Theme) 
                 format_elapsed(outcome.duration)
             ));
         }
-        let mut lines = vec![Line::styled(
-            header,
-            Style::new().add_modifier(Modifier::BOLD),
-        )];
+        let mut lines = vec![Line::styled(header, theme.title())];
         for line in row.lines.iter().skip(row.scroll) {
             let style = if line.stderr {
                 theme.error()
             } else {
-                Style::new()
+                theme.text()
             };
             lines.push(Line::styled(line.text.clone(), style));
         }
