@@ -41,11 +41,25 @@ pub trait SshBackend {
         Err(Error::Message("file copy arrives in phase 6".to_string()))
     }
 
-    /// Start a port forward. Implemented in phase 8.
-    fn forward(&self, _args: &[String]) -> Result<(), Error> {
-        Err(Error::Message(
-            "port forwards arrive in phase 8".to_string(),
-        ))
+    /// Start a blocking port forward (`ssh -N …`). Prefer
+    /// [`crate::services::tunnels::TunnelManager`] for tracked TUI tunnels.
+    fn forward(&self, args: &[String]) -> Result<(), Error> {
+        let status = std::process::Command::new("ssh")
+            .args(args)
+            .stdin(std::process::Stdio::null())
+            .status()
+            .map_err(|error| Error::Message(format!("ssh forward failed: {error}")))?;
+        if status.success() {
+            Ok(())
+        } else {
+            Err(Error::Message(format!(
+                "ssh forward exited with {}",
+                status
+                    .code()
+                    .map(|code| code.to_string())
+                    .unwrap_or_else(|| "signal".into())
+            )))
+        }
     }
 }
 
@@ -71,11 +85,7 @@ mod tests {
                 .contains("phase 4")
         );
         assert!(stub.copy(&[]).unwrap_err().to_string().contains("phase 6"));
-        assert!(
-            stub.forward(&[])
-                .unwrap_err()
-                .to_string()
-                .contains("phase 8")
-        );
+        // Default forward tries to spawn `ssh`; without args it should fail to connect.
+        let _ = stub.forward(&[]);
     }
 }

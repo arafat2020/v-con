@@ -49,6 +49,10 @@ pub struct ExecRequest<'a> {
     pub json: bool,
     /// Skip the confirmation prompt.
     pub yes: bool,
+    /// Audit action name. Defaults to `"exec"`. Snippet run passes `"snippet"`.
+    pub audit_action: Option<&'a str>,
+    /// Override the audited command text (snippet label prefix).
+    pub audit_command: Option<String>,
 }
 
 /// Run the command described by `request`.
@@ -138,7 +142,7 @@ pub fn run(
         .enable_all()
         .build()
         .map_err(|error| Error::Message(error.to_string()))?;
-    let summary = runtime.block_on(drive(
+    let (summary, results) = runtime.block_on(drive(
         &targets,
         timeout,
         parallel,
@@ -147,6 +151,23 @@ pub fn run(
         request.json,
         &remote,
     ))?;
+    let action = request.audit_action.unwrap_or("exec");
+    let audited = request
+        .audit_command
+        .clone()
+        .unwrap_or_else(|| remote.clone());
+    crate::services::audit::record_exec(
+        &paths.audit_file(),
+        &config.audit,
+        crate::services::audit::ExecAudit {
+            action: action.to_string(),
+            selector: Some(request.selector.to_string()),
+            hosts: hosts.iter().map(|host| host.name.clone()).collect(),
+            command: audited,
+            results,
+            duration_ms: summary.duration.as_millis() as u64,
+        },
+    );
     if summary.failed > 0 {
         Ok(ExitCode::from(EXIT_SOME_FAILED))
     } else {
@@ -185,7 +206,7 @@ async fn drive(
     only_failed: bool,
     json: bool,
     command: &str,
-) -> Result<exec::Summary, Error> {
+) -> Result<(exec::Summary, std::collections::BTreeMap<String, i32>), Error> {
     let program = crate::infra::ssh::system::find_ssh()?;
     let (tx, mut rx) = mpsc::channel(128);
     let runner = Arc::new(SystemSsh::new(program));
@@ -261,7 +282,24 @@ async fn drive(
     } else {
         println!("{}", format_summary(&summary, &hosts));
     }
-    Ok(summary)
+    let mut results = std::collections::BTreeMap::new();
+    for host in &hosts {
+        let code = host
+            .outcome
+            .as_ref()
+            .and_then(|outcome| outcome.code)
+            .unwrap_or_else(|| {
+                host.outcome
+                    .as_ref()
+                    .map(|outcome| match outcome.status {
+                        EndStatus::Ok => 0,
+                        _ => 1,
+                    })
+                    .unwrap_or(1)
+            });
+        results.insert(host.name.clone(), code);
+    }
+    Ok((summary, results))
 }
 
 fn capture<'a>(hosts: &'a mut Vec<HostCapture>, name: &str) -> &'a mut HostCapture {

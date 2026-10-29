@@ -5,9 +5,10 @@
 //! anything it does not recognise (quit, help, copy) is handled here.
 //! Other tabs are placeholders until their phases.
 
-use crate::config::{Config, HealthConfig};
+use crate::config::{AuditConfig, Config, HealthConfig};
 use crate::domain::health::{HealthStatus, now_secs};
 use crate::domain::host::{EffectiveHost, Host, Inventory, Problem};
+use crate::domain::tunnel::TunnelSpec;
 use crate::error::Error;
 use crate::infra::remote_fs::{DirEntry, join, normalize};
 use crate::infra::ssh::command::{
@@ -17,6 +18,7 @@ use crate::infra::ssh::system::{self, missing_ssh_message};
 use crate::infra::ssh_config;
 use crate::infra::state_store::{self, AppState};
 use crate::paths::Paths;
+use crate::services::audit;
 use crate::services::connect::{self, ConnectPlan};
 use crate::services::exec::{self as job, ExecSettings};
 use crate::services::files::TransferEvent;
@@ -26,9 +28,11 @@ use crate::services::health::{
 use crate::services::inventory::{self, InventoryBundle};
 use crate::infra::pty::{KeyModes, encode_key, encode_paste};
 use crate::services::sessions::{SessionEvent, SessionId};
+use crate::services::snippets::SnippetStore;
+use crate::services::tunnels::{RunningTunnel, TunnelEvent};
 use crate::tui::action::{
     Action, ConnectHandoff, EditorHandoff, FilesCommand, Handoff, SessionPlace, SessionsCommand,
-    UiCommand,
+    TunnelsCommand, UiCommand,
 };
 use crate::tui::keymap::{self, Keymap};
 use crate::tui::screens::exec as exec_ui;
@@ -40,8 +44,14 @@ use crate::tui::screens::health::{HealthEvent as HealthKey, HealthView};
 use crate::tui::screens::host_form::{self, HostFormEvent};
 use crate::tui::screens::hosts::{self, HostsView, ViewOptions};
 use crate::tui::screens::import::{self, ImportEvent};
+use crate::tui::screens::log as log_ui;
+use crate::tui::screens::log::{LogEvent, LogView};
 use crate::tui::screens::sessions as sessions_ui;
 use crate::tui::screens::sessions::{SessionKey, SessionsView};
+use crate::tui::screens::snippets as snippets_ui;
+use crate::tui::screens::snippets::{SnippetEvent, SnippetsView};
+use crate::tui::screens::tunnels as tunnels_ui;
+use crate::tui::screens::tunnels::{TunnelUiEvent, TunnelsView};
 use crate::tui::theme::Theme;
 use chrono::Utc;
 use crossterm::event::{KeyCode, KeyModifiers};
@@ -73,6 +83,10 @@ pub enum Modal {
     Import(Box<import::ImportView>),
     /// Quit while embedded sessions are still live.
     QuitSessions,
+    /// Snippet picker / editor.
+    Snippets(Box<SnippetsView>),
+    /// Per-host tunnels panel.
+    Tunnels(Box<TunnelsView>),
 }
 
 /// Shell state: inventory, keymap, the Hosts screen, and the open modal.
@@ -118,6 +132,14 @@ pub struct App {
     session_prefix: (KeyCode, KeyModifiers),
     /// Scrollback lines for new sessions.
     pub(crate) session_scrollback: usize,
+    snippets_path: PathBuf,
+    audit_path: PathBuf,
+    audit: AuditConfig,
+    log: LogView,
+    /// Snapshot of running tunnels for the header / detail pane (updated by the event loop).
+    pub(crate) running_tunnels: Vec<RunningTunnel>,
+    /// When set, the next finished exec is audited as a snippet run.
+    pending_snippet_audit: Option<String>,
 }
 
 impl App {
@@ -177,9 +199,16 @@ impl App {
             session_prefix: keymap::parse_chord(&config.sessions.prefix_key)
                 .unwrap_or((KeyCode::Char(']'), KeyModifiers::CONTROL)),
             session_scrollback: config.sessions.scrollback_lines.max(1),
+            snippets_path: paths.snippets_file(),
+            audit_path: paths.audit_file(),
+            audit: config.audit.clone(),
+            log: LogView::default(),
+            running_tunnels: Vec::new(),
+            pending_snippet_audit: None,
         };
         app.seed_health_cache();
         app.refresh_groups();
+        app.refresh_log();
         app.apply_start_screen(&config.tui.start_screen);
         if app.ssh.is_none() {
             app.modal = Some(Modal::Error(missing_ssh_message().to_string()));
@@ -233,6 +262,12 @@ impl App {
             if matches!(self.modal, Some(Modal::QuitSessions)) {
                 return self.quit_sessions_key(code);
             }
+            if matches!(self.modal, Some(Modal::Snippets(_))) {
+                return self.snippets_key(code, modifiers);
+            }
+            if matches!(self.modal, Some(Modal::Tunnels(_))) {
+                return self.tunnels_key(code);
+            }
             if code == KeyCode::Esc {
                 return self.update(Action::CloseModal);
             }
@@ -242,6 +277,9 @@ impl App {
                 }
                 _ => Vec::new(),
             };
+        }
+        if self.screen == 5 {
+            return self.log_key(code, modifiers);
         }
         if self.exec_visible {
             return self.exec_results_key(code);
@@ -292,7 +330,11 @@ impl App {
                     self.modal = Some(Modal::QuitSessions);
                     return Vec::new();
                 }
-                return self.finish_quit();
+                let mut commands = self.finish_quit();
+                if !self.running_tunnels.is_empty() {
+                    commands.insert(0, UiCommand::Tunnels(TunnelsCommand::StopAll));
+                }
+                return commands;
             }
             Action::Tick => {
                 if let Some(results) = &mut self.exec_results
@@ -335,6 +377,9 @@ impl App {
                             remote: self.files.host.is_some(),
                         })];
                     }
+                    if screen == 5 {
+                        self.refresh_log();
+                    }
                 }
             }
             Action::OpenFiles => {
@@ -357,6 +402,12 @@ impl App {
                 ];
             }
             Action::OpenSession => return self.open_sessions(),
+            Action::OpenSnippets => {
+                self.open_snippets();
+            }
+            Action::OpenTunnels => {
+                self.open_tunnels();
+            }
             Action::CopySshCommand => return self.copy_command(),
             Action::Connect => return self.connect_command(),
             Action::ToggleFavorite => return self.toggle_favorite(),
@@ -391,7 +442,7 @@ impl App {
             | Action::SearchClear
             | Action::ToggleSelect
             | Action::SelectAll
-            | Action::ClearSelection => {}
+            |             Action::ClearSelection => {}
         }
         Vec::new()
     }
@@ -455,6 +506,18 @@ impl App {
             let hosts_path = self.hosts_path.clone();
             let control_dir = self.control_dir.clone();
             let health_status = self.health_status_map();
+            let cursor_tunnels: Vec<String> = self
+                .view
+                .cursor_name
+                .as_ref()
+                .map(|name| {
+                    self.running_tunnels
+                        .iter()
+                        .filter(|tunnel| &tunnel.host == name)
+                        .map(|tunnel| tunnel.label.clone())
+                        .collect()
+                })
+                .unwrap_or_default();
             let options = ViewOptions {
                 theme: &theme,
                 hosts_path: &hosts_path,
@@ -464,6 +527,7 @@ impl App {
                 multiplexing,
                 control_dir: &control_dir,
                 health: &health_status,
+                active_tunnels: &cursor_tunnels,
             };
             hosts::draw(frame, chunks[1], &mut self.view, &self.hosts, &options);
         } else if self.screen == 2 {
@@ -485,8 +549,10 @@ impl App {
                     }
                 },
             );
+        } else if self.screen == 5 {
+            log_ui::draw(frame, chunks[1], &mut self.log, &self.theme);
         } else {
-            frame.render_widget(Paragraph::new("Log arrives in a later phase."), chunks[1]);
+            frame.render_widget(Paragraph::new("Unknown screen."), chunks[1]);
         }
         self.draw_hints(frame, chunks[2]);
         if self.exec_visible
@@ -552,6 +618,12 @@ impl App {
                 .count();
             spans.push(Span::styled(format!(" ↑{active} "), self.theme.ok()));
         }
+        if !self.running_tunnels.is_empty() {
+            spans.push(Span::styled(
+                format!(" ⇄ {} ", self.running_tunnels.len()),
+                self.theme.ok(),
+            ));
+        }
         frame.render_widget(Paragraph::new(Line::from(spans)), area);
     }
 
@@ -578,9 +650,11 @@ impl App {
             } else {
                 " ⏎ focus   o open   q quit".to_string()
             }
+        } else if self.screen == 5 {
+            " j/k move   ⏎ detail   / search   f failed   R re-run   r refresh   q quit".to_string()
         } else {
             let mut hint =
-                " ⏎ connect   o session   x exec   a add   e edit   d del   ? help   q quit"
+                " ⏎ connect   o session   s snippet   t tunnel   x exec   a add   e edit   d del   ? help   q quit"
                     .to_string();
             if self
                 .exec_results
@@ -647,6 +721,20 @@ impl App {
                     Line::from("y quits and closes them   n or Esc cancels"),
                 ],
             ),
+            Modal::Snippets(view) => {
+                snippets_ui::draw(frame, area, &view, &self.theme);
+                return;
+            }
+            Modal::Tunnels(view) => {
+                let running: Vec<RunningTunnel> = self
+                    .running_tunnels
+                    .iter()
+                    .filter(|tunnel| tunnel.host == view.host)
+                    .cloned()
+                    .collect();
+                tunnels_ui::draw(frame, area, &view, &running, &self.theme);
+                return;
+            }
         };
         crate::tui::widgets::modal::render(frame, area, title, lines, &self.theme);
     }
@@ -664,6 +752,8 @@ impl App {
             Line::from("y                copy the ssh command"),
             Line::from("Enter            connect"),
             Line::from("o                open an embedded session"),
+            Line::from("s                snippet picker"),
+            Line::from("t                tunnels for the cursor host"),
             Line::from("f                open files for the cursor host"),
             Line::from("a                add a host"),
             Line::from("e                edit the cursor host"),
@@ -1299,10 +1389,57 @@ impl App {
 
     /// Fold one exec event into the results view.
     pub fn apply_exec_event(&mut self, event: job::JobEvent) {
+        let finished = matches!(event, job::JobEvent::JobFinished { .. });
         if let Some(results) = &mut self.exec_results {
             results.apply(event);
         }
+        if finished {
+            self.audit_exec_finished();
+        }
         self.dirty = true;
+    }
+
+    fn audit_exec_finished(&mut self) {
+        let Some(results) = &self.exec_results else {
+            return;
+        };
+        let mut codes = BTreeMap::new();
+        for row in &results.rows {
+            let code = row
+                .outcome
+                .as_ref()
+                .and_then(|outcome| outcome.code)
+                .unwrap_or_else(|| {
+                    row.outcome
+                        .as_ref()
+                        .map(|outcome| match outcome.status {
+                            job::EndStatus::Ok => 0,
+                            _ => 1,
+                        })
+                        .unwrap_or(1)
+                });
+            codes.insert(row.name.clone(), code);
+        }
+        let hosts: Vec<String> = results.rows.iter().map(|row| row.name.clone()).collect();
+        let (action, command) = if let Some(label) = self.pending_snippet_audit.take() {
+            ("snippet", label)
+        } else {
+            ("exec", results.command.clone())
+        };
+        let duration_ms = results
+            .rows
+            .iter()
+            .filter_map(|row| row.outcome.as_ref())
+            .map(|outcome| outcome.duration.as_millis() as u64)
+            .max()
+            .unwrap_or(0);
+        let mut entry = audit::entry(action, hosts, Some(command));
+        entry.results = Some(codes);
+        entry.duration_ms = Some(duration_ms);
+        self.write_audit(entry);
+        if self.screen == 5 {
+            self.refresh_log();
+        }
     }
 
     /// True while the results popup is on screen. The clipboard toast uses this.
@@ -1396,7 +1533,9 @@ impl App {
                         | Action::ToggleFavorite
                         | Action::CopySshCommand
                         | Action::OpenFiles
-                        | Action::OpenSession),
+                        | Action::OpenSession
+                        | Action::OpenSnippets
+                        | Action::OpenTunnels),
                     ) = self.keymap.lookup(code, modifiers)
                 {
                     return self.update(action);
@@ -1472,6 +1611,23 @@ impl App {
 
     /// Fold one transfer event into the queue panel.
     pub fn apply_transfer_event(&mut self, event: TransferEvent) {
+        if let TransferEvent::Finished {
+            id,
+            state,
+            error: _,
+        } = &event
+            && let Some(job) = self.files.queue.jobs.iter().find(|job| job.id == *id)
+        {
+            let command = format!("{:?} {} → {}", job.direction, job.source, job.destination);
+            let mut entry = audit::entry("transfer", vec![job.host.clone()], Some(command));
+            let code = if *state == crate::services::files::TransferState::Done {
+                0
+            } else {
+                1
+            };
+            entry.results = Some(BTreeMap::from([(job.host.clone(), code)]));
+            self.write_audit(entry);
+        }
         self.files.queue.apply(event);
         self.dirty = true;
     }
@@ -1515,7 +1671,9 @@ impl App {
                 | Action::Connect
                 | Action::Exec
                 | Action::OpenFiles
-                | Action::OpenSession),
+                | Action::OpenSession
+                | Action::OpenSnippets
+                | Action::OpenTunnels),
             ) = self.keymap.lookup(code, modifiers)
             {
                 return self.update(action);
@@ -1549,6 +1707,19 @@ impl App {
                     return Vec::new();
                 };
                 self.files.delete = None;
+                if delete.remote {
+                    let host = self
+                        .files
+                        .host
+                        .clone()
+                        .unwrap_or_else(|| "remote".into());
+                    let entry = audit::entry(
+                        "delete_remote",
+                        vec![host],
+                        Some(delete.paths.join(", ")),
+                    );
+                    self.write_audit(entry);
+                }
                 vec![UiCommand::Files(FilesCommand::Delete {
                     paths: delete.paths,
                     remote: delete.remote,
@@ -1726,6 +1897,9 @@ impl App {
         }
         self.screen = 4;
         let (rows, cols) = self.default_session_size();
+        for host in &hosts {
+            self.write_audit(audit::entry("session_open", vec![host.clone()], None));
+        }
         hosts
             .into_iter()
             .map(|host| {
@@ -1957,7 +2131,264 @@ impl App {
         if !self.sessions.hosts.is_empty() {
             commands.insert(0, UiCommand::Sessions(SessionsCommand::CloseAll));
         }
+        if !self.running_tunnels.is_empty() {
+            commands.insert(0, UiCommand::Tunnels(TunnelsCommand::StopAll));
+        }
         commands
+    }
+
+    fn refresh_log(&mut self) {
+        match audit::read_recent(&self.audit_path, 500) {
+            Ok(entries) => self.log.load(entries),
+            Err(error) => self.toast(format!("audit log: {error}")),
+        }
+    }
+
+    fn open_snippets(&mut self) {
+        match SnippetStore::load(&self.snippets_path) {
+            Ok(store) => {
+                self.modal = Some(Modal::Snippets(Box::new(SnippetsView::new(
+                    store.list().to_vec(),
+                ))));
+            }
+            Err(error) => self.show_error(error.to_string()),
+        }
+    }
+
+    fn open_tunnels(&mut self) {
+        let Some(host) = self.exec_targets().into_iter().next() else {
+            self.toast("No host selected");
+            return;
+        };
+        self.modal = Some(Modal::Tunnels(Box::new(TunnelsView::new(&host))));
+    }
+
+    fn snippets_key(&mut self, code: KeyCode, modifiers: KeyModifiers) -> Vec<UiCommand> {
+        let Some(Modal::Snippets(mut view)) = self.modal.take() else {
+            return Vec::new();
+        };
+        match snippets_ui::on_key(&mut view, code, modifiers) {
+            SnippetEvent::Continue => {
+                self.modal = Some(Modal::Snippets(view));
+                Vec::new()
+            }
+            SnippetEvent::Cancel => Vec::new(),
+            SnippetEvent::Run { snippet, command } => {
+                let hosts = if let Some(selector) = &snippet.selector {
+                    match crate::domain::selector::parse_selector(selector).and_then(|terms| {
+                            let selection =
+                                crate::domain::selector::evaluate_selector(&terms, &self.hosts);
+                            if let Some(error) = selection.error {
+                                Err(error)
+                            } else {
+                                Ok(selection
+                                    .hosts
+                                    .into_iter()
+                                    .cloned()
+                                    .collect::<Vec<_>>())
+                            }
+                        }) {
+                        Ok(hosts) if !hosts.is_empty() => hosts,
+                        Ok(_) => {
+                            self.toast("snippet selector matched no hosts");
+                            return Vec::new();
+                        }
+                        Err(error) => {
+                            self.toast(error);
+                            return Vec::new();
+                        }
+                    }
+                } else {
+                    self.exec_targets()
+                };
+                if hosts.is_empty() {
+                    self.toast("No host selected");
+                    return Vec::new();
+                }
+                self.pending_snippet_audit = Some(format!("[{}] {command}", snippet.name));
+                let settings = ExecSettings {
+                    confirm_threshold: self.confirm_threshold,
+                    protected_tags: self.protected_tags.clone(),
+                };
+                if snippet.confirm || job::needs_confirmation(&hosts, &settings).is_some() {
+                    let reason = if snippet.confirm {
+                        format!("snippet `{}` requires confirm", snippet.name)
+                    } else {
+                        job::needs_confirmation(&hosts, &settings)
+                            .map(|reason| reason.message())
+                            .unwrap_or_else(|| "confirm".into())
+                    };
+                    self.exec_confirm = Some(Confirm {
+                        command,
+                        sudo: false,
+                        timeout: job::DEFAULT_TIMEOUT,
+                        hosts,
+                        reason,
+                    });
+                    Vec::new()
+                } else {
+                    self.start_exec(command, false, job::DEFAULT_TIMEOUT, hosts)
+                }
+            }
+            SnippetEvent::Upsert(snippet) => {
+                match SnippetStore::load(&self.snippets_path) {
+                    Ok(mut store) => {
+                        if let Err(error) = store.upsert(snippet) {
+                            self.show_error(error.to_string());
+                        } else {
+                            view.set_snippets(store.list().to_vec());
+                            self.toast("snippet saved");
+                        }
+                    }
+                    Err(error) => self.show_error(error.to_string()),
+                }
+                self.modal = Some(Modal::Snippets(view));
+                Vec::new()
+            }
+            SnippetEvent::Delete(name) => {
+                match SnippetStore::load(&self.snippets_path) {
+                    Ok(mut store) => {
+                        match store.delete(&name) {
+                            Ok(true) => {
+                                view.set_snippets(store.list().to_vec());
+                                view.mode_picker();
+                                self.toast(format!("deleted snippet `{name}`"));
+                            }
+                            Ok(false) => self.toast("snippet not found"),
+                            Err(error) => self.show_error(error.to_string()),
+                        }
+                    }
+                    Err(error) => self.show_error(error.to_string()),
+                }
+                self.modal = Some(Modal::Snippets(view));
+                Vec::new()
+            }
+        }
+    }
+
+    fn tunnels_key(&mut self, code: KeyCode) -> Vec<UiCommand> {
+        let Some(Modal::Tunnels(mut view)) = self.modal.take() else {
+            return Vec::new();
+        };
+        let running: Vec<RunningTunnel> = self
+            .running_tunnels
+            .iter()
+            .filter(|tunnel| tunnel.host == view.host)
+            .cloned()
+            .collect();
+        match tunnels_ui::on_key(&mut view, code, &running) {
+            TunnelUiEvent::Continue => {
+                self.modal = Some(Modal::Tunnels(view));
+                Vec::new()
+            }
+            TunnelUiEvent::Close => Vec::new(),
+            TunnelUiEvent::Start { label, spec } => {
+                let host = view.host.clone();
+                self.modal = Some(Modal::Tunnels(view));
+                vec![UiCommand::Tunnels(TunnelsCommand::Start {
+                    host,
+                    label,
+                    spec,
+                })]
+            }
+            TunnelUiEvent::Stop(id) => {
+                self.modal = Some(Modal::Tunnels(view));
+                vec![UiCommand::Tunnels(TunnelsCommand::Stop(id))]
+            }
+        }
+    }
+
+    fn log_key(&mut self, code: KeyCode, modifiers: KeyModifiers) -> Vec<UiCommand> {
+        match code {
+            KeyCode::Char('q') if !self.log.searching && self.log.detail.is_none() => {
+                return self.update(Action::Quit);
+            }
+            KeyCode::Char('?') if !self.log.searching && self.log.detail.is_none() => {
+                return self.update(Action::ToggleHelp);
+            }
+            KeyCode::Char(digit @ '1'..='5')
+                if !self.log.searching && self.log.detail.is_none() =>
+            {
+                let screen = digit.to_digit(10).unwrap_or(0) as u8;
+                return self.update(Action::SwitchScreen(screen));
+            }
+            KeyCode::Char('r') if !self.log.searching && self.log.detail.is_none() => {
+                self.refresh_log();
+                self.dirty = true;
+                return Vec::new();
+            }
+            _ => {}
+        }
+        if let Some(
+            action @ (Action::OpenSnippets
+            | Action::OpenTunnels
+            | Action::OpenFiles
+            | Action::OpenSession
+            | Action::Exec),
+        ) = self.keymap.lookup(code, modifiers)
+            && !self.log.searching
+            && self.log.detail.is_none()
+        {
+            return self.update(action);
+        }
+        match log_ui::on_key(&mut self.log, code) {
+            LogEvent::None => {
+                self.dirty = true;
+                Vec::new()
+            }
+            LogEvent::Rerun { hosts, command } => {
+                let resolved: Vec<EffectiveHost> = self
+                    .hosts
+                    .iter()
+                    .filter(|host| hosts.iter().any(|name| name == &host.name))
+                    .cloned()
+                    .collect();
+                if resolved.is_empty() {
+                    self.toast("hosts from this entry are gone");
+                    return Vec::new();
+                }
+                self.exec_confirm = Some(Confirm {
+                    command,
+                    sudo: false,
+                    timeout: job::DEFAULT_TIMEOUT,
+                    hosts: resolved,
+                    reason: "re-run from audit log".into(),
+                });
+                Vec::new()
+            }
+        }
+    }
+
+    /// Apply a tunnel manager event (death toast + snapshot refresh).
+    pub fn apply_tunnel_event(&mut self, event: TunnelEvent) {
+        match event {
+            TunnelEvent::Exited {
+                id,
+                host,
+                label,
+                code,
+            } => {
+                self.running_tunnels.retain(|tunnel| tunnel.id != id);
+                let code = code
+                    .map(|code| code.to_string())
+                    .unwrap_or_else(|| "signal".into());
+                self.toast(format!("tunnel {label} on {host} exited ({code})"));
+            }
+        }
+        self.dirty = true;
+    }
+
+    /// Replace the running-tunnel snapshot from the manager.
+    pub fn set_running_tunnels(&mut self, tunnels: Vec<RunningTunnel>) {
+        self.running_tunnels = tunnels;
+        self.dirty = true;
+    }
+
+    fn write_audit(&mut self, entry: crate::infra::audit_log::AuditEntry) {
+        if let Err(error) = audit::append(&self.audit_path, entry, &self.audit) {
+            tracing::warn!("audit log write failed: {error}");
+            self.toast(format!("audit log: {error}"));
+        }
     }
 
     fn finish_quit(&mut self) -> Vec<UiCommand> {
@@ -1998,6 +2429,17 @@ impl App {
     /// Located `ssh` binary, if any.
     pub fn ssh_program(&self) -> Option<&PathBuf> {
         self.ssh.as_ref()
+    }
+
+    /// Audit a tunnel start from the event loop.
+    pub fn audit_tunnel_start(&mut self, host: &str, label: &str, spec: &TunnelSpec) {
+        let mut entry = audit::entry(
+            "tunnel_start",
+            vec![host.to_string()],
+            Some(format!("{label} ({})", spec.to_compact())),
+        );
+        entry.selector = Some(host.to_string());
+        self.write_audit(entry);
     }
 
     /// Whether ControlMaster paths are enabled.
@@ -2167,6 +2609,12 @@ mod tests {
             sessions: SessionsView::new(),
             session_prefix: (KeyCode::Char(']'), KeyModifiers::CONTROL),
             session_scrollback: 5000,
+            snippets_path: PathBuf::from("/tmp/snippets.toml"),
+            audit_path: PathBuf::from("/tmp/audit.jsonl"),
+            audit: AuditConfig::default(),
+            log: LogView::default(),
+            running_tunnels: Vec::new(),
+            pending_snippet_audit: None,
         }
     }
 

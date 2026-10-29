@@ -30,7 +30,10 @@ use crate::services::connect::{self};
 use crate::services::health::{self as health_svc, HealthControl, HealthEvent};
 use crate::services::inventory::InventoryBundle;
 use crate::services::sessions::{SessionEvent, SessionManager};
-use crate::tui::action::{Action, FilesCommand, Handoff, SessionsCommand, UiCommand};
+use crate::services::tunnels::{TunnelEvent, TunnelManager};
+use crate::tui::action::{
+    Action, FilesCommand, Handoff, SessionsCommand, TunnelsCommand, UiCommand,
+};
 use crate::tui::app::App;
 use crate::tui::screens::files::PaneFocus;
 use crossterm::event::{Event, EventStream, KeyEventKind};
@@ -73,6 +76,7 @@ async fn event_loop(
     let mut health = spawn_health(app);
     let mut live_files = LiveFiles::new();
     let mut live_sessions = LiveSessions::new(app.session_scrollback);
+    let mut live_tunnels = LiveTunnels::new(app.ssh_program().cloned());
     tick.set_missed_tick_behavior(MissedTickBehavior::Skip);
     render.set_missed_tick_behavior(MissedTickBehavior::Skip);
     if let Ok(size) = terminal.size() {
@@ -91,6 +95,7 @@ async fn event_loop(
             }
             live_files.shutdown().await;
             live_sessions.manager.close_all();
+            live_tunnels.manager.stop_all();
             break;
         }
         let mut effects = Effects::default();
@@ -126,6 +131,22 @@ async fn event_loop(
                     while let Ok(event) = live_sessions.events.try_recv() {
                         apply_session_side_effects(app, &live_sessions, &event);
                         app.apply_session_event(event);
+                    }
+                }
+            }
+            tunnel_event = live_tunnels.events.recv() => {
+                if let Some(event) = tunnel_event {
+                    live_tunnels.manager.forget(match &event {
+                        TunnelEvent::Exited { id, .. } => *id,
+                    });
+                    app.apply_tunnel_event(event);
+                    app.set_running_tunnels(live_tunnels.manager.list());
+                    while let Ok(event) = live_tunnels.events.try_recv() {
+                        live_tunnels.manager.forget(match &event {
+                            TunnelEvent::Exited { id, .. } => *id,
+                        });
+                        app.apply_tunnel_event(event);
+                        app.set_running_tunnels(live_tunnels.manager.list());
                     }
                 }
             }
@@ -226,8 +247,29 @@ async fn event_loop(
                 app.show_error(error.to_string());
             }
         }
+        for command in effects.tunnels {
+            if let Err(error) = handle_tunnels_command(app, &mut live_tunnels, command) {
+                app.show_error(error.to_string());
+            }
+        }
     }
     Ok(())
+}
+
+struct LiveTunnels {
+    manager: TunnelManager,
+    events: mpsc::UnboundedReceiver<TunnelEvent>,
+}
+
+impl LiveTunnels {
+    fn new(program: Option<std::path::PathBuf>) -> Self {
+        let (tx, events) = mpsc::unbounded_channel();
+        let program = program.unwrap_or_else(|| std::path::PathBuf::from("ssh"));
+        Self {
+            manager: TunnelManager::new(program, tx),
+            events,
+        }
+    }
 }
 
 const VIEW_CAP: usize = 1024 * 1024;
@@ -285,6 +327,7 @@ struct Effects {
     cancel: bool,
     files: Vec<FilesCommand>,
     sessions: Vec<SessionsCommand>,
+    tunnels: Vec<TunnelsCommand>,
 }
 
 struct LiveSessions {
@@ -396,6 +439,7 @@ fn apply_commands(
             }
             UiCommand::Files(files) => effects.files.push(files),
             UiCommand::Sessions(sessions) => effects.sessions.push(sessions),
+            UiCommand::Tunnels(tunnels) => effects.tunnels.push(tunnels),
         }
     }
     effects
@@ -412,6 +456,45 @@ fn apply_session_side_effects(
         let bracketed = live.manager.bracketed_paste(*id);
         app.refresh_session_modes(*id, modes, bracketed);
     }
+}
+
+fn handle_tunnels_command(
+    app: &mut App,
+    live: &mut LiveTunnels,
+    command: TunnelsCommand,
+) -> Result<(), Error> {
+    match command {
+        TunnelsCommand::Start { host, label, spec } => {
+            let host_ref = app
+                .effective_hosts()
+                .iter()
+                .find(|candidate| candidate.name == host)
+                .ok_or_else(|| Error::Message(format!("no host `{host}`")))?;
+            let host_owned = host_ref.clone();
+            let hosts = app.effective_hosts().to_vec();
+            live.manager.start(
+                &host_owned,
+                &hosts,
+                label.clone(),
+                spec.clone(),
+                app.multiplexing_enabled(),
+                app.control_dir_path(),
+            )?;
+            app.audit_tunnel_start(&host, &label, &spec);
+            app.set_running_tunnels(live.manager.list());
+            app.toast(format!("tunnel {label} started"));
+        }
+        TunnelsCommand::Stop(id) => {
+            live.manager.stop(id)?;
+            app.set_running_tunnels(live.manager.list());
+            app.toast("tunnel stopped");
+        }
+        TunnelsCommand::StopAll => {
+            live.manager.stop_all();
+            app.set_running_tunnels(Vec::new());
+        }
+    }
+    Ok(())
 }
 
 fn handle_sessions_command(

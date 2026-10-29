@@ -10,5 +10,5 @@ pub mod health;
 pub mod host;
 pub mod host_form;
 pub mod selector;
-mod snippet;
-mod tunnel;
+pub mod snippet;
+pub mod tunnel;
