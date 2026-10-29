@@ -6,17 +6,25 @@
 //! Other tabs are placeholders until their phases.
 
 use crate::config::Config;
-use crate::domain::host::{EffectiveHost, Problem};
+use crate::domain::host::{EffectiveHost, Host, Inventory, Problem};
 use crate::error::Error;
-use crate::infra::ssh::command::{SshCommandOptions, build_ssh_command, command_line};
+use crate::infra::ssh::command::{
+    SshCommandOptions, build_ssh_command, command_line, exec_arguments,
+};
 use crate::infra::ssh::system::{self, missing_ssh_message};
+use crate::infra::ssh_config;
 use crate::infra::state_store::{self, AppState};
 use crate::paths::Paths;
 use crate::services::connect::{self, ConnectPlan};
+use crate::services::exec::{self as job, ExecSettings};
 use crate::services::inventory::{self, InventoryBundle};
 use crate::tui::action::{Action, ConnectHandoff, EditorHandoff, Handoff, UiCommand};
 use crate::tui::keymap::Keymap;
+use crate::tui::screens::exec as exec_ui;
+use crate::tui::screens::exec::{Confirm, Prompt, PromptEvent, Results, ResultsEvent};
+use crate::tui::screens::host_form::{self, HostFormEvent};
 use crate::tui::screens::hosts::{self, HostsView, ViewOptions};
+use crate::tui::screens::import::{self, ImportEvent};
 use crate::tui::theme::Theme;
 use chrono::Utc;
 use crossterm::event::{KeyCode, KeyModifiers};
@@ -40,10 +48,17 @@ pub enum Modal {
     Problems,
     /// A failure the user has to dismiss, such as ssh exiting 255.
     Error(String),
+    /// Add, edit, or duplicate a host.
+    HostForm(Box<host_form::HostForm>),
+    /// Confirm deletion of one host.
+    Delete { name: String },
+    /// Checklist of hosts found in an OpenSSH config.
+    Import(Box<import::ImportView>),
 }
 
 /// Shell state: inventory, keymap, the Hosts screen, and the open modal.
 pub struct App {
+    inventory: Inventory,
     hosts: Vec<EffectiveHost>,
     problems: Vec<Problem>,
     hosts_path: PathBuf,
@@ -66,6 +81,13 @@ pub struct App {
     state: AppState,
     state_path: PathBuf,
     ssh: Option<PathBuf>,
+    parallel: usize,
+    confirm_threshold: usize,
+    protected_tags: Vec<String>,
+    exec_prompt: Option<Prompt>,
+    exec_confirm: Option<Confirm>,
+    exec_results: Option<Results>,
+    exec_visible: bool,
 }
 
 impl App {
@@ -86,6 +108,7 @@ impl App {
         let (state, warning) = state_store::load(&state_path);
         let ssh = system::find_program("ssh", std::env::var_os("PATH").as_deref());
         let mut app = Self {
+            inventory: bundle.inventory.clone(),
             hosts: bundle.hosts,
             problems: bundle.problems,
             hosts_path: paths.hosts_file(),
@@ -107,6 +130,13 @@ impl App {
             state,
             state_path,
             ssh,
+            parallel: config.parallel.max(1),
+            confirm_threshold: config.confirm_threshold,
+            protected_tags: config.protected_tags.clone(),
+            exec_prompt: None,
+            exec_confirm: None,
+            exec_results: None,
+            exec_visible: false,
         };
         app.refresh_groups();
         app.apply_start_screen(&config.tui.start_screen);
@@ -143,7 +173,22 @@ impl App {
         if code == KeyCode::Char('c') && modifiers.contains(KeyModifiers::CONTROL) {
             return self.update(Action::Quit);
         }
+        if self.exec_confirm.is_some() {
+            return self.exec_confirm_key(code);
+        }
+        if self.exec_prompt.is_some() {
+            return self.exec_prompt_key(code, modifiers);
+        }
         if self.modal.is_some() {
+            if matches!(self.modal, Some(Modal::HostForm(_))) {
+                return self.host_form_key(code, modifiers);
+            }
+            if matches!(self.modal, Some(Modal::Import(_))) {
+                return self.import_key(code, modifiers);
+            }
+            if matches!(self.modal, Some(Modal::Delete { .. })) {
+                return self.delete_key(code);
+            }
             if code == KeyCode::Esc {
                 return self.update(Action::CloseModal);
             }
@@ -153,6 +198,9 @@ impl App {
                 }
                 _ => Vec::new(),
             };
+        }
+        if self.exec_visible {
+            return self.exec_results_key(code);
         }
         if self.screen == 1 && self.view.editing && self.modal.is_none() {
             return match code {
@@ -182,9 +230,22 @@ impl App {
                 self.state
                     .remember_ui(screen_name(self.screen), &self.view.query);
                 self.quit = true;
-                return vec![UiCommand::Persist];
+                let mut commands = vec![UiCommand::Persist];
+                if self
+                    .exec_results
+                    .as_ref()
+                    .is_some_and(|results| results.running)
+                {
+                    commands.insert(0, UiCommand::CancelExec);
+                }
+                return commands;
             }
             Action::Tick => {
+                if let Some(results) = &mut self.exec_results
+                    && results.running
+                {
+                    results.spinner = results.spinner.wrapping_add(1);
+                }
                 if let Some((_, left)) = &mut self.toast {
                     if *left == 0 {
                         self.toast = None;
@@ -225,6 +286,13 @@ impl App {
                 });
             }
             Action::EditInventory => return self.edit_inventory(),
+            Action::AddHost => self.open_add(),
+            Action::EditHost => self.open_edit(),
+            Action::DuplicateHost => self.open_duplicate(),
+            Action::DeleteHost => self.open_delete(),
+            Action::ImportHosts => self.open_import(),
+            Action::Exec => self.open_exec(),
+            Action::ShowExec => self.show_exec(),
             Action::FocusTree
             | Action::FocusTable
             | Action::MoveUp
@@ -301,6 +369,17 @@ impl App {
             frame.render_widget(Paragraph::new(message), chunks[1]);
         }
         self.draw_hints(frame, chunks[2]);
+        if self.exec_visible
+            && let Some(results) = &self.exec_results
+        {
+            exec_ui::draw_results(frame, area, results, &self.theme);
+        }
+        if let Some(prompt) = &self.exec_prompt {
+            exec_ui::draw_prompt(frame, area, prompt, &self.theme);
+        }
+        if let Some(confirm) = &self.exec_confirm {
+            exec_ui::draw_confirm(frame, area, confirm, &self.theme);
+        }
         if let Some(modal) = self.modal.clone() {
             self.draw_modal(frame, area, modal);
         }
@@ -331,7 +410,30 @@ impl App {
             message.clone()
         } else {
             let mut hint =
-                " ⏎ connect   j/k move   / search   * fav   E edit   ? help   q quit".to_string();
+                " ⏎ connect   x exec   a add   e edit   d del   ? help   q quit".to_string();
+            if self
+                .exec_results
+                .as_ref()
+                .is_some_and(|results| results.running && !self.exec_visible)
+            {
+                let done = self
+                    .exec_results
+                    .as_ref()
+                    .map(|results| {
+                        results
+                            .rows
+                            .iter()
+                            .filter(|row| row.outcome.is_some())
+                            .count()
+                    })
+                    .unwrap_or(0);
+                let total = self
+                    .exec_results
+                    .as_ref()
+                    .map(|results| results.rows.len())
+                    .unwrap_or(0);
+                hint = format!(" exec {done}/{total}   {hint}");
+            }
             if !self.problems.is_empty() {
                 hint.push_str("   v problems");
             }
@@ -344,7 +446,22 @@ impl App {
         let (title, lines) = match modal {
             Modal::Help => ("Help", self.help_lines()),
             Modal::Problems => ("Validation", self.problem_lines()),
-            Modal::Error(message) => ("Error", vec![Line::from(message.clone())]),
+            Modal::Error(message) => ("Error", vec![Line::from(message)]),
+            Modal::HostForm(form) => {
+                host_form::draw(frame, area, &form, &self.theme);
+                return;
+            }
+            Modal::Import(view) => {
+                import::draw(frame, area, &view, &self.theme);
+                return;
+            }
+            Modal::Delete { name } => (
+                "Delete host",
+                vec![
+                    Line::from(format!("Delete {name}?")),
+                    Line::from("y confirms   n or Esc cancels"),
+                ],
+            ),
         };
         crate::tui::widgets::modal::render(frame, area, title, lines, &self.theme);
     }
@@ -361,6 +478,13 @@ impl App {
             Line::from("Esc              clear selection"),
             Line::from("y                copy the ssh command"),
             Line::from("Enter            connect"),
+            Line::from("a                add a host"),
+            Line::from("e                edit the cursor host"),
+            Line::from("D                duplicate the cursor host"),
+            Line::from("d                delete the cursor host"),
+            Line::from("i                import ~/.ssh/config"),
+            Line::from("x                run a command on the selection"),
+            Line::from("X                reopen exec results"),
             Line::from("*                toggle favorite"),
             Line::from("S                sort by frecency"),
             Line::from("E                edit hosts.toml"),
@@ -513,6 +637,7 @@ impl App {
         match inventory::load_hosts(&self.hosts_path, &crate::paths::local_user()) {
             Ok(bundle) => {
                 let problems = bundle.problems.len();
+                self.inventory = bundle.inventory;
                 self.hosts = bundle.hosts;
                 self.problems = bundle.problems;
                 self.view
@@ -529,6 +654,431 @@ impl App {
             Err(error) => self.modal = Some(Modal::Error(error.to_string())),
         }
         self.dirty = true;
+    }
+
+    fn open_add(&mut self) {
+        if self.screen != 1 {
+            return;
+        }
+        let form = host_form::add_form(&self.inventory, &crate::paths::local_user());
+        self.modal = Some(Modal::HostForm(Box::new(form)));
+    }
+
+    fn open_edit(&mut self) {
+        if self.screen != 1 {
+            return;
+        }
+        let Some(host) = self.raw_host().cloned() else {
+            self.toast("No host selected");
+            return;
+        };
+        let form = host_form::edit_form(&host, &self.inventory, &crate::paths::local_user());
+        self.modal = Some(Modal::HostForm(Box::new(form)));
+    }
+
+    fn open_duplicate(&mut self) {
+        if self.screen != 1 {
+            return;
+        }
+        let Some(host) = self.raw_host().cloned() else {
+            self.toast("No host selected");
+            return;
+        };
+        let form = host_form::duplicate_form(&host, &self.inventory, &crate::paths::local_user());
+        self.modal = Some(Modal::HostForm(Box::new(form)));
+    }
+
+    fn open_delete(&mut self) {
+        if self.screen != 1 {
+            return;
+        }
+        let Some(name) = self.view.cursor_name.clone() else {
+            self.toast("No host selected");
+            return;
+        };
+        let blockers = crate::domain::host_form::deletion_blockers(&self.inventory, &name);
+        if blockers.is_empty() {
+            self.modal = Some(Modal::Delete { name });
+        } else {
+            self.modal = Some(Modal::Error(format!(
+                "cannot delete {name}: used as a jump by {}",
+                blockers.join(", ")
+            )));
+        }
+    }
+
+    fn open_import(&mut self) {
+        if self.screen != 1 {
+            return;
+        }
+        let path = ssh_config::default_path();
+        if !path.exists() {
+            self.modal = Some(Modal::Error(format!("no ssh config at {}", path.display())));
+            return;
+        }
+        self.modal = Some(Modal::Import(Box::new(import::load(
+            &path,
+            &self.inventory,
+        ))));
+    }
+
+    fn raw_host(&self) -> Option<&Host> {
+        let name = self.view.cursor_name.as_deref()?;
+        self.inventory.hosts.iter().find(|host| host.name == name)
+    }
+
+    fn host_form_key(&mut self, code: KeyCode, modifiers: KeyModifiers) -> Vec<UiCommand> {
+        let Some(Modal::HostForm(mut form)) = self.modal.take() else {
+            return Vec::new();
+        };
+        match host_form::on_key(&mut form, &self.inventory, code, modifiers) {
+            HostFormEvent::Continue => {
+                self.modal = Some(Modal::HostForm(form));
+                Vec::new()
+            }
+            HostFormEvent::Cancel => Vec::new(),
+            HostFormEvent::Submit {
+                original_name,
+                host,
+            } => self.save_host(*form, original_name, *host),
+        }
+    }
+
+    fn save_host(
+        &mut self,
+        mut form: host_form::HostForm,
+        original_name: Option<String>,
+        host: Host,
+    ) -> Vec<UiCommand> {
+        let user = crate::paths::local_user();
+        let saved = match &original_name {
+            Some(old) => inventory::update_host(&self.hosts_path, &user, old, host.clone()),
+            None => inventory::add_host(&self.hosts_path, &user, host.clone()),
+        };
+        match saved {
+            Ok(bundle) => {
+                let new_name = host.name.clone();
+                if let Some(old) = original_name {
+                    if old != new_name {
+                        self.state.rename_host(&old, &new_name);
+                        if self.view.selected.remove(&old) {
+                            self.view.selected.insert(new_name.clone());
+                        }
+                        if self.view.cursor_name.as_deref() == Some(old.as_str()) {
+                            self.view.cursor_name = Some(new_name);
+                        }
+                    }
+                } else {
+                    self.view.cursor_name = Some(new_name);
+                }
+                self.install_bundle(bundle);
+                self.toast(format!("saved {}", host.name));
+                vec![UiCommand::Persist]
+            }
+            Err(error) => {
+                form.status = Some(error.to_string());
+                self.modal = Some(Modal::HostForm(Box::new(form)));
+                Vec::new()
+            }
+        }
+    }
+
+    fn import_key(&mut self, code: KeyCode, modifiers: KeyModifiers) -> Vec<UiCommand> {
+        let Some(Modal::Import(mut view)) = self.modal.take() else {
+            return Vec::new();
+        };
+        match import::on_key(&mut view, code, modifiers) {
+            ImportEvent::Continue => {
+                self.modal = Some(Modal::Import(view));
+                Vec::new()
+            }
+            ImportEvent::Cancel => Vec::new(),
+            ImportEvent::Import(hosts) if hosts.is_empty() => {
+                self.toast("nothing selected");
+                self.modal = Some(Modal::Import(view));
+                Vec::new()
+            }
+            ImportEvent::Import(hosts) => {
+                match inventory::import_hosts(
+                    &self.hosts_path,
+                    &crate::paths::local_user(),
+                    &hosts,
+                    true,
+                ) {
+                    Ok(bundle) => {
+                        let count = hosts.len();
+                        self.install_bundle(bundle);
+                        self.toast(format!("imported {count} hosts"));
+                        vec![UiCommand::Persist]
+                    }
+                    Err(error) => {
+                        self.modal = Some(Modal::Error(error.to_string()));
+                        Vec::new()
+                    }
+                }
+            }
+        }
+    }
+
+    fn delete_key(&mut self, code: KeyCode) -> Vec<UiCommand> {
+        let Some(Modal::Delete { name }) = self.modal.clone() else {
+            return Vec::new();
+        };
+        match code {
+            KeyCode::Char('y') | KeyCode::Char('Y') => {
+                self.modal = None;
+                match inventory::remove_host(&self.hosts_path, &crate::paths::local_user(), &name) {
+                    Ok(bundle) => {
+                        self.state.forget_host(&name);
+                        self.view.selected.remove(&name);
+                        if self.view.cursor_name.as_deref() == Some(name.as_str()) {
+                            self.view.cursor_name = None;
+                        }
+                        self.install_bundle(bundle);
+                        self.toast(format!("deleted {name}"));
+                        vec![UiCommand::Persist]
+                    }
+                    Err(error) => {
+                        self.modal = Some(Modal::Error(error.to_string()));
+                        Vec::new()
+                    }
+                }
+            }
+            KeyCode::Char('n') | KeyCode::Char('N') | KeyCode::Esc => {
+                self.modal = None;
+                Vec::new()
+            }
+            _ => Vec::new(),
+        }
+    }
+
+    fn install_bundle(&mut self, bundle: InventoryBundle) {
+        self.inventory = bundle.inventory;
+        self.hosts = bundle.hosts;
+        self.problems = bundle.problems;
+        self.view
+            .selected
+            .retain(|name| self.hosts.iter().any(|host| &host.name == name));
+        self.refresh_groups();
+        self.view.refresh(&self.hosts);
+        let cursor_missing = self
+            .view
+            .cursor_name
+            .as_ref()
+            .is_none_or(|name| !self.hosts.iter().any(|host| &host.name == name));
+        if cursor_missing {
+            self.view.cursor_name = self.hosts.first().map(|host| host.name.clone());
+        }
+    }
+
+    fn open_exec(&mut self) {
+        if self.screen != 1 {
+            return;
+        }
+        if self
+            .exec_results
+            .as_ref()
+            .is_some_and(|results| results.running)
+        {
+            self.toast("an exec is already running");
+            self.exec_visible = true;
+            return;
+        }
+        let targets = self.exec_targets();
+        if targets.is_empty() {
+            self.toast("No host selected");
+            return;
+        }
+        self.exec_prompt = Some(Prompt::new(
+            targets.into_iter().map(|host| host.name).collect(),
+            self.state.ui.exec_history.clone(),
+        ));
+        self.exec_confirm = None;
+    }
+
+    fn show_exec(&mut self) {
+        if self.exec_results.is_some() {
+            self.exec_visible = true;
+        } else {
+            self.toast("no exec to show");
+        }
+    }
+
+    fn exec_targets(&self) -> Vec<EffectiveHost> {
+        if !self.view.selected.is_empty() {
+            return self
+                .hosts
+                .iter()
+                .filter(|host| self.view.selected.contains(&host.name))
+                .cloned()
+                .collect();
+        }
+        self.view.cursor(&self.hosts).cloned().into_iter().collect()
+    }
+
+    fn exec_prompt_key(&mut self, code: KeyCode, modifiers: KeyModifiers) -> Vec<UiCommand> {
+        let Some(mut prompt) = self.exec_prompt.take() else {
+            return Vec::new();
+        };
+        match exec_ui::prompt_on_key(&mut prompt, code, modifiers) {
+            PromptEvent::Continue => {
+                self.exec_prompt = Some(prompt);
+                Vec::new()
+            }
+            PromptEvent::Cancel => Vec::new(),
+            PromptEvent::Submit {
+                command,
+                sudo,
+                timeout,
+            } => self.stage_exec(command, sudo, timeout),
+        }
+    }
+
+    fn exec_confirm_key(&mut self, code: KeyCode) -> Vec<UiCommand> {
+        match code {
+            KeyCode::Char('y') | KeyCode::Char('Y') => {
+                let Some(confirm) = self.exec_confirm.take() else {
+                    return Vec::new();
+                };
+                self.start_exec(
+                    confirm.command,
+                    confirm.sudo,
+                    confirm.timeout,
+                    confirm.hosts,
+                )
+            }
+            KeyCode::Char('n') | KeyCode::Char('N') | KeyCode::Esc => {
+                self.exec_confirm = None;
+                Vec::new()
+            }
+            _ => Vec::new(),
+        }
+    }
+
+    fn exec_results_key(&mut self, code: KeyCode) -> Vec<UiCommand> {
+        let Some(results) = self.exec_results.as_mut() else {
+            self.exec_visible = false;
+            return Vec::new();
+        };
+        let event = exec_ui::results_on_key(results, code);
+        match event {
+            ResultsEvent::Continue => Vec::new(),
+            ResultsEvent::Close => {
+                self.exec_visible = false;
+                Vec::new()
+            }
+            ResultsEvent::Cancel => vec![UiCommand::CancelExec],
+            ResultsEvent::Copy(text) => vec![UiCommand::Copy(text)],
+            ResultsEvent::Rerun(names) => {
+                if self
+                    .exec_results
+                    .as_ref()
+                    .is_some_and(|results| results.running)
+                {
+                    self.toast("an exec is already running");
+                    return Vec::new();
+                }
+                let Some(results) = self.exec_results.clone() else {
+                    return Vec::new();
+                };
+                let hosts = self
+                    .hosts
+                    .iter()
+                    .filter(|host| names.iter().any(|name| name == &host.name))
+                    .cloned()
+                    .collect();
+                self.start_exec(results.command, results.sudo, results.timeout, hosts)
+            }
+        }
+    }
+
+    fn stage_exec(&mut self, command: String, sudo: bool, timeout: Duration) -> Vec<UiCommand> {
+        let hosts = self.exec_targets();
+        if hosts.is_empty() {
+            self.toast("No host selected");
+            self.exec_prompt = None;
+            return Vec::new();
+        }
+        let settings = ExecSettings {
+            confirm_threshold: self.confirm_threshold,
+            protected_tags: self.protected_tags.clone(),
+        };
+        if let Some(reason) = job::needs_confirmation(&hosts, &settings) {
+            self.exec_prompt = None;
+            self.exec_confirm = Some(Confirm {
+                command,
+                sudo,
+                timeout,
+                hosts,
+                reason: reason.message(),
+            });
+            return Vec::new();
+        }
+        self.start_exec(command, sudo, timeout, hosts)
+    }
+
+    fn start_exec(
+        &mut self,
+        command: String,
+        sudo: bool,
+        timeout: Duration,
+        hosts: Vec<EffectiveHost>,
+    ) -> Vec<UiCommand> {
+        let Some(program) = self.ssh.clone() else {
+            self.show_error(missing_ssh_message().to_string());
+            self.exec_prompt = None;
+            self.exec_confirm = None;
+            return Vec::new();
+        };
+        if hosts.is_empty() {
+            self.toast("No host selected");
+            return Vec::new();
+        }
+        let remote = job::remote_command(&command, sudo);
+        let connect_timeout = (timeout.as_secs() > 0).then_some(timeout.as_secs());
+        let control = self.control_dir.display().to_string();
+        let names: Vec<String> = hosts.iter().map(|host| host.name.clone()).collect();
+        let targets = hosts
+            .iter()
+            .map(|host| job::HostTarget {
+                name: host.name.clone(),
+                args: exec_arguments(
+                    host,
+                    &self.hosts,
+                    connect_timeout,
+                    self.multiplexing,
+                    Some(&control),
+                    &remote,
+                ),
+            })
+            .collect();
+        job::push_history(&mut self.state.ui.exec_history, &command);
+        self.exec_results = Some(Results::starting(command, sudo, timeout, &names));
+        self.exec_visible = true;
+        self.exec_prompt = None;
+        self.exec_confirm = None;
+        vec![
+            UiCommand::StartExec(job::ExecLaunch {
+                program,
+                targets,
+                timeout,
+                parallel: self.parallel,
+            }),
+            UiCommand::Persist,
+        ]
+    }
+
+    /// Fold one exec event into the results view.
+    pub fn apply_exec_event(&mut self, event: job::JobEvent) {
+        if let Some(results) = &mut self.exec_results {
+            results.apply(event);
+        }
+        self.dirty = true;
+    }
+
+    /// True while the results popup is on screen. The clipboard toast uses this.
+    pub fn exec_visible(&self) -> bool {
+        self.exec_visible
     }
 
     /// Show a modal when ssh could not start a shell.
@@ -660,6 +1210,7 @@ mod tests {
     fn preview(hosts: Vec<EffectiveHost>) -> App {
         let view = HostsView::new(&hosts);
         App {
+            inventory: Inventory::default(),
             hosts,
             problems: Vec::new(),
             hosts_path: PathBuf::from("~/.config/vcon/hosts.toml"),
@@ -681,6 +1232,13 @@ mod tests {
             state: AppState::default(),
             state_path: PathBuf::from("/tmp/vcon-state.json"),
             ssh: Some(PathBuf::from("ssh")),
+            parallel: 10,
+            confirm_threshold: 5,
+            protected_tags: Vec::new(),
+            exec_prompt: None,
+            exec_confirm: None,
+            exec_results: None,
+            exec_visible: false,
         }
     }
 
@@ -967,5 +1525,155 @@ mod tests {
         app.reload_inventory();
         assert!(app.hosts.iter().any(|host| host.name == "added"));
         assert!(app.toast.as_ref().unwrap().0.contains("reloaded"));
+    }
+
+    fn writable(body: &str) -> (tempfile::TempDir, App) {
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join("hosts.toml");
+        std::fs::write(&path, body).unwrap();
+        let mut app = preview(Vec::new());
+        app.hosts_path = path;
+        app.reload_inventory();
+        app.toast = None;
+        (dir, app)
+    }
+
+    const PAIR: &str = r#"
+[[hosts]]
+name = "web-1"
+address = "203.0.113.10"
+ssh_options = { ForwardAgent = "yes" }
+
+[[hosts]]
+name = "db-1"
+address = "10.0.0.20"
+jump = "web-1"
+"#;
+
+    #[test]
+    fn add_writes_a_host_and_a_duplicate_name_does_not() {
+        let (_dir, mut app) = writable(PAIR);
+        app.on_key(KeyCode::Char('a'), KeyModifiers::NONE);
+        for ch in "edge".chars() {
+            app.on_key(KeyCode::Char(ch), KeyModifiers::NONE);
+        }
+        app.on_key(KeyCode::Down, KeyModifiers::NONE);
+        for ch in "10.1.1.1".chars() {
+            app.on_key(KeyCode::Char(ch), KeyModifiers::NONE);
+        }
+        let commands = app.on_key(KeyCode::Char('s'), KeyModifiers::CONTROL);
+        assert!(
+            commands
+                .iter()
+                .any(|command| matches!(command, UiCommand::Persist))
+        );
+        assert!(app.modal.is_none());
+        let text = std::fs::read_to_string(&app.hosts_path).unwrap();
+        assert!(text.contains("edge"), "{text}");
+        assert!(text.contains("10.1.1.1"), "{text}");
+
+        app.on_key(KeyCode::Char('a'), KeyModifiers::NONE);
+        for ch in "web-1".chars() {
+            app.on_key(KeyCode::Char(ch), KeyModifiers::NONE);
+        }
+        app.on_key(KeyCode::Char('s'), KeyModifiers::CONTROL);
+        assert!(matches!(app.modal, Some(Modal::HostForm(_))));
+        let text = std::fs::read_to_string(&app.hosts_path).unwrap();
+        assert_eq!(text.matches("name = \"web-1\"").count(), 1, "{text}");
+    }
+
+    #[test]
+    fn delete_refuses_a_jump_target_and_removes_a_leaf() {
+        let (_dir, mut app) = writable(PAIR);
+        app.state.record_connect("db-1", Utc::now());
+        app.view.cursor_name = Some("web-1".to_string());
+        app.on_key(KeyCode::Char('d'), KeyModifiers::NONE);
+        match &app.modal {
+            Some(Modal::Error(message)) => assert!(message.contains("jump"), "{message}"),
+            other => panic!("expected a refusal, got {other:?}"),
+        }
+        assert!(
+            std::fs::read_to_string(&app.hosts_path)
+                .unwrap()
+                .contains("web-1")
+        );
+
+        app.modal = None;
+        app.view.cursor_name = Some("db-1".to_string());
+        app.on_key(KeyCode::Char('d'), KeyModifiers::NONE);
+        app.on_key(KeyCode::Char('q'), KeyModifiers::NONE);
+        assert!(!app.quit());
+        assert!(matches!(app.modal, Some(Modal::Delete { .. })));
+        let commands = app.on_key(KeyCode::Char('y'), KeyModifiers::NONE);
+        assert!(
+            commands
+                .iter()
+                .any(|command| matches!(command, UiCommand::Persist))
+        );
+        let text = std::fs::read_to_string(&app.hosts_path).unwrap();
+        assert!(!text.contains("db-1"), "{text}");
+        assert!(text.contains("web-1"), "{text}");
+        assert!(!app.state.hosts.contains_key("db-1"));
+    }
+
+    #[test]
+    fn duplicate_writes_a_copy_and_keeps_ssh_options() {
+        let (_dir, mut app) = writable(PAIR);
+        app.view.cursor_name = Some("web-1".to_string());
+        app.on_key(KeyCode::Char('D'), KeyModifiers::NONE);
+        let commands = app.on_key(KeyCode::Char('s'), KeyModifiers::CONTROL);
+        assert!(
+            commands
+                .iter()
+                .any(|command| matches!(command, UiCommand::Persist))
+        );
+        let loaded = crate::infra::inventory_store::load(&app.hosts_path).unwrap();
+        let copy = loaded
+            .inventory
+            .hosts
+            .iter()
+            .find(|host| host.name == "web-1-copy")
+            .unwrap();
+        assert_eq!(copy.address, "203.0.113.10");
+        assert_eq!(
+            copy.ssh_options.get("ForwardAgent").map(String::as_str),
+            Some("yes")
+        );
+    }
+
+    #[test]
+    fn exec_confirms_a_protected_tag_and_q_stays_in_the_prompt() {
+        let mut app = preview(fleet());
+        app.on_key(KeyCode::Char('x'), KeyModifiers::NONE);
+        app.on_key(KeyCode::Char('q'), KeyModifiers::NONE);
+        assert!(!app.quit());
+        assert_eq!(app.exec_prompt.as_ref().unwrap().command, "q");
+        app.on_key(KeyCode::Esc, KeyModifiers::NONE);
+        assert!(app.exec_prompt.is_none());
+
+        app.protected_tags = vec!["prod".to_string()];
+        app.view.cursor_name = Some("web-1".to_string());
+        app.on_key(KeyCode::Char('x'), KeyModifiers::NONE);
+        for ch in "uptime".chars() {
+            app.on_key(KeyCode::Char(ch), KeyModifiers::NONE);
+        }
+        let commands = app.on_key(KeyCode::Enter, KeyModifiers::NONE);
+        assert!(commands.is_empty());
+        assert!(app.exec_confirm.as_ref().unwrap().reason.contains("prod"));
+        let commands = app.on_key(KeyCode::Char('y'), KeyModifiers::NONE);
+        assert!(commands.iter().any(|command| matches!(command, UiCommand::StartExec(launch) if launch.targets.len() == 1 && launch.targets[0].args.last().map(String::as_str) == Some("uptime"))));
+        assert!(app.exec_visible);
+        let commands = app.on_key(KeyCode::Esc, KeyModifiers::NONE);
+        assert!(commands.is_empty());
+        assert!(!app.exec_visible);
+        assert!(app.exec_results.as_ref().unwrap().running);
+        app.on_key(KeyCode::Char('X'), KeyModifiers::NONE);
+        assert!(app.exec_visible);
+        let commands = app.on_key(KeyCode::Char('c'), KeyModifiers::NONE);
+        assert!(
+            commands
+                .iter()
+                .any(|command| matches!(command, UiCommand::CancelExec))
+        );
     }
 }

@@ -62,6 +62,11 @@ impl Theme {
         self.paint(self.warn, Modifier::BOLD)
     }
 
+    /// Healthy status, such as a finished exec row.
+    pub fn ok(&self) -> Style {
+        self.paint(self.ok, Modifier::BOLD)
+    }
+
     pub fn error(&self) -> Style {
         self.paint(self.crit, Modifier::BOLD)
     }

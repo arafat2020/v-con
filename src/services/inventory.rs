@@ -1,11 +1,11 @@
 //! Load the inventory and resolve it for both the CLI and the TUI.
 //!
 //! The service owns the use case. Callers pass a path and the local user name
-//! and get back effective hosts plus every validation problem. Writing hosts
-//! is phase 3; the [`toml_edit`] document is kept so that write can preserve comments.
+//! and get back effective hosts plus every validation problem. Writes go through
+//! [`toml_edit`] so comments in `hosts.toml` survive.
 
 use crate::config::{self, Config};
-use crate::domain::host::{EffectiveHost, Inventory, Problem, validate_inventory};
+use crate::domain::host::{EffectiveHost, Host, Inventory, Problem, validate_inventory};
 use crate::error::Error;
 use crate::infra::inventory_store::{self, LoadedInventory};
 use crate::paths::Paths;
@@ -53,5 +53,39 @@ pub fn bundle(loaded: LoadedInventory, local_user: &str) -> InventoryBundle {
 /// Load one `hosts.toml`. Used by `vcon ls` and `vcon check`.
 pub fn load_hosts(path: &Path, local_user: &str) -> Result<InventoryBundle, Error> {
     let loaded = inventory_store::load(path)?;
+    Ok(bundle(loaded, local_user))
+}
+
+/// Validate `host`, append it, and return the reloaded inventory.
+pub fn add_host(path: &Path, local_user: &str, host: Host) -> Result<InventoryBundle, Error> {
+    let loaded = inventory_store::add_host(path, host)?;
+    Ok(bundle(loaded, local_user))
+}
+
+/// Validate a replacement for `old_name` and return the reloaded inventory.
+pub fn update_host(
+    path: &Path,
+    local_user: &str,
+    old_name: &str,
+    host: Host,
+) -> Result<InventoryBundle, Error> {
+    let loaded = inventory_store::update_host(path, old_name, host)?;
+    Ok(bundle(loaded, local_user))
+}
+
+/// Remove `name` when the resulting inventory is still valid.
+pub fn remove_host(path: &Path, local_user: &str, name: &str) -> Result<InventoryBundle, Error> {
+    let loaded = inventory_store::remove_host(path, name)?;
+    Ok(bundle(loaded, local_user))
+}
+
+/// Write imported hosts. Existing names are replaced only when `overwrite` is set.
+pub fn import_hosts(
+    path: &Path,
+    local_user: &str,
+    hosts: &[Host],
+    overwrite: bool,
+) -> Result<InventoryBundle, Error> {
+    let loaded = inventory_store::import_hosts(path, hosts, overwrite)?;
     Ok(bundle(loaded, local_user))
 }

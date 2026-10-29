@@ -51,6 +51,9 @@ pub struct UiState {
     /// Search text without the leading `/`.
     #[serde(default)]
     pub last_filter: String,
+    /// Commands typed into the exec prompt, oldest first.
+    #[serde(default)]
+    pub exec_history: Vec<String>,
 }
 
 fn current_version() -> u32 {
@@ -127,6 +130,21 @@ impl AppState {
         let stamp = self.hosts.get(name)?.last_connected.as_deref()?;
         let then = activity::parse_timestamp(stamp)?;
         Some(activity::compact_age(then, now))
+    }
+
+    /// Drop a host's history after it is deleted.
+    pub fn forget_host(&mut self, name: &str) {
+        self.hosts.remove(name);
+    }
+
+    /// Move history when a host is renamed. Jump references in `hosts.toml` are updated separately.
+    pub fn rename_host(&mut self, old_name: &str, new_name: &str) {
+        if old_name == new_name {
+            return;
+        }
+        if let Some(record) = self.hosts.remove(old_name) {
+            self.hosts.insert(new_name.to_string(), record);
+        }
     }
 
     /// Store the screen name and the current search text.

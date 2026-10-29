@@ -1,7 +1,8 @@
 //! Command-line entry point.
 //!
-//! No subcommand starts the TUI. `init`, `list` (`ls`), `check`, and `connect`
-//! (`c`) share [`crate::services::inventory`] and the state file with the Hosts screen.
+//! No subcommand starts the TUI. `init`, `list` (`ls`), `check`, `connect`
+//! (`c`), `import`, and `exec` (`x`) share [`crate::services::inventory`] and the
+//! state file with the Hosts screen.
 
 mod commands;
 
@@ -56,12 +57,55 @@ pub enum Command {
         /// Host name, for example `web-1`.
         name: String,
     },
+    /// Import hosts. The source is `ssh-config`.
+    Import {
+        /// Source name. Only `ssh-config` is supported.
+        source: String,
+        /// Config file to read. The default is `~/.ssh/config`.
+        #[arg(long)]
+        file: Option<PathBuf>,
+        /// Print the plan and do not write `hosts.toml`.
+        #[arg(long)]
+        dry_run: bool,
+        /// Replace hosts that already use an imported name.
+        #[arg(long)]
+        overwrite: bool,
+    },
+    /// Run one command on many hosts. `x` is an alias.
+    #[command(alias = "x")]
+    Exec {
+        /// Selector such as `web-1` or `@web`.
+        selector: String,
+        /// Remote command. Put it after `--`.
+        #[arg(trailing_var_arg = true, allow_hyphen_values = true)]
+        command: Vec<String>,
+        /// Max concurrent hosts. The default is `parallel` from config.toml.
+        #[arg(short = 'p', long)]
+        parallel: Option<usize>,
+        /// Per-host timeout in seconds. `0` waits without a limit. The default is 30.
+        #[arg(short = 't', long)]
+        timeout: Option<u64>,
+        /// Print each line as it arrives.
+        #[arg(long)]
+        stream: bool,
+        /// Grouped output is the default. Combining this with `--stream` is an error.
+        #[arg(long)]
+        grouped: bool,
+        /// Hide output from hosts that succeeded.
+        #[arg(long)]
+        only_failed: bool,
+        /// Print each ssh command and do not run it.
+        #[arg(long)]
+        dry_run: bool,
+        /// Prefix the remote command with `sudo -n`.
+        #[arg(long)]
+        sudo: bool,
+    },
 }
 
 /// Parse argv and run the selected command. The process exit code is the return value.
 pub fn run() -> ExitCode {
     let cli = Cli::parse();
-    let _ = cli.yes;
     init_logging(&Paths::resolve(cli.config_dir.as_deref()), cli.verbose);
     match dispatch(&cli) {
         Ok(code) => code,
@@ -113,6 +157,61 @@ fn dispatch(cli: &Cli) -> Result<ExitCode, Error> {
             let (bundle, config) = inventory::load(&paths, &paths::local_user())?;
             commands::connect::run(&bundle, &config, &paths, name)?;
             Ok(ExitCode::SUCCESS)
+        }
+        Some(Command::Import {
+            source,
+            file,
+            dry_run,
+            overwrite,
+        }) => {
+            if source != "ssh-config" {
+                return Err(Error::Message(format!(
+                    "unknown import source `{source}`; use ssh-config"
+                )));
+            }
+            let config_file = file
+                .clone()
+                .unwrap_or_else(crate::infra::ssh_config::default_path);
+            let result = commands::import::run(
+                &paths.hosts_file(),
+                &config_file,
+                *dry_run,
+                *overwrite,
+                &paths::local_user(),
+            )?;
+            println!("{}", result.text);
+            Ok(ExitCode::SUCCESS)
+        }
+        Some(Command::Exec {
+            selector,
+            command,
+            parallel,
+            timeout,
+            stream,
+            grouped,
+            only_failed,
+            dry_run,
+            sudo,
+        }) => {
+            let (bundle, config) = inventory::load(&paths, &paths::local_user())?;
+            commands::exec::run(
+                &bundle,
+                &config,
+                &paths,
+                &commands::exec::ExecRequest {
+                    selector,
+                    command,
+                    parallel: *parallel,
+                    timeout: *timeout,
+                    stream: *stream,
+                    grouped: *grouped,
+                    only_failed: *only_failed,
+                    dry_run: *dry_run,
+                    sudo: *sudo,
+                    json: cli.json,
+                    yes: cli.yes,
+                },
+            )
         }
         None => {
             if !std::io::IsTerminal::is_terminal(&std::io::stdout()) {

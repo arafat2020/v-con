@@ -13,4 +13,4 @@ expression: screen
 │                                      │
 │                                      │
 └──────────────────────────────────────┘
- ⏎ connect   j/k move   / search   * fav
+ ⏎ connect   x exec   a add   e edit   d
