@@ -142,6 +142,50 @@ pub enum Command {
         /// Local destination directory.
         local: PathBuf,
     },
+    /// Foreground port forward. Ctrl+C stops.
+    Tunnel {
+        /// Host name.
+        host: String,
+        /// Compact spec (`L:…`) or a saved tunnel name on that host.
+        spec: String,
+    },
+    /// List or run saved command snippets.
+    Snippet {
+        #[command(subcommand)]
+        action: SnippetCommand,
+    },
+    /// Print the audit log.
+    Log {
+        /// Restrict to this host.
+        #[arg(long)]
+        host: Option<String>,
+        /// Restrict to this action (`exec`, `snippet`, …).
+        #[arg(long)]
+        action: Option<String>,
+        /// Only entries newer than this duration (`1d`, `12h`, `30m`).
+        #[arg(long)]
+        since: Option<String>,
+        /// Only entries with a non-zero host result.
+        #[arg(long)]
+        failed: bool,
+    },
+}
+
+/// `vcon snippet` subcommands.
+#[derive(Debug, Subcommand)]
+pub enum SnippetCommand {
+    /// Print saved snippets.
+    List,
+    /// Render and run a snippet on a selector.
+    Run {
+        /// Snippet name.
+        name: String,
+        /// Host selector.
+        selector: String,
+        /// Template variable `key=value`. Repeatable.
+        #[arg(long = "var", value_name = "KEY=VALUE")]
+        vars: Vec<String>,
+    },
 }
 
 /// Parse argv and run the selected command. The process exit code is the return value.
@@ -251,6 +295,8 @@ fn dispatch(cli: &Cli) -> Result<ExitCode, Error> {
                     sudo: *sudo,
                     json: cli.json,
                     yes: cli.yes,
+                    audit_action: None,
+                    audit_command: None,
                 },
             )
         }
@@ -324,6 +370,48 @@ fn dispatch(cli: &Cli) -> Result<ExitCode, Error> {
                 },
             )
         }
+        Some(Command::Tunnel { host, spec }) => {
+            let (bundle, config) = inventory::load(&paths, &paths::local_user())?;
+            commands::tunnel::run(&bundle, &config, &paths, host, spec)?;
+            Ok(ExitCode::SUCCESS)
+        }
+        Some(Command::Snippet { action }) => match action {
+            SnippetCommand::List => commands::snippet::list(&paths, cli.json),
+            SnippetCommand::Run {
+                name,
+                selector,
+                vars,
+            } => {
+                let (bundle, config) = inventory::load(&paths, &paths::local_user())?;
+                commands::snippet::run(
+                    &bundle,
+                    &config,
+                    &paths,
+                    &commands::snippet::RunRequest {
+                        name,
+                        selector,
+                        vars,
+                        yes: cli.yes,
+                        json: cli.json,
+                    },
+                )
+            }
+        },
+        Some(Command::Log {
+            host,
+            action,
+            since,
+            failed,
+        }) => commands::log::run(
+            &paths,
+            &commands::log::LogRequest {
+                host: host.as_deref(),
+                action: action.as_deref(),
+                since: since.as_deref(),
+                failed: *failed,
+                json: cli.json,
+            },
+        ),
         None => {
             if !std::io::IsTerminal::is_terminal(&std::io::stdout()) {
                 eprintln!("vcon's TUI needs a terminal; use subcommands for scripting");
