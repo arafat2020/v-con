@@ -25,4 +25,4 @@ expression: screen
 │                                                                              │
 │                                                                              │
 └──────────────────────────────────────────────────────────────────────────────┘
- ⏎ connect   x exec   a add   e edit   d del   ? help   q quit
+ ⏎ connect   o session   x exec   a add   e edit   d del   ? help   q quit
