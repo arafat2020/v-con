@@ -7,5 +7,5 @@ pub mod host_form;
 pub mod hosts;
 pub mod import;
 mod log;
-mod sessions;
+pub mod sessions;
 mod snippets;

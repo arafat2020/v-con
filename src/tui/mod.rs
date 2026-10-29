@@ -18,7 +18,7 @@ use crate::config::Config;
 use crate::error::Error;
 use crate::infra::remote_fs::{LocalFs, RemoteFs, SftpFs, normalize, parent_of, sftp_arguments};
 use crate::infra::ssh::backend::SshBackend;
-use crate::infra::ssh::system::SystemSsh;
+use crate::infra::ssh::system::{self, SystemSsh};
 use crate::infra::state_store;
 use crate::paths::Paths;
 use crate::services::exec::{self as job, ExecLaunch};
@@ -26,9 +26,11 @@ use crate::services::files::{
     TransferDirection, TransferEvent, TransferJob, TransferState, collect_tree, map_destinations,
     run_queue,
 };
+use crate::services::connect::{self};
 use crate::services::health::{self as health_svc, HealthControl, HealthEvent};
 use crate::services::inventory::InventoryBundle;
-use crate::tui::action::{Action, FilesCommand, Handoff, UiCommand};
+use crate::services::sessions::{SessionEvent, SessionManager};
+use crate::tui::action::{Action, FilesCommand, Handoff, SessionsCommand, UiCommand};
 use crate::tui::app::App;
 use crate::tui::screens::files::PaneFocus;
 use crossterm::event::{Event, EventStream, KeyEventKind};
@@ -70,6 +72,7 @@ async fn event_loop(
     let mut job: Option<LiveExec> = None;
     let mut health = spawn_health(app);
     let mut live_files = LiveFiles::new();
+    let mut live_sessions = LiveSessions::new(app.session_scrollback);
     tick.set_missed_tick_behavior(MissedTickBehavior::Skip);
     render.set_missed_tick_behavior(MissedTickBehavior::Skip);
     if let Ok(size) = terminal.size() {
@@ -87,6 +90,7 @@ async fn event_loop(
                 let _ = tokio::time::timeout(Duration::from_secs(2), live.task).await;
             }
             live_files.shutdown().await;
+            live_sessions.manager.close_all();
             break;
         }
         let mut effects = Effects::default();
@@ -98,10 +102,31 @@ async fn event_loop(
                         let commands = app.on_key(key.code, key.modifiers);
                         effects = apply_commands(app, commands, health.as_ref(), &mut live_files);
                     }
-                    Some(Ok(Event::Resize(width, height))) => app.note_size(width, height),
+                    Some(Ok(Event::Paste(text))) => {
+                        let commands = app.on_paste(&text);
+                        effects = apply_commands(app, commands, health.as_ref(), &mut live_files);
+                    }
+                    Some(Ok(Event::Resize(width, height))) => {
+                        app.note_size(width, height);
+                        for command in app.session_resize_commands() {
+                            if let UiCommand::Sessions(sessions) = command {
+                                effects.sessions.push(sessions);
+                            }
+                        }
+                    }
                     Some(Ok(_)) => {}
                     Some(Err(error)) => return Err(Error::Message(error.to_string())),
                     None => break,
+                }
+            }
+            session_event = live_sessions.events.recv() => {
+                if let Some(event) = session_event {
+                    apply_session_side_effects(app, &live_sessions, &event);
+                    app.apply_session_event(event);
+                    while let Ok(event) = live_sessions.events.try_recv() {
+                        apply_session_side_effects(app, &live_sessions, &event);
+                        app.apply_session_event(event);
+                    }
                 }
             }
             exec_event = recv_exec(&mut job) => {
@@ -160,9 +185,17 @@ async fn event_loop(
             }
             _ = render.tick(), if app.dirty => {
                 terminal
-                    .draw(|frame| app.draw(frame))
+                    .draw(|frame| app.draw(frame, Some(&live_sessions.manager)))
                     .map_err(|error| Error::Message(error.to_string()))?;
                 app.dirty = false;
+                for command in app.session_resize_commands() {
+                    if let UiCommand::Sessions(sessions) = command
+                        && let Err(error) =
+                            handle_sessions_command(app, &mut live_sessions, sessions)
+                    {
+                        app.show_error(error.to_string());
+                    }
+                }
             }
         }
         if effects.cancel
@@ -185,6 +218,11 @@ async fn event_loop(
         }
         for command in effects.files {
             if let Err(error) = handle_files_command(app, &mut live_files, command).await {
+                app.show_error(error.to_string());
+            }
+        }
+        for command in effects.sessions {
+            if let Err(error) = handle_sessions_command(app, &mut live_sessions, command) {
                 app.show_error(error.to_string());
             }
         }
@@ -246,6 +284,22 @@ struct Effects {
     start: Option<ExecLaunch>,
     cancel: bool,
     files: Vec<FilesCommand>,
+    sessions: Vec<SessionsCommand>,
+}
+
+struct LiveSessions {
+    manager: SessionManager,
+    events: mpsc::UnboundedReceiver<SessionEvent>,
+}
+
+impl LiveSessions {
+    fn new(scrollback_lines: usize) -> Self {
+        let (tx, events) = mpsc::unbounded_channel();
+        Self {
+            manager: SessionManager::new(tx, scrollback_lines),
+            events,
+        }
+    }
 }
 
 fn spawn_exec(launch: ExecLaunch) -> LiveExec {
@@ -341,9 +395,102 @@ fn apply_commands(
                 }
             }
             UiCommand::Files(files) => effects.files.push(files),
+            UiCommand::Sessions(sessions) => effects.sessions.push(sessions),
         }
     }
     effects
+}
+
+fn apply_session_side_effects(
+    app: &mut App,
+    live: &LiveSessions,
+    event: &SessionEvent,
+) {
+    if let SessionEvent::Output(id) = event {
+        live.manager.clear_pending(*id);
+        let modes = live.manager.key_modes(*id);
+        let bracketed = live.manager.bracketed_paste(*id);
+        app.refresh_session_modes(*id, modes, bracketed);
+    }
+}
+
+fn handle_sessions_command(
+    app: &mut App,
+    live: &mut LiveSessions,
+    command: SessionsCommand,
+) -> Result<(), Error> {
+    match command {
+        SessionsCommand::Open {
+            host,
+            rows,
+            cols,
+            place,
+        } => {
+            let id = open_session(app, live, &host, rows, cols)?;
+            app.session_opened(id, host, place);
+            for command in app.session_resize_commands() {
+                if let UiCommand::Sessions(sessions) = command {
+                    handle_sessions_command(app, live, sessions)?;
+                }
+            }
+        }
+        SessionsCommand::Write { id, bytes } => {
+            live.manager.write(id, &bytes)?;
+        }
+        SessionsCommand::Resize { id, rows, cols } => {
+            live.manager.resize(id, rows, cols)?;
+        }
+        SessionsCommand::Close(id) => {
+            live.manager.close(id);
+            app.session_closed(id);
+        }
+        SessionsCommand::CloseAll => {
+            let ids: Vec<_> = app.sessions.hosts.keys().copied().collect();
+            live.manager.close_all();
+            for id in ids {
+                app.session_closed(id);
+            }
+        }
+        SessionsCommand::Scroll { id, delta } => {
+            live.manager.with_parser_mut(id, |parser| {
+                let current = parser.screen().scrollback() as isize;
+                let next = (current + delta).max(0) as usize;
+                parser.screen_mut().set_scrollback(next);
+            });
+            app.dirty = true;
+        }
+        SessionsCommand::Reconnect {
+            id,
+            host,
+            rows,
+            cols,
+        } => {
+            live.manager.close(id);
+            let new_id = open_session(app, live, &host, rows, cols)?;
+            app.session_reconnected(id, new_id, host);
+            live.manager.resize(new_id, rows, cols)?;
+        }
+    }
+    Ok(())
+}
+
+fn open_session(
+    app: &mut App,
+    live: &mut LiveSessions,
+    host: &str,
+    rows: u16,
+    cols: u16,
+) -> Result<crate::services::sessions::SessionId, Error> {
+    let program = app
+        .ssh_program()
+        .cloned()
+        .or_else(|| system::find_program("ssh", std::env::var_os("PATH").as_deref()))
+        .ok_or_else(|| Error::Message(system::missing_ssh_message().to_string()))?;
+    let options =
+        connect::session_options(app.multiplexing_enabled(), app.control_dir_path());
+    let plan = connect::prepare(app.effective_hosts(), app.state_path(), &options, host)?;
+    let _ = state_store::save(app.state_path(), app.state());
+    live.manager.open(host, &program, &plan.args, rows, cols)
 }
 
 async fn handle_files_command(

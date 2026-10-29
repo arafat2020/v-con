@@ -143,6 +143,7 @@ fn defaults() -> HashMap<Binding, Action> {
     bind(KeyCode::Char('x'), KeyModifiers::NONE, Action::Exec);
     bind(KeyCode::Char('X'), KeyModifiers::NONE, Action::ShowExec);
     bind(KeyCode::Char('f'), KeyModifiers::NONE, Action::OpenFiles);
+    bind(KeyCode::Char('o'), KeyModifiers::NONE, Action::OpenSession);
     map
 }
 
@@ -167,10 +168,16 @@ fn action_by_name(name: &str) -> Option<Action> {
         "exec" => Action::Exec,
         "show_exec" => Action::ShowExec,
         "files" | "open_files" => Action::OpenFiles,
+        "open_session" | "session" => Action::OpenSession,
         "up" => Action::MoveUp,
         "down" => Action::MoveDown,
         _ => return None,
     })
+}
+
+/// Parse a chord such as `ctrl-]` into a key code and modifiers.
+pub fn parse_chord(raw: &str) -> Option<(KeyCode, KeyModifiers)> {
+    parse_key(raw).map(|binding| (binding.code, binding.modifiers))
 }
 
 fn parse_key(raw: &str) -> Option<Binding> {
@@ -225,6 +232,15 @@ mod tests {
             Some(Action::Connect)
         );
         assert_eq!(keymap.lookup(KeyCode::Enter, KeyModifiers::NONE), None);
+    }
+
+    #[test]
+    fn o_opens_an_embedded_session() {
+        let keymap = Keymap::from_config(&KeyConfig::default()).unwrap();
+        assert_eq!(
+            keymap.lookup(KeyCode::Char('o'), KeyModifiers::NONE),
+            Some(Action::OpenSession)
+        );
     }
 
     #[test]

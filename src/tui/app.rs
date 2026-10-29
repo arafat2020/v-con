@@ -24,8 +24,13 @@ use crate::services::health::{
     self as health_svc, HealthControl, HealthEvent, HealthSettings, HostHealth,
 };
 use crate::services::inventory::{self, InventoryBundle};
-use crate::tui::action::{Action, ConnectHandoff, EditorHandoff, FilesCommand, Handoff, UiCommand};
-use crate::tui::keymap::Keymap;
+use crate::infra::pty::{KeyModes, encode_key, encode_paste};
+use crate::services::sessions::{SessionEvent, SessionId};
+use crate::tui::action::{
+    Action, ConnectHandoff, EditorHandoff, FilesCommand, Handoff, SessionPlace, SessionsCommand,
+    UiCommand,
+};
+use crate::tui::keymap::{self, Keymap};
 use crate::tui::screens::exec as exec_ui;
 use crate::tui::screens::exec::{Confirm, Prompt, PromptEvent, Results, ResultsEvent};
 use crate::tui::screens::files as files_ui;
@@ -35,6 +40,8 @@ use crate::tui::screens::health::{HealthEvent as HealthKey, HealthView};
 use crate::tui::screens::host_form::{self, HostFormEvent};
 use crate::tui::screens::hosts::{self, HostsView, ViewOptions};
 use crate::tui::screens::import::{self, ImportEvent};
+use crate::tui::screens::sessions as sessions_ui;
+use crate::tui::screens::sessions::{SessionKey, SessionsView};
 use crate::tui::theme::Theme;
 use chrono::Utc;
 use crossterm::event::{KeyCode, KeyModifiers};
@@ -64,6 +71,8 @@ pub enum Modal {
     Delete { name: String },
     /// Checklist of hosts found in an OpenSSH config.
     Import(Box<import::ImportView>),
+    /// Quit while embedded sessions are still live.
+    QuitSessions,
 }
 
 /// Shell state: inventory, keymap, the Hosts screen, and the open modal.
@@ -103,6 +112,12 @@ pub struct App {
     health_history: usize,
     health_refresh: Duration,
     pub(crate) files: files_ui::FilesView,
+    /// Embedded sessions UI (PTY children live in the event loop).
+    pub(crate) sessions: SessionsView,
+    /// Prefix chord from config (`ctrl-]` by default).
+    session_prefix: (KeyCode, KeyModifiers),
+    /// Scrollback lines for new sessions.
+    pub(crate) session_scrollback: usize,
 }
 
 impl App {
@@ -158,6 +173,10 @@ impl App {
             health_history: config.health.history_samples.max(2),
             health_refresh: Duration::from_secs(config.health.refresh_seconds.max(5)),
             files,
+            sessions: SessionsView::new(),
+            session_prefix: keymap::parse_chord(&config.sessions.prefix_key)
+                .unwrap_or((KeyCode::Char(']'), KeyModifiers::CONTROL)),
+            session_scrollback: config.sessions.scrollback_lines.max(1),
         };
         app.seed_health_cache();
         app.refresh_groups();
@@ -193,7 +212,7 @@ impl App {
     /// filter; Esc otherwise clears the multi-selection.
     pub fn on_key(&mut self, code: KeyCode, modifiers: KeyModifiers) -> Vec<UiCommand> {
         if code == KeyCode::Char('c') && modifiers.contains(KeyModifiers::CONTROL) {
-            return self.update(Action::Quit);
+            return self.force_quit();
         }
         if self.exec_confirm.is_some() {
             return self.exec_confirm_key(code);
@@ -211,6 +230,9 @@ impl App {
             if matches!(self.modal, Some(Modal::Delete { .. })) {
                 return self.delete_key(code);
             }
+            if matches!(self.modal, Some(Modal::QuitSessions)) {
+                return self.quit_sessions_key(code);
+            }
             if code == KeyCode::Esc {
                 return self.update(Action::CloseModal);
             }
@@ -223,6 +245,13 @@ impl App {
         }
         if self.exec_visible {
             return self.exec_results_key(code);
+        }
+        if self.screen == 4 && self.modal.is_none() {
+            let session_cmds = self.sessions_key(code, modifiers);
+            if !session_cmds.is_empty() || self.sessions.focused || self.sessions.prefix_until.is_some()
+            {
+                return session_cmds;
+            }
         }
         if self.screen == 2 && self.modal.is_none() {
             return self.health_key(code, modifiers);
@@ -259,18 +288,11 @@ impl App {
                     self.toast("transfers running — press C to cancel transfers, then q to quit");
                     return Vec::new();
                 }
-                self.state
-                    .remember_ui(screen_name(self.screen), &self.view.query);
-                self.quit = true;
-                let mut commands = vec![UiCommand::Persist];
-                if self
-                    .exec_results
-                    .as_ref()
-                    .is_some_and(|results| results.running)
-                {
-                    commands.insert(0, UiCommand::CancelExec);
+                if self.sessions.has_live() {
+                    self.modal = Some(Modal::QuitSessions);
+                    return Vec::new();
                 }
-                return commands;
+                return self.finish_quit();
             }
             Action::Tick => {
                 if let Some(results) = &mut self.exec_results
@@ -278,13 +300,16 @@ impl App {
                 {
                     results.spinner = results.spinner.wrapping_add(1);
                 }
+                if self.sessions.tick_prefix() {
+                    self.dirty = true;
+                }
                 if let Some((_, left)) = &mut self.toast {
                     if *left == 0 {
                         self.toast = None;
                     } else {
                         *left -= 1;
                     }
-                } else {
+                } else if !self.sessions.focused {
                     self.dirty = false;
                 }
             }
@@ -331,6 +356,7 @@ impl App {
                     }),
                 ];
             }
+            Action::OpenSession => return self.open_sessions(),
             Action::CopySshCommand => return self.copy_command(),
             Action::Connect => return self.connect_command(),
             Action::ToggleFavorite => return self.toggle_favorite(),
@@ -380,6 +406,22 @@ impl App {
         self.dirty = true;
     }
 
+    /// Resize commands for panes that changed size after a layout or terminal resize.
+    pub fn session_resize_commands(&mut self) -> Vec<UiCommand> {
+        let area = self.session_content_area();
+        self.sessions
+            .take_resizes(area)
+            .into_iter()
+            .map(|(id, rows, cols)| UiCommand::Sessions(SessionsCommand::Resize { id, rows, cols }))
+            .collect()
+    }
+
+    fn session_content_area(&self) -> ratatui::layout::Rect {
+        let height = self.terminal_height.saturating_sub(2);
+        // Sub-tab bar uses one row inside the content area.
+        ratatui::layout::Rect::new(0, 0, self.terminal_width.max(1), height.max(1))
+    }
+
     /// Show `message` on the hint line for about two seconds.
     pub fn toast(&mut self, message: impl Into<String>) {
         self.toast = Some((message.into(), 8));
@@ -387,7 +429,13 @@ impl App {
     }
 
     /// Draw the tab bar, the active screen, the hint line, and a modal if one is open.
-    pub fn draw(&mut self, frame: &mut Frame) {
+    ///
+    /// `session_manager` supplies vt100 screens when the Sessions tab is visible.
+    pub fn draw(
+        &mut self,
+        frame: &mut Frame,
+        session_manager: Option<&crate::services::sessions::SessionManager>,
+    ) {
         let area = frame.area();
         self.terminal_width = area.width;
         self.terminal_height = area.height;
@@ -422,12 +470,23 @@ impl App {
             health_ui::draw(frame, chunks[1], &mut self.health, &self.hosts, &self.theme);
         } else if self.screen == 3 {
             files_ui::draw(frame, chunks[1], &mut self.files, &self.hosts, &self.theme);
+        } else if self.screen == 4 {
+            let theme = self.theme.clone();
+            sessions_ui::draw(
+                frame,
+                chunks[1],
+                &self.sessions,
+                &theme,
+                &mut |id, callback| {
+                    if let Some(manager) = session_manager {
+                        manager.with_parser(id, |parser| {
+                            callback(parser.screen());
+                        });
+                    }
+                },
+            );
         } else {
-            let message = match self.screen {
-                4 => "Sessions arrives in a later phase.",
-                _ => "Log arrives in a later phase.",
-            };
-            frame.render_widget(Paragraph::new(message), chunks[1]);
+            frame.render_widget(Paragraph::new("Log arrives in a later phase."), chunks[1]);
         }
         self.draw_hints(frame, chunks[2]);
         if self.exec_visible
@@ -449,7 +508,11 @@ impl App {
     fn draw_header(&self, frame: &mut Frame, area: Rect) {
         let mut spans = vec![Span::raw(" vcon ")];
         for (index, name) in TABS.iter().enumerate() {
-            let label = format!(" {} {} ", index + 1, name);
+            let label = if index == 3 && self.sessions.tab_count() > 0 {
+                format!(" {} {}({}) ", index + 1, name, self.sessions.tab_count())
+            } else {
+                format!(" {} {} ", index + 1, name)
+            };
             let style = if self.screen == index as u8 + 1 {
                 self.theme.selected()
             } else {
@@ -502,9 +565,23 @@ impl App {
             )
         } else if self.screen == 3 {
             " Tab panes   ⏎ open   h up   space mark   c copy   m mkdir   r rename   d delete   v view   H host   C cancel   q quit".to_string()
+        } else if self.screen == 4 {
+            if self.sessions.focused {
+                let host = self
+                    .sessions
+                    .focused_host()
+                    .unwrap_or_else(|| "session".into());
+                let prefix = format_prefix(self.session_prefix);
+                format!(" SESSION  {host}  —  {prefix} for vcon")
+            } else if self.sessions.tab_count() == 0 {
+                " o on a host opens a session   4 jumps here   q quit".to_string()
+            } else {
+                " ⏎ focus   o open   q quit".to_string()
+            }
         } else {
             let mut hint =
-                " ⏎ connect   x exec   a add   e edit   d del   ? help   q quit".to_string();
+                " ⏎ connect   o session   x exec   a add   e edit   d del   ? help   q quit"
+                    .to_string();
             if self
                 .exec_results
                 .as_ref()
@@ -556,6 +633,20 @@ impl App {
                     Line::from("y confirms   n or Esc cancels"),
                 ],
             ),
+            Modal::QuitSessions => (
+                "Quit",
+                vec![
+                    Line::from(format!(
+                        "{} live session(s) are still open.",
+                        self.sessions
+                            .hosts
+                            .keys()
+                            .filter(|id| !self.sessions.ended.contains_key(id))
+                            .count()
+                    )),
+                    Line::from("y quits and closes them   n or Esc cancels"),
+                ],
+            ),
         };
         crate::tui::widgets::modal::render(frame, area, title, lines, &self.theme);
     }
@@ -572,6 +663,7 @@ impl App {
             Line::from("Esc              clear selection"),
             Line::from("y                copy the ssh command"),
             Line::from("Enter            connect"),
+            Line::from("o                open an embedded session"),
             Line::from("f                open files for the cursor host"),
             Line::from("a                add a host"),
             Line::from("e                edit the cursor host"),
@@ -1303,7 +1395,8 @@ impl App {
                         | Action::EditInventory
                         | Action::ToggleFavorite
                         | Action::CopySshCommand
-                        | Action::OpenFiles),
+                        | Action::OpenFiles
+                        | Action::OpenSession),
                     ) = self.keymap.lookup(code, modifiers)
                 {
                     return self.update(action);
@@ -1421,7 +1514,8 @@ impl App {
                 | Action::CopySshCommand
                 | Action::Connect
                 | Action::Exec
-                | Action::OpenFiles),
+                | Action::OpenFiles
+                | Action::OpenSession),
             ) = self.keymap.lookup(code, modifiers)
             {
                 return self.update(action);
@@ -1620,6 +1714,267 @@ impl App {
     }
 
     /// Open an error modal. Esc dismisses it.
+    fn open_sessions(&mut self) -> Vec<UiCommand> {
+        if self.ssh.is_none() {
+            self.modal = Some(Modal::Error(missing_ssh_message().to_string()));
+            return Vec::new();
+        }
+        let hosts = self.session_target_hosts();
+        if hosts.is_empty() {
+            self.toast("No host selected");
+            return Vec::new();
+        }
+        self.screen = 4;
+        let (rows, cols) = self.default_session_size();
+        hosts
+            .into_iter()
+            .map(|host| {
+                UiCommand::Sessions(SessionsCommand::Open {
+                    host,
+                    rows,
+                    cols,
+                    place: SessionPlace::NewTab,
+                })
+            })
+            .collect()
+    }
+
+    fn session_target_hosts(&self) -> Vec<String> {
+        if !self.view.selected.is_empty() {
+            return self
+                .hosts
+                .iter()
+                .filter(|host| self.view.selected.contains(&host.name))
+                .map(|host| host.name.clone())
+                .collect();
+        }
+        self.active_cursor_name()
+            .into_iter()
+            .collect()
+    }
+
+    fn default_session_size(&self) -> (u16, u16) {
+        let area = self.session_content_area();
+        let rows = area.height.saturating_sub(3).max(1);
+        let cols = area.width.saturating_sub(2).max(1);
+        (rows, cols)
+    }
+
+    fn sessions_key(&mut self, code: KeyCode, modifiers: KeyModifiers) -> Vec<UiCommand> {
+        let is_prefix = code == self.session_prefix.0
+            && modifiers
+                .intersection(KeyModifiers::CONTROL | KeyModifiers::ALT | KeyModifiers::SHIFT)
+                == self.session_prefix.1;
+
+        if !self.sessions.focused
+            && self.sessions.prefix_until.is_none()
+            && self.sessions.confirm_close.is_none()
+            && !self.sessions.scrollback
+        {
+            match code {
+                KeyCode::Char('q') => return self.update(Action::Quit),
+                KeyCode::Char('?') => return self.update(Action::ToggleHelp),
+                KeyCode::Char(digit @ '1'..='5') => {
+                    let screen = digit.to_digit(10).unwrap_or(0) as u8;
+                    return self.update(Action::SwitchScreen(screen));
+                }
+                KeyCode::Enter if self.sessions.tab_count() > 0 => {
+                    self.sessions.focused = true;
+                    self.sessions.mark_active_read();
+                    self.dirty = true;
+                    return Vec::new();
+                }
+                _ => {}
+            }
+            if let Some(action) = self.keymap.lookup(code, modifiers) {
+                return self.update(action);
+            }
+            self.dirty = true;
+            return Vec::new();
+        }
+
+        let modes = self
+            .sessions
+            .focused_id()
+            .and_then(|id| self.sessions.key_modes.get(&id).copied())
+            .unwrap_or_default();
+        let encode = |code, modifiers| encode_key(code, modifiers, &modes);
+        let result = self.sessions.on_key(code, modifiers, is_prefix, encode);
+        self.session_key_to_commands(result)
+    }
+
+    fn session_key_to_commands(&mut self, result: SessionKey) -> Vec<UiCommand> {
+        self.dirty = true;
+        match result {
+            SessionKey::None => Vec::new(),
+            SessionKey::Write(bytes) => {
+                let Some(id) = self.sessions.focused_id() else {
+                    return Vec::new();
+                };
+                // Re-encode is not needed; bytes already produced. For app-cursor accuracy,
+                // the event loop rewrites using manager.key_modes when Write is applied if we
+                // pass the raw key — keep bytes for paste/simple keys.
+                vec![UiCommand::Sessions(SessionsCommand::Write { id, bytes })]
+            }
+            SessionKey::Split { host, dir } => {
+                let (rows, cols) = self.default_session_size();
+                vec![UiCommand::Sessions(SessionsCommand::Open {
+                    host,
+                    rows,
+                    cols,
+                    place: SessionPlace::Split(dir),
+                })]
+            }
+            SessionKey::CloseFocused => {
+                if let Some(id) = self.sessions.focused_id() {
+                    vec![UiCommand::Sessions(SessionsCommand::Close(id))]
+                } else {
+                    Vec::new()
+                }
+            }
+            SessionKey::ConfirmClose(_) => Vec::new(),
+            SessionKey::Detach => Vec::new(),
+            SessionKey::Reconnect { id, host } => {
+                let (rows, cols) = self
+                    .sessions
+                    .last_sizes
+                    .get(&id)
+                    .copied()
+                    .unwrap_or_else(|| self.default_session_size());
+                vec![UiCommand::Sessions(SessionsCommand::Reconnect {
+                    id,
+                    host,
+                    rows,
+                    cols,
+                })]
+            }
+            SessionKey::Scroll(delta) => {
+                let Some(id) = self.sessions.focused_id() else {
+                    return Vec::new();
+                };
+                vec![UiCommand::Sessions(SessionsCommand::Scroll { id, delta })]
+            }
+        }
+    }
+
+    /// Forward a paste into the focused session when appropriate.
+    pub fn on_paste(&mut self, text: &str) -> Vec<UiCommand> {
+        if self.screen != 4 || !self.sessions.focused || self.sessions.scrollback {
+            return Vec::new();
+        }
+        let Some(id) = self.sessions.focused_id() else {
+            return Vec::new();
+        };
+        if self.sessions.ended.contains_key(&id) {
+            return Vec::new();
+        }
+        let bracketed = self
+            .sessions
+            .bracketed_paste
+            .get(&id)
+            .copied()
+            .unwrap_or(false);
+        let bytes = encode_paste(text, bracketed);
+        self.dirty = true;
+        vec![UiCommand::Sessions(SessionsCommand::Write { id, bytes })]
+    }
+
+    /// Apply a session manager event.
+    pub fn apply_session_event(&mut self, event: SessionEvent) {
+        match event {
+            SessionEvent::Output(id) => {
+                self.sessions.note_output(id);
+                self.dirty = true;
+            }
+            SessionEvent::Exited { id, code } => {
+                self.sessions.mark_ended(id, code);
+                self.dirty = true;
+            }
+        }
+    }
+
+    /// Refresh key/paste modes from the live parser after output.
+    pub fn refresh_session_modes(
+        &mut self,
+        id: SessionId,
+        modes: KeyModes,
+        bracketed_paste: bool,
+    ) {
+        self.sessions.key_modes.insert(id, modes);
+        self.sessions.bracketed_paste.insert(id, bracketed_paste);
+    }
+
+    /// Record a newly opened session in the UI.
+    pub fn session_opened(
+        &mut self,
+        id: SessionId,
+        host: String,
+        place: SessionPlace,
+    ) {
+        match place {
+            SessionPlace::NewTab => self.sessions.open_tab(id, host),
+            SessionPlace::Split(dir) => {
+                if !self.sessions.split_focused(id, host.clone(), dir) {
+                    self.sessions.open_tab(id, host);
+                }
+            }
+        }
+        self.screen = 4;
+        self.dirty = true;
+    }
+
+    /// Record a reconnect that replaced `old` with `new`.
+    pub fn session_reconnected(&mut self, old: SessionId, new: SessionId, host: String) {
+        self.sessions.replace_session(old, new, host);
+        self.dirty = true;
+    }
+
+    /// Drop UI state after a session is closed by the event loop.
+    pub fn session_closed(&mut self, id: SessionId) {
+        self.sessions.remove_session(id);
+        self.dirty = true;
+    }
+
+    fn quit_sessions_key(&mut self, code: KeyCode) -> Vec<UiCommand> {
+        match code {
+            KeyCode::Char('y') | KeyCode::Char('Y') => {
+                self.modal = None;
+                let mut commands = self.finish_quit();
+                commands.insert(0, UiCommand::Sessions(SessionsCommand::CloseAll));
+                commands
+            }
+            KeyCode::Char('n') | KeyCode::Char('N') | KeyCode::Esc => {
+                self.modal = None;
+                self.dirty = true;
+                Vec::new()
+            }
+            _ => Vec::new(),
+        }
+    }
+
+    fn force_quit(&mut self) -> Vec<UiCommand> {
+        let mut commands = self.finish_quit();
+        if !self.sessions.hosts.is_empty() {
+            commands.insert(0, UiCommand::Sessions(SessionsCommand::CloseAll));
+        }
+        commands
+    }
+
+    fn finish_quit(&mut self) -> Vec<UiCommand> {
+        self.state
+            .remember_ui(screen_name(self.screen), &self.view.query);
+        self.quit = true;
+        let mut commands = vec![UiCommand::Persist];
+        if self
+            .exec_results
+            .as_ref()
+            .is_some_and(|results| results.running)
+        {
+            commands.insert(0, UiCommand::CancelExec);
+        }
+        commands
+    }
+
     pub fn show_error(&mut self, message: impl Into<String>) {
         self.modal = Some(Modal::Error(message.into()));
         self.dirty = true;
@@ -1681,6 +2036,27 @@ fn screen_index(name: &str) -> Option<u8> {
         "log" => Some(5),
         _ => None,
     }
+}
+
+fn format_prefix((code, modifiers): (KeyCode, KeyModifiers)) -> String {
+    let key = match code {
+        KeyCode::Char(ch) => ch.to_string(),
+        KeyCode::Enter => "Enter".into(),
+        KeyCode::Esc => "Esc".into(),
+        other => format!("{other:?}"),
+    };
+    let mut out = String::new();
+    if modifiers.contains(KeyModifiers::CONTROL) {
+        out.push_str("Ctrl+");
+    }
+    if modifiers.contains(KeyModifiers::ALT) {
+        out.push_str("Alt+");
+    }
+    if modifiers.contains(KeyModifiers::SHIFT) {
+        out.push_str("Shift+");
+    }
+    out.push_str(&key);
+    out
 }
 
 #[cfg(test)]
@@ -1788,13 +2164,18 @@ mod tests {
             health_history: 60,
             health_refresh: Duration::from_secs(30),
             files: files_ui::FilesView::new(files_home()),
+            sessions: SessionsView::new(),
+            session_prefix: (KeyCode::Char(']'), KeyModifiers::CONTROL),
+            session_scrollback: 5000,
         }
     }
 
     fn render(app: &mut App, width: u16, height: u16) -> String {
         app.note_size(width, height);
         let mut terminal = Terminal::new(TestBackend::new(width, height)).unwrap();
-        terminal.draw(|frame| app.draw(frame)).unwrap();
+        terminal
+            .draw(|frame| app.draw(frame, None))
+            .unwrap();
         let buffer = terminal.backend().buffer();
         let mut lines = Vec::new();
         for y in 0..buffer.area.height {
