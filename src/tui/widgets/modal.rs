@@ -3,6 +3,7 @@
 use crate::tui::theme::Theme;
 use ratatui::Frame;
 use ratatui::layout::Rect;
+use ratatui::style::{Color, Style};
 use ratatui::text::{Line, Span};
 use ratatui::widgets::{Block, Clear, Paragraph, Wrap};
 
@@ -28,8 +29,27 @@ pub fn render(
         width,
         height,
     };
+    if !theme.no_color {
+        let shadow = Rect {
+            x: popup.x.saturating_add(1),
+            y: popup.y.saturating_add(1),
+            width: popup
+                .width
+                .min(area.right().saturating_sub(popup.x.saturating_add(1))),
+            height: popup
+                .height
+                .min(area.bottom().saturating_sub(popup.y.saturating_add(1))),
+        };
+        if shadow.width > 0 && shadow.height > 0 {
+            frame.render_widget(
+                Block::default().style(Style::new().bg(Color::Rgb(8, 10, 14))),
+                shadow,
+            );
+        }
+    }
     frame.render_widget(Clear, popup);
-    let block = Block::bordered()
+    let block = theme
+        .block()
         .title(Span::styled(format!(" {title} "), theme.title()))
         .border_style(theme.border_focus())
         .style(theme.bar());

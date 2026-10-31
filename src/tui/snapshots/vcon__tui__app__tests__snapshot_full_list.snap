@@ -2,7 +2,7 @@
 source: src/tui/app.rs
 expression: screen
 ---
- vcon  1 Hosts  2 Health  3 Files  4 Sessions  5 Log
+ 1 Hosts │ 2 Health │ 3 Files │ 4 Sessions │ 5 Log                       ╭v-con╮
 ┌ Tags ────────────────┐┌ Hosts ─ 5 ───────────────────────────────────────────┐
 │  all (5)             ││NAME           UP  ADDRESS    USER       TAGS     LAST│
 │  db (2)              ││   bastion     ·   198.51.100 admin      infra    —   │
@@ -17,12 +17,12 @@ expression: screen
 │                      ││                                                      │
 │                      ││                                                      │
 └──────────────────────┘└──────────────────────────────────────────────────────┘
-┌ Detail ──────────────────────────────────────────────────────────────────────┐
-│deploy@203.0.113.10:22 via admin@198.51.100.5                                 │
-│identity: ssh default                                                         │
-│tags: web, prod                                                               │
-│notes: Main nginx box                                                         │
-│ssh -J admin@198.51.100.5 deploy@203.0.113.10                                 │
-│                                                                              │
+┌ web-1 ───────────────────────────────────────────────────────────────────────┐
+│connect  deploy@203.0.113.10:22                                               │
+│via      admin@198.51.100.5                                                   │
+│identity ssh default                                                          │
+│tags     web, prod                                                            │
+│notes    Main nginx box                                                       │
+│ssh      ssh -J admin@198.51.100.5 deploy@203.0.113.10                        │
 └──────────────────────────────────────────────────────────────────────────────┘
- ⏎ connect   o session   s snippet   t tunnel   x exec   a add   e edit   d del
+ ⏎  connect  o  session  s  snippet  t  tunnel  x  exec  a  add  e  edit  d  del

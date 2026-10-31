@@ -2,7 +2,7 @@
 source: src/tui/app.rs
 expression: screen
 ---
- vcon  1 Hosts  2 Health  3 Files  4 Sessions  5 Log
+ 1 Hosts │ 2 Health │ 3 Files │ 4 Sessions │ 5 Log                       ╭v-con╮
 ┌ Tags ────────────────┐┌ Hosts ─ 0 ───────────────────────────────────────────┐
 │  all (0)             ││No hosts yet — press `i` to import from ~/.ssh/config │
 │  recent (0)          ││or `a` to add one (phase 3), or edit                  │
@@ -25,4 +25,4 @@ expression: screen
 │                                                                              │
 │                                                                              │
 └──────────────────────────────────────────────────────────────────────────────┘
- ⏎ connect   o session   s snippet   t tunnel   x exec   a add   e edit   d del
+ ⏎  connect  o  session  s  snippet  t  tunnel  x  exec  a  add  e  edit  d  del
