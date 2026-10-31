@@ -55,8 +55,7 @@ impl DirEntry {
         if self.kind == EntryKind::Dir {
             return true;
         }
-        self.mode
-            .is_some_and(|mode| mode & 0o170_000 == 0o040_000)
+        self.mode.is_some_and(|mode| mode & 0o170_000 == 0o040_000)
     }
 
     /// True for regular files (not dirs/symlinks).
@@ -122,6 +121,15 @@ pub trait RemoteFs: Send + Sync {
         mode: Option<u32>,
         mtime: Option<SystemTime>,
     ) -> impl Future<Output = Result<(), Error>> + Send;
+
+    /// Close a handle left open by repeated [`RemoteFs::read_at`] / [`RemoteFs::write_at`] calls.
+    ///
+    /// SFTP keeps one handle per path so a multi-megabyte upload is not an
+    /// open/close round trip per chunk. Other backends do nothing.
+    fn release(&self, path: &str) -> impl Future<Output = Result<(), Error>> + Send {
+        let _ = path;
+        async { Ok(()) }
+    }
 }
 
 #[cfg(test)]

@@ -575,7 +575,10 @@ impl App {
 
     fn draw_header(&self, frame: &mut Frame, area: Rect) {
         let bar = self.theme.bar();
-        let mut spans = vec![Span::styled(" vcon ", self.theme.title().bg(self.theme.panel))];
+        let mut spans = vec![Span::styled(
+            " vcon ",
+            self.theme.title().bg(self.theme.panel),
+        )];
         for (index, name) in TABS.iter().enumerate() {
             let label = if index == 3 && self.sessions.tab_count() > 0 {
                 format!(" {} {}({}) ", index + 1, name, self.sessions.tab_count())
@@ -645,7 +648,7 @@ impl App {
                 " ⏎ details   s sort   p pause   r refresh   R all   / filter   c connect   x exec   q quit{pause}"
             )
         } else if self.screen == 3 {
-            " Tab panes   ⏎/l open   h/← up   space mark   c copy   m mkdir   r rename   d delete   v view   H host   C cancel   q quit".to_string()
+            " Tab panes   ⏎/l open   h/← up   space mark   c copy to other pane   m mkdir   r rename   d delete   v view   H host   C cancel   q quit".to_string()
         } else if self.screen == 4 {
             if self.sessions.focused {
                 let host = self
@@ -1702,9 +1705,7 @@ impl App {
             match code {
                 KeyCode::Char('q') => return self.update(Action::Quit),
                 KeyCode::Char('?') => return self.update(Action::ToggleHelp),
-                KeyCode::Char(digit @ '1'..='5')
-                    if !modifiers.contains(KeyModifiers::CONTROL) =>
-                {
+                KeyCode::Char(digit @ '1'..='5') if !modifiers.contains(KeyModifiers::CONTROL) => {
                     let screen = digit.to_digit(10).unwrap_or(0) as u8;
                     return self.update(Action::SwitchScreen(screen));
                 }

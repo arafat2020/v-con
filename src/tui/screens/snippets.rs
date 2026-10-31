@@ -399,10 +399,7 @@ fn draw_picker(frame: &mut Frame, area: Rect, view: &SnippetsView, theme: &Theme
             } else {
                 Line::from(vec![
                     Span::styled(format!("{:<12}", snippet.name), theme.title()),
-                    Span::styled(
-                        format!(" {desc}  ·  {}", snippet.command),
-                        theme.muted(),
-                    ),
+                    Span::styled(format!(" {desc}  ·  {}", snippet.command), theme.muted()),
                 ])
             };
             ListItem::new(line)

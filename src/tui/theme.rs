@@ -165,9 +165,7 @@ impl Theme {
         if self.no_color {
             Style::new().add_modifier(Modifier::BOLD)
         } else {
-            Style::new()
-                .fg(self.directory)
-                .add_modifier(Modifier::BOLD)
+            Style::new().fg(self.directory).add_modifier(Modifier::BOLD)
         }
     }
 

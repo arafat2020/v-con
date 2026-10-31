@@ -533,10 +533,7 @@ fn detail_summary(name: &str, report: Option<&HealthReport>, theme: &Theme) -> V
             Span::styled(name.to_string(), theme.title()),
             Span::styled("  ✖  ", theme.error()),
             Span::styled(
-                report
-                    .error
-                    .clone()
-                    .unwrap_or_else(|| "unreachable".into()),
+                report.error.clone().unwrap_or_else(|| "unreachable".into()),
                 theme.error(),
             ),
         ])],
@@ -583,13 +580,11 @@ fn draw_history_chart(
         .unwrap_or_default();
     if values.is_empty() {
         frame.render_widget(
-            Paragraph::new("no samples yet")
-                .style(theme.muted())
-                .block(
-                    Block::bordered()
-                        .title(Span::styled(format!(" {label} "), theme.title()))
-                        .border_style(theme.border()),
-                ),
+            Paragraph::new("no samples yet").style(theme.muted()).block(
+                Block::bordered()
+                    .title(Span::styled(format!(" {label} "), theme.title()))
+                    .border_style(theme.border()),
+            ),
             area,
         );
         return;

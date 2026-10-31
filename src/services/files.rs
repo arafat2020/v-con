@@ -11,7 +11,10 @@ use tokio::sync::{Semaphore, mpsc};
 use tokio_util::sync::CancellationToken;
 
 /// Bytes read/written per transfer chunk.
-pub const CHUNK: usize = 64 * 1024;
+///
+/// Large enough for one SFTP write on a typical OpenSSH server, so a VPS
+/// upload is not capped at one tiny packet per round trip.
+pub const CHUNK: usize = 256 * 1024;
 
 /// Max concurrent transfers.
 pub const PARALLEL: usize = 2;
@@ -262,6 +265,44 @@ pub async fn collect_tree<F: RemoteFs>(
     Ok(out)
 }
 
+/// Files that [`plan_copies`] will transfer, plus whether an empty directory was created.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct PlannedCopy {
+    /// `(source, destination, size)` for each file.
+    pub files: Vec<(String, String, u64)>,
+    /// True when `source` was an empty directory and that directory was created at the destination.
+    pub made_directory: bool,
+}
+
+/// Expand `source` into destination paths under `dest_dir`.
+///
+/// A directory keeps its own name (`/proj/a.txt` copied into `/home` becomes
+/// `/home/proj/a.txt`). A file lands directly in `dest_dir`. An empty directory
+/// is created and produces no file jobs.
+pub async fn plan_copies<S: RemoteFs, D: RemoteFs>(
+    src: &S,
+    dst: &D,
+    source: &str,
+    dest_dir: &str,
+) -> Result<PlannedCopy, Error> {
+    let source = normalize(source);
+    let dest_dir = normalize(dest_dir);
+    let meta = src.stat(&source).await?;
+    let entries = collect_tree(src, &source).await?;
+    if entries.is_empty() && meta.is_dir() {
+        ensure_dir(dst, &join(&dest_dir, file_name(&source))).await?;
+        return Ok(PlannedCopy {
+            files: Vec::new(),
+            made_directory: true,
+        });
+    }
+    let root = parent_of(&source).unwrap_or_else(|| "/".to_string());
+    Ok(PlannedCopy {
+        files: map_destinations(&entries, &root, &dest_dir),
+        made_directory: false,
+    })
+}
+
 /// Copy one file from `src` to `dst`, writing to a `.part` then renaming.
 pub async fn copy_file<S: RemoteFs, D: RemoteFs>(
     src: &S,
@@ -271,33 +312,74 @@ pub async fn copy_file<S: RemoteFs, D: RemoteFs>(
     cancel: &CancellationToken,
     mut on_progress: impl FnMut(u64, u64),
 ) -> Result<(), Error> {
+    let part = format!("{destination}.part");
+    let result = copy_file_body(
+        src,
+        dst,
+        source,
+        destination,
+        &part,
+        cancel,
+        &mut on_progress,
+    )
+    .await;
+    if result.is_err() {
+        let _ = src.release(source).await;
+        let _ = dst.release(&part).await;
+        let _ = dst.remove_file(&part).await;
+    }
+    result
+}
+
+async fn copy_file_body<S: RemoteFs, D: RemoteFs>(
+    src: &S,
+    dst: &D,
+    source: &str,
+    destination: &str,
+    part: &str,
+    cancel: &CancellationToken,
+    on_progress: &mut impl FnMut(u64, u64),
+) -> Result<(), Error> {
+    // Show the job as running before the first network write.
+    on_progress(0, 0);
     let meta = src.stat(source).await?;
     let total = meta.size;
-    let part = format!("{destination}.part");
+    on_progress(0, total);
     if let Some(parent) = parent_of(destination) {
         ensure_dir(dst, &parent).await?;
     }
-    dst.create(&part).await?;
+    // A leftover handle would keep writing the pre-truncate inode.
+    let _ = dst.release(part).await;
+    dst.create(part).await?;
     let mut offset = 0_u64;
-    while offset < total {
+    loop {
         if cancel.is_cancelled() {
-            let _ = dst.remove_file(&part).await;
             return Err(Error::Message("cancelled".to_string()));
         }
-        let want = CHUNK.min((total - offset) as usize);
-        let chunk = src.read_at(source, offset, want).await?;
+        if total > 0 && offset >= total {
+            break;
+        }
+        let remaining = if total == 0 {
+            CHUNK
+        } else {
+            CHUNK.min((total - offset) as usize)
+        };
+        let chunk = src.read_at(source, offset, remaining).await?;
         if chunk.is_empty() {
             break;
         }
-        dst.write_at(&part, offset, &chunk).await?;
+        dst.write_at(part, offset, &chunk).await?;
         offset += chunk.len() as u64;
-        on_progress(offset, total);
+        on_progress(offset, total.max(offset));
     }
-    // Replace destination.
+    // Close before rename. Some SFTP servers refuse to rename an open file,
+    // and the bytes are only durable once the handle is closed.
+    src.release(source).await?;
+    dst.release(part).await?;
     let _ = dst.remove_file(destination).await;
-    dst.rename(&part, destination).await?;
+    dst.rename(part, destination).await?;
     let _ = dst.set_meta(destination, meta.mode, meta.mtime).await;
-    on_progress(total, total);
+    on_progress(total.max(offset), total.max(offset));
     Ok(())
 }
 
@@ -581,6 +663,36 @@ mod tests {
             dst.read_at("/dest/deep/down/a.txt", 0, 16).await.unwrap(),
             b"nested"
         );
+    }
+
+    #[tokio::test]
+    async fn plan_copies_keeps_the_directory_name() {
+        let src = FakeFs::new();
+        let dst = FakeFs::new();
+        src.insert_file("/proj/a.txt", b"a");
+        src.insert_file("/proj/sub/b.txt", b"b");
+        dst.insert_dir("/home");
+        let planned = plan_copies(&src, &dst, "/proj", "/home").await.unwrap();
+        let dests: Vec<&str> = planned
+            .files
+            .iter()
+            .map(|(_, dest, _)| dest.as_str())
+            .collect();
+        assert!(dests.contains(&"/home/proj/a.txt"));
+        assert!(dests.contains(&"/home/proj/sub/b.txt"));
+        assert!(!planned.made_directory);
+    }
+
+    #[tokio::test]
+    async fn plan_copies_creates_an_empty_directory() {
+        let src = FakeFs::new();
+        let dst = FakeFs::new();
+        src.insert_dir("/empty");
+        dst.insert_dir("/home");
+        let planned = plan_copies(&src, &dst, "/empty", "/home").await.unwrap();
+        assert!(planned.files.is_empty());
+        assert!(planned.made_directory);
+        assert!(dst.stat("/home/empty").await.unwrap().is_dir());
     }
 
     #[test]

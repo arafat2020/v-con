@@ -855,10 +855,7 @@ fn draw_message(frame: &mut Frame, area: Rect, title: &str, body: &str, theme: &
             .block(
                 Block::bordered()
                     .title(Span::styled(format!(" {title} "), theme.title()))
-                    .title_bottom(Line::styled(
-                        " Esc close  ↑↓ scroll ",
-                        theme.muted(),
-                    ))
+                    .title_bottom(Line::styled(" Esc close  ↑↓ scroll ", theme.muted()))
                     .border_style(theme.border_focus())
                     .style(theme.bar()),
             ),

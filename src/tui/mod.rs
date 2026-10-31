@@ -24,8 +24,7 @@ use crate::paths::Paths;
 use crate::services::connect::{self};
 use crate::services::exec::{self as job, ExecLaunch};
 use crate::services::files::{
-    TransferDirection, TransferEvent, TransferJob, TransferState, collect_tree, map_destinations,
-    run_queue,
+    TransferDirection, TransferEvent, TransferJob, TransferState, plan_copies, run_queue,
 };
 use crate::services::health::{self as health_svc, HealthControl, HealthEvent};
 use crate::services::inventory::InventoryBundle;
@@ -716,12 +715,19 @@ async fn connect_files_host(
     match SftpFs::connect(program, args).await {
         Ok(session) => {
             live.remote = Some(Arc::new(session));
-            if let Some(sftp) = live.remote.as_ref()
-                && let Ok(home) = sftp.realpath("~").await
-            {
-                app.files.remote.path = home;
+            if let Some(sftp) = live.remote.as_ref() {
+                match sftp.home_dir().await {
+                    Ok(home) => {
+                        app.files.remote.path = home;
+                        app.toast(format!("connected to {host_name}"));
+                    }
+                    Err(error) => {
+                        app.toast(format!(
+                            "connected to {host_name}, but home is unknown ({error}) — press g and open a writable directory before copying"
+                        ));
+                    }
+                }
             }
-            app.toast(format!("connected to {host_name}"));
         }
         Err(error) => {
             app.toast(error.to_string());
@@ -915,32 +921,18 @@ async fn start_files_copy(
     let local = Arc::new(LocalFs);
     let dest_dir = normalize(&dest_dir);
     let mut jobs = Vec::new();
+    let mut made_directory = false;
     for source in sources {
-        let source = normalize(&source);
-        let (entries, root) = match direction {
+        let planned = match direction {
             TransferDirection::Upload => {
-                let meta = LocalFs.stat(&source).await?;
-                let root = if meta.is_dir() {
-                    source.clone()
-                } else {
-                    parent_of(&source).unwrap_or_else(|| "/".to_string())
-                };
-                let entries = collect_tree(&LocalFs, &source).await?;
-                (entries, root)
+                plan_copies(&LocalFs, remote.as_ref(), &source, &dest_dir).await?
             }
             TransferDirection::Download => {
-                let meta = remote.stat(&source).await?;
-                let root = if meta.is_dir() {
-                    source.clone()
-                } else {
-                    parent_of(&source).unwrap_or_else(|| "/".to_string())
-                };
-                let entries = collect_tree(remote.as_ref(), &source).await?;
-                (entries, root)
+                plan_copies(remote.as_ref(), &LocalFs, &source, &dest_dir).await?
             }
         };
-        let mapped = map_destinations(&entries, &root, &dest_dir);
-        for (src_path, destination, size) in mapped {
+        made_directory |= planned.made_directory;
+        for (src_path, destination, size) in planned.files {
             let id = app.files.queue.ids.next();
             let job = TransferJob {
                 id,
@@ -962,9 +954,19 @@ async fn start_files_copy(
         }
     }
     if jobs.is_empty() {
-        app.toast("nothing to copy");
+        app.toast(if made_directory {
+            "created directory"
+        } else {
+            "nothing to copy"
+        });
         return Ok(());
     }
+    let noun = if jobs.len() == 1 { "file" } else { "files" };
+    let verb = match direction {
+        TransferDirection::Upload => "uploading",
+        TransferDirection::Download => "downloading",
+    };
+    app.toast(format!("{verb} {} {noun} → {dest_dir}", jobs.len()));
     let cancel = live.cancel.clone();
     let events_tx = live.events_tx.clone();
     match direction {

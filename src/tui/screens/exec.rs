@@ -519,15 +519,13 @@ pub fn draw_confirm(frame: &mut Frame, area: Rect, confirm: &Confirm, theme: &Th
         "Run `{remote}`?\n{}\ny confirms   n or Esc cancels",
         confirm.reason
     );
-    let paragraph = Paragraph::new(body)
-        .style(theme.text())
-        .block(
-            Block::default()
-                .borders(Borders::ALL)
-                .title(Span::styled(" Confirm exec ", theme.warning()))
-                .border_style(theme.warning())
-                .style(theme.bar()),
-        );
+    let paragraph = Paragraph::new(body).style(theme.text()).block(
+        Block::default()
+            .borders(Borders::ALL)
+            .title(Span::styled(" Confirm exec ", theme.warning()))
+            .border_style(theme.warning())
+            .style(theme.bar()),
+    );
     frame.render_widget(paragraph, popup);
 }
 

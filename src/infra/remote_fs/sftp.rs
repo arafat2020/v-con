@@ -6,12 +6,15 @@ use crate::error::Error;
 use crate::infra::ssh::command::{SshCommandOptions, build_ssh_command};
 use bytes::BytesMut;
 use futures::StreamExt;
+use openssh_sftp_client::file::File;
 use openssh_sftp_client::metadata::{MetaData, MetaDataBuilder, Permissions};
 use openssh_sftp_client::{Sftp, SftpOptions, UnixTimeStamp};
+use std::collections::HashMap;
 use std::path::{Path, PathBuf};
 use std::pin::pin;
-use std::time::SystemTime;
-use tokio::io::AsyncSeekExt;
+use std::sync::Arc;
+use std::time::{Duration, SystemTime};
+use tokio::io::{AsyncReadExt, AsyncSeekExt};
 use tokio::process::{Child, Command};
 use tokio::sync::Mutex;
 
@@ -31,7 +34,14 @@ pub fn sftp_arguments(
     };
     let mut args = build_ssh_command(host, hosts, &options);
     args.remove(0);
+    // `-s` must come before the destination. Putting it after makes ssh treat
+    // `-s` as a remote command on some OpenSSH builds, so the subsystem never
+    // starts and the handshake hangs or fails.
+    let destination = args.pop().unwrap_or_else(|| host.destination());
+    args.push("-o".to_string());
+    args.push("RequestTTY=no".to_string());
     args.push("-s".to_string());
+    args.push(destination);
     args.push("sftp".to_string());
     args
 }
@@ -40,6 +50,10 @@ pub fn sftp_arguments(
 pub struct SftpFs {
     sftp: Mutex<Sftp>,
     child: Mutex<Child>,
+    /// Open read handles, keyed by path. Reused across chunks of one file.
+    reads: Mutex<HashMap<String, File>>,
+    /// Open write handles, keyed by path.
+    writes: Mutex<HashMap<String, File>>,
 }
 
 impl SftpFs {
@@ -66,18 +80,83 @@ impl SftpFs {
             .stdout
             .take()
             .ok_or_else(|| Error::Message("ssh sftp stdout missing".to_string()))?;
-        let sftp = Sftp::new(stdin, stdout, SftpOptions::new())
-            .await
-            .map_err(|error| Error::Message(format!("sftp handshake failed: {error}")))?;
+        // ssh writes banners and errors to stderr. A full pipe blocks the
+        // process and the SFTP channel stops moving bytes.
+        let stderr = child.stderr.take();
+        let notes = Arc::new(std::sync::Mutex::new(String::new()));
+        let notes_task = Arc::clone(&notes);
+        tokio::spawn(async move {
+            let Some(mut stderr) = stderr else {
+                return;
+            };
+            let mut buf = [0_u8; 512];
+            loop {
+                match stderr.read(&mut buf).await {
+                    Ok(0) | Err(_) => break,
+                    Ok(n) => {
+                        let mut guard =
+                            notes_task.lock().unwrap_or_else(|error| error.into_inner());
+                        if guard.len() < 4_000 {
+                            guard.push_str(&String::from_utf8_lossy(&buf[..n]));
+                        }
+                    }
+                }
+            }
+        });
+        let sftp = match Sftp::new(stdin, stdout, SftpOptions::new()).await {
+            Ok(sftp) => sftp,
+            Err(error) => {
+                let _ = child.kill().await;
+                tokio::time::sleep(Duration::from_millis(50)).await;
+                let detail = notes
+                    .lock()
+                    .unwrap_or_else(|error| error.into_inner())
+                    .trim()
+                    .to_string();
+                let message = if detail.is_empty() {
+                    format!("sftp handshake failed: {error}")
+                } else {
+                    format!("sftp handshake failed: {error} ({detail})")
+                };
+                return Err(Error::Message(message));
+            }
+        };
         Ok(Self {
             sftp: Mutex::new(sftp),
             child: Mutex::new(child),
+            reads: Mutex::new(HashMap::new()),
+            writes: Mutex::new(HashMap::new()),
         })
+    }
+
+    /// Absolute home directory for the remote pane.
+    ///
+    /// `~` only works when the server supports the expand-path extension.
+    /// Otherwise the SFTP working directory (`.`) is the login directory.
+    pub async fn home_dir(&self) -> Result<String, Error> {
+        if let Ok(path) = self.realpath("~").await {
+            let path = super::normalize(&path);
+            if path.starts_with('/') && !path.split('/').any(|part| part == "~") {
+                return Ok(path);
+            }
+        }
+        self.realpath(".").await.map(|path| super::normalize(&path))
     }
 
     /// Close the SFTP channel and wait for ssh to exit.
     pub async fn close(self) -> Result<(), Error> {
-        let Self { sftp, child } = self;
+        let Self {
+            sftp,
+            child,
+            reads,
+            writes,
+        } = self;
+        for (_, file) in writes.into_inner() {
+            let _ = file.close().await;
+        }
+        for (_, file) in reads.into_inner() {
+            let _ = file.close().await;
+        }
         let sftp = sftp.into_inner();
         sftp.close()
             .await
@@ -170,11 +249,22 @@ impl RemoteFs for SftpFs {
     }
 
     async fn read_at(&self, path: &str, offset: u64, len: usize) -> Result<Vec<u8>, Error> {
-        let sftp = self.sftp.lock().await;
-        let mut file = sftp
-            .open(Path::new(path))
-            .await
-            .map_err(|error| sftp_err("open", path, error))?;
+        let missing = !self.reads.lock().await.contains_key(path);
+        if missing {
+            let sftp = self.sftp.lock().await;
+            let file = sftp
+                .open(Path::new(path))
+                .await
+                .map_err(|error| sftp_err("open", path, error))?;
+            drop(sftp);
+            self.reads.lock().await.insert(path.to_string(), file);
+        }
+        let mut reads = self.reads.lock().await;
+        let file = reads
+            .get_mut(path)
+            .ok_or_else(|| Error::Message(format!("sftp read {path}: handle missing")))?;
+        // Seek every chunk. The client's sequential read cursor advances by the
+        // requested length, which is larger than a short read.
         file.seek(std::io::SeekFrom::Start(offset))
             .await
             .map_err(|source| Error::Message(format!("sftp seek {path}: {source}")))?;
@@ -201,19 +291,42 @@ impl RemoteFs for SftpFs {
     }
 
     async fn write_at(&self, path: &str, offset: u64, data: &[u8]) -> Result<(), Error> {
-        let sftp = self.sftp.lock().await;
-        let mut file = sftp
-            .options()
-            .write(true)
-            .open(Path::new(path))
-            .await
-            .map_err(|error| sftp_err("open", path, error))?;
+        let missing = !self.writes.lock().await.contains_key(path);
+        if missing {
+            let sftp = self.sftp.lock().await;
+            let file = sftp
+                .options()
+                .write(true)
+                .open(Path::new(path))
+                .await
+                .map_err(|error| sftp_err("open", path, error))?;
+            drop(sftp);
+            self.writes.lock().await.insert(path.to_string(), file);
+        }
+        let mut writes = self.writes.lock().await;
+        let file = writes
+            .get_mut(path)
+            .ok_or_else(|| Error::Message(format!("sftp write {path}: handle missing")))?;
         file.seek(std::io::SeekFrom::Start(offset))
             .await
             .map_err(|source| Error::Message(format!("sftp seek {path}: {source}")))?;
         file.write_all(data)
             .await
             .map_err(|error| sftp_err("write", path, error))?;
+        Ok(())
+    }
+
+    async fn release(&self, path: &str) -> Result<(), Error> {
+        let write = self.writes.lock().await.remove(path);
+        if let Some(file) = write {
+            file.close()
+                .await
+                .map_err(|error| sftp_err("close", path, error))?;
+        }
+        let read = self.reads.lock().await.remove(path);
+        if let Some(file) = read {
+            let _ = file.close().await;
+        }
         Ok(())
     }
 
@@ -245,6 +358,43 @@ impl RemoteFs for SftpFs {
 
 fn sftp_err(op: &str, path: &str, error: openssh_sftp_client::Error) -> Error {
     Error::Message(format!("sftp {op} {path}: {error}"))
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use crate::domain::host::EffectiveHost;
+    use std::collections::BTreeMap;
+
+    fn host() -> EffectiveHost {
+        EffectiveHost {
+            name: "web".into(),
+            address: "203.0.113.10".into(),
+            user: "deploy".into(),
+            port: 22,
+            identity_file: None,
+            jump: None,
+            tags: Vec::new(),
+            notes: None,
+            ssh_options: BTreeMap::new(),
+            disabled: false,
+            connect_timeout: None,
+            tunnels: Vec::new(),
+        }
+    }
+
+    #[test]
+    fn subsystem_flag_comes_before_the_destination() {
+        let host = host();
+        let args = sftp_arguments(&host, &[host.clone()], Some(30), false, None);
+        let flag = args.iter().position(|arg| arg == "-s").unwrap();
+        assert_eq!(args[flag + 1], "deploy@203.0.113.10");
+        assert_eq!(args[flag + 2], "sftp");
+        assert!(args.windows(2).any(|pair| pair == ["-o", "RequestTTY=no"]));
+        assert!(args.windows(2).any(|pair| pair == ["-o", "BatchMode=yes"]));
+        let batch = args.iter().position(|arg| arg == "BatchMode=yes").unwrap();
+        assert!(flag > batch);
+    }
 }
 
 fn from_meta(name: String, meta: MetaData, target: Option<String>) -> DirEntry {

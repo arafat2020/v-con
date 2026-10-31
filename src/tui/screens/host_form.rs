@@ -169,10 +169,7 @@ pub fn draw(frame: &mut Frame, area: Rect, form: &HostForm, theme: &Theme) {
         .style(theme.text())
         .block(
             Block::bordered()
-                .title(Span::styled(
-                    format!(" {} ", form.title),
-                    theme.title(),
-                ))
+                .title(Span::styled(format!(" {} ", form.title), theme.title()))
                 .border_style(theme.border_focus())
                 .style(theme.bar()),
         )
