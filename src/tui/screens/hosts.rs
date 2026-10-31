@@ -16,8 +16,7 @@ use ratatui::Frame;
 use ratatui::layout::{Constraint, Layout, Rect};
 use ratatui::text::{Line, Span};
 use ratatui::widgets::{
-    Block, Cell, Paragraph, Row, Scrollbar, ScrollbarOrientation, ScrollbarState, Table,
-    TableState, Wrap,
+    Cell, Paragraph, Row, Scrollbar, ScrollbarOrientation, ScrollbarState, Table, TableState, Wrap,
 };
 use std::collections::{BTreeMap, BTreeSet, HashSet};
 use std::path::Path;
@@ -413,7 +412,9 @@ fn draw_tree(
     let tree = Tree::new(&items)
         .expect("tag identifiers are unique")
         .block(
-            Block::bordered()
+            options
+                .theme
+                .block()
                 .title(Span::styled(" Tags ", options.theme.title()))
                 .border_style(options.theme.pane_border(focused)),
         )
@@ -448,7 +449,9 @@ fn draw_table(
         .clone()
         .or_else(|| output.warnings.first().cloned());
     let focused = view.focus == Focus::Table;
-    let mut block = Block::bordered()
+    let mut block = options
+        .theme
+        .block()
         .title(Span::styled(title, options.theme.title()))
         .border_style(options.theme.pane_border(focused));
     if let Some(notice) = notice.as_ref() {
@@ -582,7 +585,9 @@ fn draw_detail(
             Paragraph::new("No host selected.")
                 .style(options.theme.muted())
                 .block(
-                    Block::bordered()
+                    options
+                        .theme
+                        .block()
                         .title(Span::styled(" Detail ", options.theme.title()))
                         .border_style(options.theme.border()),
                 ),
@@ -591,18 +596,13 @@ fn draw_detail(
         return;
     };
     let chain = jump_chain(host, hosts);
-    let via = if chain.is_empty() {
-        format!("{}:{}", host.destination(), host.port)
-    } else {
-        format!(
-            "{}:{} via {}",
-            host.destination(),
-            host.port,
-            chain.join(" → ")
-        )
-    };
     let identity = host.identity_file.as_deref().unwrap_or("ssh default");
     let notes = host.notes.as_deref().unwrap_or("—");
+    let tags = if host.tags.is_empty() {
+        "—".to_string()
+    } else {
+        host.tags.join(", ")
+    };
     let args = build_ssh_command(
         host,
         hosts,
@@ -615,27 +615,56 @@ fn draw_detail(
                 .then(|| options.control_dir.display().to_string()),
         },
     );
-    let tunnels = if options.active_tunnels.is_empty() {
-        String::new()
+    let mut lines = vec![detail_field(
+        options.theme,
+        "connect",
+        format!("{}:{}", host.destination(), host.port),
+    )];
+    if !chain.is_empty() {
+        lines.push(detail_field(options.theme, "via", chain.join(" → ")));
+    }
+    lines.push(detail_field(
+        options.theme,
+        "identity",
+        identity.to_string(),
+    ));
+    lines.push(detail_field(options.theme, "tags", tags));
+    lines.push(detail_field(options.theme, "notes", notes.to_string()));
+    if !options.active_tunnels.is_empty() {
+        lines.push(detail_field(
+            options.theme,
+            "tunnels",
+            options.active_tunnels.join(", "),
+        ));
+    }
+    lines.push(detail_field(options.theme, "ssh", command_line(&args)));
+    let star = if view.favorites.contains(&host.name) {
+        " ★"
     } else {
-        format!("\ntunnels: {}", options.active_tunnels.join(", "))
+        ""
     };
-    let text = format!(
-        "{via}\nidentity: {identity}\ntags: {}\nnotes: {notes}{tunnels}\n{}",
-        host.tags.join(", "),
-        command_line(&args)
-    );
     frame.render_widget(
-        Paragraph::new(text)
-            .style(options.theme.text())
+        Paragraph::new(lines)
             .block(
-                Block::bordered()
-                    .title(Span::styled(" Detail ", options.theme.title()))
+                options
+                    .theme
+                    .block()
+                    .title(Span::styled(
+                        format!(" {}{star} ", host.name),
+                        options.theme.title(),
+                    ))
                     .border_style(options.theme.border()),
             )
             .wrap(Wrap { trim: true }),
         area,
     );
+}
+
+fn detail_field(theme: &Theme, label: &str, value: String) -> Line<'static> {
+    Line::from(vec![
+        Span::styled(format!(" {label:<8} "), theme.muted()),
+        Span::styled(value, theme.text()),
+    ])
 }
 
 fn table_title(view: &HostsView, visible: usize) -> String {

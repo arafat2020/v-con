@@ -6,7 +6,7 @@ use crossterm::event::KeyCode;
 use ratatui::Frame;
 use ratatui::layout::{Constraint, Rect};
 use ratatui::text::Span;
-use ratatui::widgets::{Block, Clear, Paragraph, Row, Table, TableState, Wrap};
+use ratatui::widgets::{Clear, Paragraph, Row, Table, TableState, Wrap};
 
 /// Key result for the log screen.
 #[derive(Debug, Clone, PartialEq, Eq)]
@@ -234,7 +234,8 @@ pub fn draw(frame: &mut Frame, area: Rect, view: &mut LogView, theme: &Theme) {
         .header(header)
         .style(theme.text())
         .block(
-            Block::bordered()
+            theme
+                .block()
                 .title(Span::styled(title, theme.title()))
                 .border_style(theme.border()),
         )
@@ -288,7 +289,8 @@ fn draw_detail(frame: &mut Frame, area: Rect, entry: &AuditEntry, theme: &Theme)
         Paragraph::new(text)
             .style(theme.text())
             .block(
-                Block::bordered()
+                theme
+                    .block()
                     .title(Span::styled(" Audit detail ", theme.title()))
                     .border_style(theme.border_focus())
                     .style(theme.bar()),

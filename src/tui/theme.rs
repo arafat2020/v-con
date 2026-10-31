@@ -7,6 +7,7 @@
 use crate::config::ThemeConfig;
 use crate::error::Error;
 use ratatui::style::{Color, Modifier, Style};
+use ratatui::widgets::{Block, BorderType};
 
 /// Concrete colours for one run of the TUI.
 #[derive(Debug, Clone, PartialEq, Eq)]
@@ -152,6 +153,29 @@ impl Theme {
             self.border_focus()
         } else {
             self.border()
+        }
+    }
+
+    /// Rounded frames in color, plain frames when color is disabled.
+    pub fn border_kind(&self) -> BorderType {
+        if self.no_color {
+            BorderType::Plain
+        } else {
+            BorderType::Rounded
+        }
+    }
+
+    /// Bordered pane using [`Self::border_kind`].
+    pub fn block(&self) -> Block<'static> {
+        Block::bordered().border_type(self.border_kind())
+    }
+
+    /// Key token on the hint line. A filled pill in color, bold underline without it.
+    pub fn key_style(&self) -> Style {
+        if self.no_color {
+            Style::new().add_modifier(Modifier::BOLD | Modifier::UNDERLINED)
+        } else {
+            self.tab_active()
         }
     }
 

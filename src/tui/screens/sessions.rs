@@ -8,10 +8,10 @@ use crate::services::sessions::SessionId;
 use crate::tui::theme::Theme;
 use crossterm::event::{KeyCode, KeyModifiers};
 use ratatui::Frame;
-use ratatui::layout::{Constraint, Direction, Layout, Rect};
+use ratatui::layout::{Alignment, Constraint, Direction, Layout, Rect};
 use ratatui::style::{Modifier, Style};
 use ratatui::text::{Line, Span};
-use ratatui::widgets::{Block, Borders, Paragraph};
+use ratatui::widgets::Paragraph;
 use std::collections::{HashMap, HashSet};
 use std::time::{Duration, Instant};
 use tui_term::widget::PseudoTerminal;
@@ -513,7 +513,15 @@ pub fn draw(
 ) {
     if view.tabs.is_empty() {
         frame.render_widget(
-            Paragraph::new("No sessions. Press o on a host to open one."),
+            Paragraph::new("No sessions yet.\n\nPress o on a host to open one.")
+                .style(theme.muted())
+                .alignment(Alignment::Center)
+                .block(
+                    theme
+                        .block()
+                        .title(Span::styled(" Sessions ", theme.title()))
+                        .border_style(theme.border()),
+                ),
             area,
         );
         return;
@@ -649,8 +657,8 @@ fn draw_pane(
     } else {
         format!(" {host} ")
     };
-    let block = Block::default()
-        .borders(Borders::ALL)
+    let block = theme
+        .block()
         .title(Span::styled(title, theme.title()))
         .border_style(theme.pane_border(focused));
     let inner = block.inner(area);

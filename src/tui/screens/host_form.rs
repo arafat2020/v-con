@@ -12,7 +12,7 @@ use crossterm::event::{KeyCode, KeyModifiers};
 use ratatui::Frame;
 use ratatui::layout::Rect;
 use ratatui::text::Span;
-use ratatui::widgets::{Block, Clear, Paragraph, Wrap};
+use ratatui::widgets::{Clear, Paragraph, Wrap};
 use std::path::Path;
 
 /// What the host form wants the shell to do.
@@ -168,7 +168,8 @@ pub fn draw(frame: &mut Frame, area: Rect, form: &HostForm, theme: &Theme) {
     let paragraph = Paragraph::new(lines.join("\n"))
         .style(theme.text())
         .block(
-            Block::bordered()
+            theme
+                .block()
                 .title(Span::styled(format!(" {} ", form.title), theme.title()))
                 .border_style(theme.border_focus())
                 .style(theme.bar()),
