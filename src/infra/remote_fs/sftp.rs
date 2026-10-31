@@ -360,6 +360,31 @@ fn sftp_err(op: &str, path: &str, error: openssh_sftp_client::Error) -> Error {
     Error::Message(format!("sftp {op} {path}: {error}"))
 }
 
+fn from_meta(name: String, meta: MetaData, target: Option<String>) -> DirEntry {
+    let mode = meta.permissions().map(|perms| perms.as_raw().bits());
+    let kind = match meta.file_type() {
+        Some(ft) if ft.is_dir() => EntryKind::Dir,
+        Some(ft) if ft.is_symlink() => EntryKind::Symlink,
+        Some(ft) if ft.is_file() => EntryKind::File,
+        Some(_) => EntryKind::Other,
+        None => match mode.map(|m| m & 0o170_000) {
+            Some(0o040_000) => EntryKind::Dir,
+            Some(0o120_000) => EntryKind::Symlink,
+            Some(0o100_000) => EntryKind::File,
+            _ => EntryKind::Other,
+        },
+    };
+    let mtime = meta.modified().map(|stamp| stamp.as_system_time());
+    DirEntry {
+        name,
+        kind,
+        size: meta.len().unwrap_or(0),
+        mtime,
+        mode,
+        target,
+    }
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -386,7 +411,7 @@ mod tests {
     #[test]
     fn subsystem_flag_comes_before_the_destination() {
         let host = host();
-        let args = sftp_arguments(&host, &[host.clone()], Some(30), false, None);
+        let args = sftp_arguments(&host, std::slice::from_ref(&host), Some(30), false, None);
         let flag = args.iter().position(|arg| arg == "-s").unwrap();
         assert_eq!(args[flag + 1], "deploy@203.0.113.10");
         assert_eq!(args[flag + 2], "sftp");
@@ -394,30 +419,5 @@ mod tests {
         assert!(args.windows(2).any(|pair| pair == ["-o", "BatchMode=yes"]));
         let batch = args.iter().position(|arg| arg == "BatchMode=yes").unwrap();
         assert!(flag > batch);
-    }
-}
-
-fn from_meta(name: String, meta: MetaData, target: Option<String>) -> DirEntry {
-    let mode = meta.permissions().map(|perms| perms.as_raw().bits());
-    let kind = match meta.file_type() {
-        Some(ft) if ft.is_dir() => EntryKind::Dir,
-        Some(ft) if ft.is_symlink() => EntryKind::Symlink,
-        Some(ft) if ft.is_file() => EntryKind::File,
-        Some(_) => EntryKind::Other,
-        None => match mode.map(|m| m & 0o170_000) {
-            Some(0o040_000) => EntryKind::Dir,
-            Some(0o120_000) => EntryKind::Symlink,
-            Some(0o100_000) => EntryKind::File,
-            _ => EntryKind::Other,
-        },
-    };
-    let mtime = meta.modified().map(|stamp| stamp.as_system_time());
-    DirEntry {
-        name,
-        kind,
-        size: meta.len().unwrap_or(0),
-        mtime,
-        mode,
-        target,
     }
 }
