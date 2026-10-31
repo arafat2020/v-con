@@ -185,14 +185,9 @@ impl RemoteFs for LocalFs {
             path: path.clone(),
             source,
         })?;
-        file.flush().await.map_err(|source| Error::Write {
-            path: path.clone(),
-            source,
-        })?;
-        file.sync_all().await.map_err(|source| Error::Write {
-            path: path.clone(),
-            source,
-        })?;
+        file.flush()
+            .await
+            .map_err(|source| Error::Write { path, source })?;
         Ok(())
     }
 

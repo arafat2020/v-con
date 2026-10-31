@@ -855,10 +855,7 @@ fn draw_message(frame: &mut Frame, area: Rect, title: &str, body: &str, theme: &
             .block(
                 Block::bordered()
                     .title(Span::styled(format!(" {title} "), theme.title()))
-                    .title_bottom(Line::styled(
-                        " Esc close  ↑↓ scroll ",
-                        theme.muted(),
-                    ))
+                    .title_bottom(Line::styled(" Esc close  ↑↓ scroll ", theme.muted()))
                     .border_style(theme.border_focus())
                     .style(theme.bar()),
             ),
@@ -923,5 +920,12 @@ mod tests {
         );
         assert_eq!(on_key(&mut view, KeyCode::Right, &[]), FilesEvent::Activate);
         assert_eq!(on_key(&mut view, KeyCode::Left, &[]), FilesEvent::Parent);
+    }
+
+    #[test]
+    fn c_and_f5_request_copy() {
+        let mut view = FilesView::new(PathBuf::from("/tmp"));
+        assert_eq!(on_key(&mut view, KeyCode::Char('c'), &[]), FilesEvent::Copy);
+        assert_eq!(on_key(&mut view, KeyCode::F(5), &[]), FilesEvent::Copy);
     }
 }

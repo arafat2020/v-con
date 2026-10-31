@@ -3,10 +3,10 @@
 use crate::config::Config;
 use crate::domain::selector::{evaluate_selector, parse_selector};
 use crate::error::Error;
-use crate::infra::remote_fs::{LocalFs, RemoteFs, SftpFs, normalize, parent_of, sftp_arguments};
+use crate::infra::remote_fs::{LocalFs, SftpFs, normalize, sftp_arguments};
 use crate::paths::Paths;
 use crate::services::exec::{ConfirmGate, ExecSettings, confirmation_gate, needs_confirmation};
-use crate::services::files::{collect_tree, copy_file, map_destinations};
+use crate::services::files::{copy_file, plan_copies};
 use crate::services::inventory::InventoryBundle;
 use std::io::{self, IsTerminal, Write};
 use std::path::Path;
@@ -101,16 +101,9 @@ pub fn run(
         let result = runtime.block_on(async {
             let remote = Arc::new(SftpFs::connect(program.clone(), args).await?);
             let source = normalize(local_path);
-            let meta = LocalFs.stat(&source).await?;
-            let root = if meta.is_dir() {
-                source.clone()
-            } else {
-                parent_of(&source).unwrap_or_else(|| "/".to_string())
-            };
-            let entries = collect_tree(&LocalFs, &source).await?;
-            let mapped = map_destinations(&entries, &root, &remote_dir);
+            let planned = plan_copies(&LocalFs, remote.as_ref(), &source, &remote_dir).await?;
             let cancel = CancellationToken::new();
-            for (src_path, destination, _size) in mapped {
+            for (src_path, destination, _size) in planned.files {
                 if copy_file(
                     &LocalFs,
                     remote.as_ref(),

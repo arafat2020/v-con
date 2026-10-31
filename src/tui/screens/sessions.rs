@@ -575,10 +575,7 @@ fn draw_tab_bar(frame: &mut Frame, area: Rect, view: &SessionsView, theme: &Them
         };
         spans.push(Span::styled(format!(" {text} "), style));
     }
-    frame.render_widget(
-        Paragraph::new(Line::from(spans)).style(theme.bar()),
-        area,
-    );
+    frame.render_widget(Paragraph::new(Line::from(spans)).style(theme.bar()), area);
 }
 
 #[allow(clippy::too_many_arguments)]

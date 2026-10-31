@@ -61,12 +61,63 @@ config with Files, and answer “what did I run on db-1?” from the Log tab.
 
 ---
 
+## Install
+
+macOS and Linux. You need `git`, a Rust toolchain (`cargo`), and `ssh` on `PATH`.
+
+Paste this in a terminal:
+
+```bash
+curl -fsSL https://raw.githubusercontent.com/arafat2020/v-con/main/install.sh | bash
+```
+
+That clones the repo, builds the release binary, and installs it under `~/.local`. From a checkout of this repository, `./install.sh` does the same thing without cloning.
+
+That builds the release binary and installs it under `~/.local`:
+
+| Path | What |
+|------|------|
+| `~/.local/bin/vcon` | The `vcon` command |
+| `~/.local/share/man/man1/vcon.1` | Man page (`man vcon`, once `MANPATH` includes it) |
+| `~/.local/share/bash-completion/completions/vcon` | Bash completions |
+| `~/.local/share/zsh/site-functions/_vcon` | Zsh completions |
+| `~/.local/share/fish/vendor_completions.d/vcon.fish` | Fish completions |
+
+Running the script as root installs to `/usr/local` instead. Either way, your inventory in `~/.config/vcon` is left alone. If `~/.local/bin` is not on `PATH`, the script prints the line to add. Re-running `./install.sh` upgrades the same files in place.
+
+```bash
+sudo ./install.sh --prefix /usr/local   # system-wide
+./install.sh --skip-build                # install an existing target/release/vcon
+./install.sh --help
+```
+
+### Uninstall
+
+Paste this in a terminal:
+
+```bash
+curl -fsSL https://raw.githubusercontent.com/arafat2020/v-con/main/uninstall.sh | bash
+```
+
+From a checkout, `./uninstall.sh` is the same command. It asks before deleting anything. Add `-y` to skip that question:
+
+```bash
+curl -fsSL https://raw.githubusercontent.com/arafat2020/v-con/main/uninstall.sh | bash -s -- -y
+```
+
+This removes the binary, man page, and completions recorded by the installer. Hosts, snippets, the audit log, and other data under `~/.config/vcon`, `~/.local/share/vcon`, `~/.local/state/vcon`, and `~/.cache/vcon` stay put.
+
+```bash
+./uninstall.sh --purge                   # also delete that user data
+sudo ./uninstall.sh --prefix /usr/local  # match a system install
+./uninstall.sh -y                        # skip the confirmation
+```
+
+---
+
 ## Quick start
 
 ```bash
-cargo build --release
-cp target/release/vcon ~/.local/bin/   # or anywhere on PATH
-
 vcon doctor                 # ssh, agent, config paths, control dir
 vcon init                   # ~/.config/vcon/hosts.toml
 $EDITOR ~/.config/vcon/hosts.toml
@@ -200,6 +251,8 @@ design history lives under [`docs/phases/`](docs/phases/).
 
 | Path | Role |
 |------|------|
+| [`install.sh`](install.sh) | Build and install the binary, man page, and completions |
+| [`uninstall.sh`](uninstall.sh) | Remove that install (`--purge` also deletes user data) |
 | [`MANUAL.md`](MANUAL.md) | Full user manual (keys, config, CLI, troubleshooting) |
 | [`CHANGELOG.md`](CHANGELOG.md) | Release notes |
 | [`docs/`](docs/README.md) | Requirements, architecture, data model, decisions |

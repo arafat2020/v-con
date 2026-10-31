@@ -575,7 +575,10 @@ impl App {
 
     fn draw_header(&self, frame: &mut Frame, area: Rect) {
         let bar = self.theme.bar();
-        let mut spans = vec![Span::styled(" vcon ", self.theme.title().bg(self.theme.panel))];
+        let mut spans = vec![Span::styled(
+            " vcon ",
+            self.theme.title().bg(self.theme.panel),
+        )];
         for (index, name) in TABS.iter().enumerate() {
             let label = if index == 3 && self.sessions.tab_count() > 0 {
                 format!(" {} {}({}) ", index + 1, name, self.sessions.tab_count())
@@ -645,7 +648,7 @@ impl App {
                 " ⏎ details   s sort   p pause   r refresh   R all   / filter   c connect   x exec   q quit{pause}"
             )
         } else if self.screen == 3 {
-            " Tab panes   ⏎/l open   h/← up   space mark   c copy   m mkdir   r rename   d delete   v view   H host   C cancel   q quit".to_string()
+            " Tab panes   ⏎/l open   h/← up   space mark   c copy to other pane   m mkdir   r rename   d delete   v view   H host   C cancel   q quit".to_string()
         } else if self.screen == 4 {
             if self.sessions.focused {
                 let host = self
@@ -1611,26 +1614,73 @@ impl App {
     }
 
     /// Fold one transfer event into the queue panel.
-    pub fn apply_transfer_event(&mut self, event: TransferEvent) {
-        if let TransferEvent::Finished {
-            id,
-            state,
-            error: _,
-        } = &event
-            && let Some(job) = self.files.queue.jobs.iter().find(|job| job.id == *id)
-        {
-            let command = format!("{:?} {} → {}", job.direction, job.source, job.destination);
-            let mut entry = audit::entry("transfer", vec![job.host.clone()], Some(command));
-            let code = if *state == crate::services::files::TransferState::Done {
-                0
-            } else {
-                1
-            };
-            entry.results = Some(BTreeMap::from([(job.host.clone(), code)]));
-            self.write_audit(entry);
+    ///
+    /// Returns a refresh command when a job finishes so the destination pane
+    /// picks up the new file without requiring a manual reload.
+    pub fn apply_transfer_event(&mut self, event: TransferEvent) -> Option<FilesCommand> {
+        let mut refresh = None;
+        if let TransferEvent::Finished { id, state, error } = &event {
+            let finished = self
+                .files
+                .queue
+                .jobs
+                .iter()
+                .find(|job| job.id == *id)
+                .map(|job| {
+                    (
+                        job.direction,
+                        job.source.clone(),
+                        job.destination.clone(),
+                        job.host.clone(),
+                    )
+                });
+            if let Some((direction, source, destination, host)) = finished {
+                let command = format!("{direction:?} {source} → {destination}");
+                let mut entry = audit::entry("transfer", vec![host.clone()], Some(command));
+                let code = if *state == crate::services::files::TransferState::Done {
+                    0
+                } else {
+                    1
+                };
+                entry.results = Some(BTreeMap::from([(host, code)]));
+                self.write_audit(entry);
+                match state {
+                    crate::services::files::TransferState::Done => {
+                        self.toast(format!(
+                            "copied {}",
+                            crate::infra::remote_fs::file_name(&source)
+                        ));
+                        refresh = Some(match direction {
+                            crate::services::files::TransferDirection::Upload => {
+                                FilesCommand::Refresh {
+                                    local: false,
+                                    remote: self.files.host.is_some(),
+                                }
+                            }
+                            crate::services::files::TransferDirection::Download => {
+                                FilesCommand::Refresh {
+                                    local: true,
+                                    remote: false,
+                                }
+                            }
+                        });
+                    }
+                    crate::services::files::TransferState::Failed => {
+                        let detail = error
+                            .clone()
+                            .unwrap_or_else(|| "transfer failed".to_string());
+                        self.toast(detail);
+                    }
+                    crate::services::files::TransferState::Cancelled => {
+                        self.toast("transfer cancelled");
+                    }
+                    _ => {}
+                }
+            }
         }
         self.files.queue.apply(event);
         self.dirty = true;
+        refresh
     }
 
     /// Open the read-only file viewer with loaded text.
@@ -1649,35 +1699,17 @@ impl App {
             || self.files.delete.is_some()
             || self.files.prompt.is_some()
             || self.files.picker.is_some();
+        // Only global chrome here. Host-list bindings (Enter/connect, d/delete
+        // host, s/snippets, t/tunnels, …) must not steal Files keys like copy.
         if !overlay && !self.files.focused_ref().filtering {
             match code {
                 KeyCode::Char('q') => return self.update(Action::Quit),
                 KeyCode::Char('?') => return self.update(Action::ToggleHelp),
-                KeyCode::Char('v') => return self.update(Action::ToggleProblems),
-                KeyCode::Char(digit @ '1'..='5') => {
+                KeyCode::Char(digit @ '1'..='5') if !modifiers.contains(KeyModifiers::CONTROL) => {
                     let screen = digit.to_digit(10).unwrap_or(0) as u8;
                     return self.update(Action::SwitchScreen(screen));
                 }
                 _ => {}
-            }
-            if let Some(
-                action @ (Action::AddHost
-                | Action::EditHost
-                | Action::DuplicateHost
-                | Action::DeleteHost
-                | Action::ImportHosts
-                | Action::EditInventory
-                | Action::ToggleFavorite
-                | Action::CopySshCommand
-                | Action::Connect
-                | Action::Exec
-                | Action::OpenFiles
-                | Action::OpenSession
-                | Action::OpenSnippets
-                | Action::OpenTunnels),
-            ) = self.keymap.lookup(code, modifiers)
-            {
-                return self.update(action);
             }
         }
         match files_ui::on_key(&mut self.files, code, &self.hosts) {
@@ -3046,6 +3078,43 @@ jump = "web-1"
             commands
                 .iter()
                 .any(|command| matches!(command, UiCommand::CancelExec))
+        );
+    }
+
+    #[test]
+    fn files_c_copies_instead_of_host_actions() {
+        let mut app = preview(fleet());
+        app.screen = 3;
+        app.files.host = Some("web-1".into());
+        app.files.local.entries = vec![DirEntry {
+            name: "readme.txt".into(),
+            kind: crate::infra::remote_fs::EntryKind::File,
+            size: 4,
+            mtime: None,
+            mode: None,
+            target: None,
+        }];
+        app.files.local.cursor = 0;
+        app.files.focus = PaneFocus::Local;
+        let commands = app.on_key(KeyCode::Char('c'), KeyModifiers::NONE);
+        assert!(
+            matches!(
+                commands.as_slice(),
+                [UiCommand::Files(FilesCommand::Copy {
+                    direction: crate::services::files::TransferDirection::Upload,
+                    host,
+                    ..
+                })] if host == "web-1"
+            ),
+            "expected upload copy, got {commands:?}"
+        );
+        // Enter must open/activate on Files, not hand off to ssh.
+        let commands = app.on_key(KeyCode::Enter, KeyModifiers::NONE);
+        assert!(
+            !commands
+                .iter()
+                .any(|command| matches!(command, UiCommand::Suspend(_))),
+            "Enter must not connect from Files: {commands:?}"
         );
     }
 }
