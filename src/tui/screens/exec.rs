@@ -10,7 +10,7 @@ use ratatui::Frame;
 use ratatui::layout::{Constraint, Layout, Rect};
 use ratatui::style::Style;
 use ratatui::text::{Line, Span};
-use ratatui::widgets::{Block, Borders, Clear, Paragraph, Wrap};
+use ratatui::widgets::{Clear, Paragraph, Wrap};
 use std::time::{Duration, Instant};
 
 const TIMEOUTS: [u64; 5] = [10, 30, 60, 120, 0];
@@ -500,8 +500,8 @@ pub fn draw_prompt(frame: &mut Frame, area: Rect, prompt: &Prompt, theme: &Theme
     let paragraph = Paragraph::new(body)
         .style(theme.text())
         .block(
-            Block::default()
-                .borders(Borders::ALL)
+            theme
+                .block()
                 .title(Span::styled(" Exec ", theme.title()))
                 .border_style(theme.border_focus())
                 .style(theme.bar()),
@@ -520,8 +520,8 @@ pub fn draw_confirm(frame: &mut Frame, area: Rect, confirm: &Confirm, theme: &Th
         confirm.reason
     );
     let paragraph = Paragraph::new(body).style(theme.text()).block(
-        Block::default()
-            .borders(Borders::ALL)
+        theme
+            .block()
             .title(Span::styled(" Confirm exec ", theme.warning()))
             .border_style(theme.warning())
             .style(theme.bar()),
@@ -561,8 +561,8 @@ pub fn draw_results(frame: &mut Frame, area: Rect, results: &Results, theme: &Th
         results.command,
         results.rows.len()
     );
-    let block = Block::default()
-        .borders(Borders::ALL)
+    let block = theme
+        .block()
         .title(Span::styled(title, theme.title()))
         .border_style(theme.border_focus())
         .style(theme.bar());

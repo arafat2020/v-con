@@ -2,7 +2,7 @@
 source: src/tui/app.rs
 expression: screen
 ---
- vcon  1 Hosts  2 Health  3 Files  4 Ses
+ 1 Hosts │ 2 Health │ 3 Files │  ╭v-con╮
 ┌ Hosts ─ 5 ───────────────────────────┐
 │NAME              UP  ADDRESS         │
 │>  bastion        ·   198.51.100.5    │
@@ -13,4 +13,4 @@ expression: screen
 │                                      │
 │                                      │
 └──────────────────────────────────────┘
- ⏎ connect   o session   s snippet   t t
+ ⏎  connect  o  session  s  snippet  t

@@ -10,8 +10,11 @@ use crate::tui::theme::Theme;
 use crossterm::event::KeyCode;
 use ratatui::Frame;
 use ratatui::layout::{Constraint, Layout, Rect};
+use ratatui::style::Style;
 use ratatui::text::{Line, Span};
-use ratatui::widgets::{Block, Clear, Gauge, List, ListItem, ListState, Paragraph, Wrap};
+use ratatui::widgets::{
+    Cell, Clear, Gauge, HighlightSpacing, Paragraph, Row, Table, TableState, Wrap,
+};
 use std::collections::BTreeSet;
 use std::path::PathBuf;
 use std::time::SystemTime;
@@ -687,53 +690,69 @@ fn draw_pane(
     let title = format!(" {title}: {}{filter} ", pane.path);
     let now = SystemTime::now();
     let visible = pane.visible();
-    let items: Vec<ListItem> = visible
-        .iter()
-        .enumerate()
-        .map(|(index, entry)| {
-            let marked = pane.marks.contains(&entry.name);
-            let cursor = index == pane.cursor;
-            let glyph = match entry.kind {
-                EntryKind::Dir => "▸",
-                EntryKind::Symlink => "↗",
-                _ => " ",
-            };
-            let mark = if marked {
-                "●"
-            } else if cursor {
-                ">"
-            } else {
-                " "
-            };
-            let size = if entry.is_dir() {
-                "-".to_string()
-            } else {
-                format_size(entry.size)
-            };
-            let line = format!(
-                "{mark}{glyph} {:<22} {:>6} {:>4} {}",
-                truncate(&entry.name, 22),
-                size,
-                format_age(entry.mtime, now),
-                format_mode(entry.kind, entry.mode),
-            );
-            let style = if cursor && focused {
-                theme.selected()
-            } else if entry.is_dir() {
-                theme.directory()
-            } else if matches!(entry.kind, EntryKind::Symlink) {
-                theme.symlink()
-            } else {
-                theme.text()
-            };
-            ListItem::new(Line::from(Span::styled(line, style)))
-        })
-        .collect();
-    let block = Block::bordered()
+    let rows = visible.iter().enumerate().map(|(index, entry)| {
+        let marked = pane.marks.contains(&entry.name);
+        let cursor = index == pane.cursor;
+        let glyph = match entry.kind {
+            EntryKind::Dir => "▸ ",
+            EntryKind::Symlink => "↗ ",
+            _ => "  ",
+        };
+        let mark = if marked {
+            "●"
+        } else if cursor {
+            ">"
+        } else {
+            " "
+        };
+        let size = if entry.is_dir() {
+            "—".to_string()
+        } else {
+            format_size(entry.size)
+        };
+        let name_style = if cursor && focused {
+            theme.selected()
+        } else if entry.is_dir() {
+            theme.directory()
+        } else if matches!(entry.kind, EntryKind::Symlink) {
+            theme.symlink()
+        } else {
+            theme.text()
+        };
+        Row::new(vec![
+            Cell::from(Line::from(vec![
+                Span::raw(format!("{mark}{glyph}")),
+                Span::styled(entry.name.clone(), name_style),
+            ])),
+            Cell::from(size),
+            Cell::from(format_age(entry.mtime, now)),
+            Cell::from(format_mode(entry.kind, entry.mode)),
+        ])
+    });
+    let block = theme
+        .block()
         .title(Span::styled(title, theme.title()))
         .border_style(theme.pane_border(focused));
-    let mut state = ListState::default().with_selected(Some(pane.cursor));
-    frame.render_stateful_widget(List::new(items).block(block), area, &mut state);
+    let table = Table::new(
+        rows,
+        [
+            Constraint::Min(12),
+            Constraint::Length(8),
+            Constraint::Length(5),
+            Constraint::Length(6),
+        ],
+    )
+    .header(Row::new(["NAME", "SIZE", "AGE", "MODE"]).style(theme.header_row()))
+    .block(block)
+    .row_highlight_style(if focused {
+        theme.selected()
+    } else {
+        Style::new()
+    })
+    .highlight_spacing(HighlightSpacing::Never)
+    .style(theme.text());
+    let mut state = TableState::default().with_selected(Some(pane.cursor));
+    frame.render_stateful_widget(table, area, &mut state);
 }
 
 fn draw_queue(frame: &mut Frame, area: Rect, view: &FilesView, theme: &Theme) {
@@ -756,7 +775,8 @@ fn draw_queue(frame: &mut Frame, area: Rect, view: &FilesView, theme: &Theme) {
             })
             .style(theme.muted())
             .block(
-                Block::bordered()
+                theme
+                    .block()
                     .title(Span::styled(title, theme.title()))
                     .border_style(theme.border()),
             ),
@@ -769,13 +789,15 @@ fn draw_queue(frame: &mut Frame, area: Rect, view: &FilesView, theme: &Theme) {
             .collect::<Vec<_>>(),
     )
     .split(
-        Block::bordered()
+        theme
+            .block()
             .title(Span::styled(title.clone(), theme.title()))
             .border_style(theme.border())
             .inner(area),
     );
     frame.render_widget(
-        Block::bordered()
+        theme
+            .block()
             .title(Span::styled(title, theme.title()))
             .border_style(theme.border()),
         area,
@@ -814,6 +836,7 @@ fn draw_job(frame: &mut Frame, area: Rect, job: &TransferJob, theme: &Theme) {
     frame.render_widget(
         Gauge::default()
             .gauge_style(style)
+            .use_unicode(true)
             .ratio(ratio.clamp(0.0, 1.0))
             .label(label),
         area,
@@ -853,7 +876,8 @@ fn draw_message(frame: &mut Frame, area: Rect, title: &str, body: &str, theme: &
             .wrap(Wrap { trim: false })
             .style(theme.text())
             .block(
-                Block::bordered()
+                theme
+                    .block()
                     .title(Span::styled(format!(" {title} "), theme.title()))
                     .title_bottom(Line::styled(" Esc close  ↑↓ scroll ", theme.muted()))
                     .border_style(theme.border_focus())
@@ -861,23 +885,6 @@ fn draw_message(frame: &mut Frame, area: Rect, title: &str, body: &str, theme: &
             ),
         rect,
     );
-}
-
-fn truncate(text: &str, width: usize) -> String {
-    let mut out = String::new();
-    for (index, ch) in text.chars().enumerate() {
-        if index >= width {
-            break;
-        }
-        out.push(ch);
-    }
-    if text.chars().count() > width {
-        if let Some((idx, _)) = out.char_indices().nth(width.saturating_sub(1)) {
-            out.truncate(idx);
-        }
-        out.push('…');
-    }
-    out
 }
 
 fn file_name_only(path: &str) -> String {
