@@ -9,7 +9,7 @@ use nucleo::{Config, Matcher, Utf32Str};
 use ratatui::Frame;
 use ratatui::layout::{Constraint, Layout, Rect};
 use ratatui::text::{Line, Span};
-use ratatui::widgets::{Block, Clear, List, ListItem, ListState, Paragraph, Wrap};
+use ratatui::widgets::{Clear, List, ListItem, ListState, Paragraph, Wrap};
 use std::collections::BTreeMap;
 
 /// What the app should do after a key in the snippets overlay.
@@ -358,7 +358,8 @@ pub fn draw(frame: &mut Frame, area: Rect, view: &SnippetsView, theme: &Theme) {
             crate::tui::widgets::modal::render(frame, area, "Edit snippet", lines, theme);
         }
         Mode::ConfirmDelete { name } => {
-            let block = Block::bordered()
+            let block = theme
+                .block()
                 .title(Span::styled(" Delete snippet ", theme.title()))
                 .border_style(theme.border_focus())
                 .style(theme.bar());
@@ -409,7 +410,8 @@ fn draw_picker(frame: &mut Frame, area: Rect, view: &SnippetsView, theme: &Theme
     frame.render_stateful_widget(
         List::new(items)
             .block(
-                Block::bordered()
+                theme
+                    .block()
                     .title(Span::styled(" Snippets ", theme.title()))
                     .border_style(theme.border()),
             )

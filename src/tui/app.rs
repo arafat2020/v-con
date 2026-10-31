@@ -57,8 +57,9 @@ use chrono::Utc;
 use crossterm::event::{KeyCode, KeyModifiers};
 use ratatui::Frame;
 use ratatui::layout::{Constraint, Layout, Rect};
+use ratatui::style::{Modifier, Style};
 use ratatui::text::{Line, Span};
-use ratatui::widgets::Paragraph;
+use ratatui::widgets::{Block, Paragraph, Tabs};
 use std::collections::{BTreeMap, BTreeSet};
 use std::path::PathBuf;
 use std::process::ExitStatus;
@@ -574,27 +575,61 @@ impl App {
     }
 
     fn draw_header(&self, frame: &mut Frame, area: Rect) {
-        let bar = self.theme.bar();
-        let mut spans = vec![Span::styled(
-            " vcon ",
-            self.theme.title().bg(self.theme.panel),
-        )];
-        for (index, name) in TABS.iter().enumerate() {
-            let label = if index == 3 && self.sessions.tab_count() > 0 {
-                format!(" {} {}({}) ", index + 1, name, self.sessions.tab_count())
+        frame.render_widget(Block::default().style(self.theme.bar()), area);
+        let chips = self.status_line();
+        let mut chip_width = u16::try_from(chips.width()).unwrap_or(0);
+        let mut brand_width: u16 = 8;
+        let tabs_floor = 20u16;
+        while brand_width + chip_width + tabs_floor > area.width {
+            if brand_width > 0 {
+                brand_width = 0;
+            } else if chip_width > 0 {
+                chip_width = 0;
             } else {
-                format!(" {} {} ", index + 1, name)
-            };
-            let style = if self.screen == index as u8 + 1 {
-                self.theme.tab_active()
-            } else {
-                self.theme.tab_inactive()
-            };
-            spans.push(Span::styled(label, style));
+                break;
+            }
         }
+        let mut constraints = vec![Constraint::Min(tabs_floor)];
+        if chip_width > 0 {
+            constraints.push(Constraint::Length(chip_width));
+        }
+        if brand_width > 0 {
+            constraints.push(Constraint::Length(brand_width));
+        }
+        let chunks = Layout::horizontal(constraints).split(area);
+        let titles: Vec<Line> = TABS
+            .iter()
+            .enumerate()
+            .map(|(index, name)| {
+                let label = if index == 3 && self.sessions.tab_count() > 0 {
+                    format!(" {} {}({}) ", index + 1, name, self.sessions.tab_count())
+                } else {
+                    format!(" {} {} ", index + 1, name)
+                };
+                Line::from(label)
+            })
+            .collect();
+        let tabs = Tabs::new(titles)
+            .style(self.theme.tab_inactive())
+            .highlight_style(self.theme.tab_active())
+            .select(usize::from(self.screen.saturating_sub(1)))
+            .divider(Span::styled("│", self.theme.border()))
+            .padding("", "");
+        frame.render_widget(tabs, chunks[0]);
+        if chip_width > 0 {
+            frame.render_widget(Paragraph::new(chips).style(self.theme.bar()), chunks[1]);
+        }
+        if brand_width > 0 {
+            let slot = *chunks.last().expect("brand column");
+            frame.render_widget(Paragraph::new(brand_mark(&self.theme)), slot);
+        }
+    }
+
+    fn status_line(&self) -> Line<'static> {
+        let mut spans = Vec::new();
         if !self.problems.is_empty() {
             spans.push(Span::styled(
-                format!("  ⚠ {} ", self.problems.len()),
+                format!(" ⚠{} ", self.problems.len()),
                 self.theme.warning().bg(self.theme.panel),
             ));
         }
@@ -632,76 +667,178 @@ impl App {
         }
         if !self.running_tunnels.is_empty() {
             spans.push(Span::styled(
-                format!(" ⇄ {} ", self.running_tunnels.len()),
+                format!(" ⇄{} ", self.running_tunnels.len()),
                 self.theme.ok().bg(self.theme.panel),
             ));
         }
-        frame.render_widget(Paragraph::new(Line::from(spans)).style(bar), area);
+        Line::from(spans)
     }
 
     fn draw_hints(&self, frame: &mut Frame, area: Rect) {
-        let text = if let Some((message, _)) = &self.toast {
-            message.clone()
-        } else if self.screen == 2 {
-            let pause = if self.health.paused { "  paused" } else { "" };
-            format!(
-                " ⏎ details   s sort   p pause   r refresh   R all   / filter   c connect   x exec   q quit{pause}"
-            )
-        } else if self.screen == 3 {
-            " Tab panes   ⏎/l open   h/← up   space mark   c copy to other pane   m mkdir   r rename   d delete   v view   H host   C cancel   q quit".to_string()
-        } else if self.screen == 4 {
+        frame.render_widget(Block::default().style(self.theme.bar()), area);
+        if let Some((message, _)) = &self.toast {
+            frame.render_widget(
+                Paragraph::new(message.as_str()).style(self.theme.warning().bg(self.theme.panel)),
+                area,
+            );
+            return;
+        }
+        let line = self.hint_line();
+        let meta = self.hint_meta();
+        let hint_width = u16::try_from(line.width()).unwrap_or(u16::MAX);
+        let meta_width = u16::try_from(meta.width()).unwrap_or(0);
+        if meta_width > 0 && area.width > hint_width.saturating_add(meta_width) {
+            let chunks = Layout::horizontal([Constraint::Min(10), Constraint::Length(meta_width)])
+                .split(area);
+            frame.render_widget(Paragraph::new(line), chunks[0]);
+            frame.render_widget(Paragraph::new(meta).style(self.theme.bar()), chunks[1]);
+        } else {
+            frame.render_widget(Paragraph::new(line), area);
+        }
+    }
+
+    fn hint_line(&self) -> Line<'static> {
+        let theme = &self.theme;
+        if self.screen == 2 {
+            let mut line = hint_line(
+                theme,
+                &[
+                    ("⏎", "details"),
+                    ("s", "sort"),
+                    ("p", "pause"),
+                    ("r", "refresh"),
+                    ("R", "all"),
+                    ("/", "filter"),
+                    ("c", "connect"),
+                    ("x", "exec"),
+                    ("q", "quit"),
+                ],
+            );
+            if self.health.paused {
+                line.spans
+                    .push(Span::styled("  paused", theme.warning().bg(theme.panel)));
+            }
+            return line;
+        }
+        if self.screen == 3 {
+            return hint_line(
+                theme,
+                &[
+                    ("Tab", "panes"),
+                    ("⏎", "open"),
+                    ("h", "up"),
+                    ("space", "mark"),
+                    ("c", "copy"),
+                    ("m", "mkdir"),
+                    ("d", "delete"),
+                    ("H", "host"),
+                    ("q", "quit"),
+                ],
+            );
+        }
+        if self.screen == 4 {
             if self.sessions.focused {
                 let host = self
                     .sessions
                     .focused_host()
                     .unwrap_or_else(|| "session".into());
                 let prefix = format_prefix(self.session_prefix);
-                format!(" SESSION  {host}  —  {prefix} for vcon")
-            } else if self.sessions.tab_count() == 0 {
-                " o on a host opens a session   4 jumps here   q quit".to_string()
-            } else {
-                " ⏎ focus   o open   q quit".to_string()
+                return Line::from(vec![
+                    Span::styled(" SESSION ", theme.key_style()),
+                    Span::styled(format!(" {host}  "), theme.text().bg(theme.panel)),
+                    Span::styled(format!("{prefix} for v-con"), theme.muted().bg(theme.panel)),
+                ]);
             }
-        } else if self.screen == 5 {
-            " j/k move   ⏎ detail   / search   f failed   R re-run   r refresh   q quit".to_string()
-        } else {
-            let mut hint =
-                " ⏎ connect   o session   s snippet   t tunnel   x exec   a add   e edit   d del   ? help   q quit"
-                    .to_string();
-            if self
+            if self.sessions.tab_count() == 0 {
+                return hint_line(
+                    theme,
+                    &[("o", "open on a host"), ("4", "here"), ("q", "quit")],
+                );
+            }
+            return hint_line(theme, &[("⏎", "focus"), ("o", "open"), ("q", "quit")]);
+        }
+        if self.screen == 5 {
+            return hint_line(
+                theme,
+                &[
+                    ("j/k", "move"),
+                    ("⏎", "detail"),
+                    ("/", "search"),
+                    ("f", "failed"),
+                    ("R", "re-run"),
+                    ("r", "refresh"),
+                    ("q", "quit"),
+                ],
+            );
+        }
+        let mut items = vec![
+            ("⏎", "connect"),
+            ("o", "session"),
+            ("s", "snippet"),
+            ("t", "tunnel"),
+            ("x", "exec"),
+            ("a", "add"),
+            ("e", "edit"),
+            ("d", "del"),
+            ("?", "help"),
+            ("q", "quit"),
+        ];
+        if !self.problems.is_empty() {
+            items.push(("v", "problems"));
+        }
+        let mut line = hint_line(theme, &items);
+        if self
+            .exec_results
+            .as_ref()
+            .is_some_and(|results| results.running && !self.exec_visible)
+        {
+            let done = self
                 .exec_results
                 .as_ref()
-                .is_some_and(|results| results.running && !self.exec_visible)
-            {
-                let done = self
-                    .exec_results
-                    .as_ref()
-                    .map(|results| {
-                        results
-                            .rows
-                            .iter()
-                            .filter(|row| row.outcome.is_some())
-                            .count()
-                    })
-                    .unwrap_or(0);
-                let total = self
-                    .exec_results
-                    .as_ref()
-                    .map(|results| results.rows.len())
-                    .unwrap_or(0);
-                hint = format!(" exec {done}/{total}   {hint}");
+                .map(|results| {
+                    results
+                        .rows
+                        .iter()
+                        .filter(|row| row.outcome.is_some())
+                        .count()
+                })
+                .unwrap_or(0);
+            let total = self
+                .exec_results
+                .as_ref()
+                .map(|results| results.rows.len())
+                .unwrap_or(0);
+            line.spans.insert(
+                0,
+                Span::styled(
+                    format!(" exec {done}/{total} "),
+                    theme.warning().bg(theme.panel),
+                ),
+            );
+        }
+        line
+    }
+
+    fn hint_meta(&self) -> Line<'static> {
+        let text = match self.screen {
+            1 => format!(" {} hosts ", self.hosts.len()),
+            2 => {
+                let (ok, warn, crit, down) = self.health.counts();
+                format!(" {ok} ok · {warn} warn · {} down ", crit + down)
             }
-            if !self.problems.is_empty() {
-                hint.push_str("   v problems");
+            3 => {
+                let host = self.files.host.as_deref().unwrap_or("no host");
+                format!(" {host} ")
             }
-            hint
+            4 => format!(" {} sessions ", self.sessions.tab_count()),
+            5 => format!(" {} entries ", self.log.visible.len()),
+            _ => String::new(),
         };
-        let style = if self.toast.is_some() {
-            self.theme.warning().bg(self.theme.panel)
+        if text.trim().is_empty() {
+            Line::from("")
         } else {
-            self.theme.muted().bg(self.theme.panel)
-        };
-        frame.render_widget(Paragraph::new(text).style(style), area);
+            Line::from(Span::styled(text, self.theme.muted().bg(self.theme.panel)))
+        }
     }
 
     fn draw_modal(&self, frame: &mut Frame, area: Rect, modal: Modal) {
@@ -2489,6 +2626,52 @@ fn screen_index(name: &str) -> Option<u8> {
         "log" => Some(5),
         _ => None,
     }
+}
+
+/// One-row wordmark pinned to the top-right of the header.
+fn brand_mark(theme: &Theme) -> Line<'static> {
+    let edge = if theme.no_color {
+        Style::new().add_modifier(Modifier::BOLD)
+    } else {
+        Style::new().fg(theme.highlight)
+    };
+    let letter = if theme.no_color {
+        Style::new().add_modifier(Modifier::BOLD)
+    } else {
+        Style::new().fg(theme.title).add_modifier(Modifier::BOLD)
+    };
+    let dash = if theme.no_color {
+        Style::new().add_modifier(Modifier::BOLD)
+    } else {
+        Style::new()
+            .fg(theme.highlight)
+            .add_modifier(Modifier::BOLD)
+    };
+    Line::from(vec![
+        Span::raw(" "),
+        Span::styled("╭", edge),
+        Span::styled("v", letter),
+        Span::styled("-", dash),
+        Span::styled("con", letter),
+        Span::styled("╮", edge),
+    ])
+}
+
+fn hint_line(theme: &Theme, items: &[(&str, &str)]) -> Line<'static> {
+    let mut spans = Vec::new();
+    for (index, (key, label)) in items.iter().enumerate() {
+        if index > 0 {
+            spans.push(Span::raw(" "));
+        }
+        spans.push(Span::styled(format!(" {key} "), theme.key_style()));
+        if !label.is_empty() {
+            spans.push(Span::styled(
+                format!(" {label}"),
+                theme.muted().bg(theme.panel),
+            ));
+        }
+    }
+    Line::from(spans)
 }
 
 fn format_prefix((code, modifiers): (KeyCode, KeyModifiers)) -> String {

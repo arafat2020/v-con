@@ -12,7 +12,7 @@ use ratatui::layout::{Constraint, Layout, Rect};
 use ratatui::style::{Modifier, Style};
 use ratatui::text::{Line, Span};
 use ratatui::widgets::{
-    Axis, Block, Cell, Chart, Dataset, GraphType, Paragraph, Row, Table, TableState, Wrap,
+    Axis, Cell, Chart, Dataset, GraphType, Paragraph, Row, Table, TableState, Wrap,
 };
 use std::collections::{BTreeMap, VecDeque};
 
@@ -401,7 +401,8 @@ pub fn draw(
         .header(header)
         .style(theme.text())
         .block(
-            Block::bordered()
+            theme
+                .block()
                 .title(Span::styled(title, theme.title()))
                 .title_bottom(Line::styled(filter_note, theme.muted()))
                 .border_style(theme.border()),
@@ -427,8 +428,10 @@ fn draw_detail(frame: &mut Frame, area: Rect, view: &HealthView, name: &str, the
     let host = view.hosts.get(name);
     let report = host.and_then(|host| host.report.as_ref());
     let history = host.map(|host| &host.history);
+    let reachable = report.is_some_and(|report| report.reachable);
+    let summary_height = if reachable { 11 } else { 5 };
     let chunks = Layout::vertical([
-        Constraint::Length(9),
+        Constraint::Length(summary_height),
         Constraint::Percentage(34),
         Constraint::Percentage(33),
         Constraint::Percentage(33),
@@ -436,16 +439,53 @@ fn draw_detail(frame: &mut Frame, area: Rect, view: &HealthView, name: &str, the
     .split(area);
 
     let summary = detail_summary(name, report, theme);
-    frame.render_widget(
-        Paragraph::new(summary)
-            .block(
-                Block::bordered()
-                    .title(Span::styled(format!(" {name} "), theme.title()))
-                    .border_style(theme.border()),
-            )
-            .wrap(Wrap { trim: false }),
-        chunks[0],
-    );
+    let block = theme
+        .block()
+        .title(Span::styled(format!(" {name} "), theme.title()))
+        .border_style(theme.border());
+    let inner = block.inner(chunks[0]);
+    frame.render_widget(block, chunks[0]);
+    if reachable {
+        let parts = Layout::vertical([
+            Constraint::Length(1),
+            Constraint::Length(1),
+            Constraint::Length(1),
+            Constraint::Length(1),
+            Constraint::Min(0),
+        ])
+        .split(inner);
+        let head = summary.first().cloned().unwrap_or_else(|| Line::from(""));
+        let tail = if summary.len() > 1 {
+            summary[1..].to_vec()
+        } else {
+            Vec::new()
+        };
+        frame.render_widget(Paragraph::new(head), parts[0]);
+        draw_usage_gauge(
+            frame,
+            parts[1],
+            "cpu",
+            report.and_then(|r| r.cpu_pct),
+            theme,
+        );
+        draw_usage_gauge(
+            frame,
+            parts[2],
+            "mem",
+            report.and_then(|r| r.mem_pct),
+            theme,
+        );
+        draw_usage_gauge(
+            frame,
+            parts[3],
+            "disk",
+            report.and_then(|r| r.disk_pct),
+            theme,
+        );
+        frame.render_widget(Paragraph::new(tail).wrap(Wrap { trim: false }), parts[4]);
+    } else {
+        frame.render_widget(Paragraph::new(summary).wrap(Wrap { trim: false }), inner);
+    }
 
     draw_history_chart(
         frame,
@@ -494,9 +534,6 @@ fn detail_summary(name: &str, report: Option<&HealthReport>, theme: &Theme) -> V
                     theme.muted(),
                 ),
             ])];
-            lines.push(usage_bar_line("cpu", report.cpu_pct, theme));
-            lines.push(usage_bar_line("mem", report.mem_pct, theme));
-            lines.push(usage_bar_line("disk", report.disk_pct, theme));
             lines.push(Line::from(vec![
                 Span::styled("load ", theme.muted()),
                 Span::styled(load(report.load1), theme.text()),
@@ -544,14 +581,17 @@ fn detail_summary(name: &str, report: Option<&HealthReport>, theme: &Theme) -> V
     }
 }
 
-fn usage_bar_line(label: &str, value: Option<f64>, theme: &Theme) -> Line<'static> {
-    let pct_val = value.unwrap_or(0.0);
+fn draw_usage_gauge(frame: &mut Frame, area: Rect, label: &str, value: Option<f64>, theme: &Theme) {
+    let pct_val = value.unwrap_or(0.0).clamp(0.0, 100.0);
     let style = usage_style(pct_val, theme);
-    Line::from(vec![
-        Span::styled(format!("{label:<4} "), theme.muted()),
-        Span::styled(format!("{:<24}", bar(pct_val, 24)), style),
-        Span::styled(format!(" {:>4}", pct(value)), style),
-    ])
+    let gauge = ratatui::widgets::LineGauge::default()
+        .ratio(pct_val / 100.0)
+        .label(format!("{label:<4} {pct_val:>3.0}%"))
+        .filled_style(style)
+        .unfilled_style(theme.border())
+        .filled_symbol(ratatui::symbols::line::THICK_HORIZONTAL)
+        .unfilled_symbol("╌");
+    frame.render_widget(gauge, area);
 }
 
 fn usage_style(pct: f64, theme: &Theme) -> Style {
@@ -581,7 +621,8 @@ fn draw_history_chart(
     if values.is_empty() {
         frame.render_widget(
             Paragraph::new("no samples yet").style(theme.muted()).block(
-                Block::bordered()
+                theme
+                    .block()
                     .title(Span::styled(format!(" {label} "), theme.title()))
                     .border_style(theme.border()),
             ),
@@ -623,7 +664,8 @@ fn draw_history_chart(
         .data(&data);
     let chart = Chart::new(vec![dataset])
         .block(
-            Block::bordered()
+            theme
+                .block()
                 .title(Span::styled(title, theme.title()))
                 .border_style(theme.border()),
         )

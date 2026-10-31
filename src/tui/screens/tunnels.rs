@@ -9,7 +9,7 @@ use crossterm::event::KeyCode;
 use ratatui::Frame;
 use ratatui::layout::{Constraint, Layout, Rect};
 use ratatui::text::{Line, Span};
-use ratatui::widgets::{Block, Clear, Paragraph, Wrap};
+use ratatui::widgets::{Clear, Paragraph, Wrap};
 
 /// Result of a key in the tunnels panel.
 #[derive(Debug, Clone, PartialEq, Eq)]
@@ -178,7 +178,8 @@ pub fn draw(
         Paragraph::new(lines)
             .style(theme.text())
             .block(
-                Block::bordered()
+                theme
+                    .block()
                     .title(Span::styled(
                         format!(" Tunnels — {} ", view.host),
                         theme.title(),

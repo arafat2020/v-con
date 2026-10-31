@@ -1,1 +1,6 @@
+temp_auto_push.bat
 /target
+.gitignore
+branch_structure.json
+config.bat
+node_modules
