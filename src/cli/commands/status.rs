@@ -4,6 +4,7 @@ use crate::config::Config;
 use crate::domain::health::{HealthReport, HealthStatus, format_rate};
 use crate::domain::selector::{evaluate_selector, parse_selector};
 use crate::error::Error;
+use crate::infra::secrets;
 use crate::infra::ssh::system::SystemSsh;
 use crate::paths::Paths;
 use crate::services::health::{self, HealthSettings};
@@ -52,7 +53,7 @@ pub fn run(
     let program = crate::infra::ssh::system::find_ssh()?;
     let settings =
         HealthSettings::from_config(&config.health, config.parallel.max(1), program.clone());
-    let targets = health::health_targets(
+    let targets = health::health_targets_auth(
         &bundle.hosts,
         Some(
             &hosts
@@ -62,6 +63,8 @@ pub fn run(
         ),
         config.multiplexing,
         &paths.control_dir(),
+        secrets::system_store().as_ref(),
+        &paths.cache_dir,
     );
     let runner = Arc::new(SystemSsh::new(program));
     let reports = tokio::runtime::Builder::new_current_thread()

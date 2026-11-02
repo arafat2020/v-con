@@ -117,6 +117,8 @@ pub struct ViewOptions<'a> {
     pub health: &'a BTreeMap<String, HealthStatus>,
     /// Active tunnels for the cursor host (detail pane).
     pub active_tunnels: &'a [String],
+    /// Whether the cursor host has a login password in the OS keychain.
+    pub keychain: bool,
 }
 
 impl HostsView {
@@ -374,7 +376,7 @@ pub fn draw(
     }
 
     let (main, detail) = if show_detail {
-        let chunks = Layout::vertical([Constraint::Min(3), Constraint::Length(8)]).split(area);
+        let chunks = Layout::vertical([Constraint::Min(3), Constraint::Length(9)]).split(area);
         (chunks[0], Some(chunks[1]))
     } else {
         (area, None)
@@ -608,6 +610,7 @@ fn draw_detail(
         hosts,
         &SshCommandOptions {
             batch_mode: false,
+            password_auth: false,
             connect_timeout: None,
             multiplexing: options.multiplexing,
             control_path_dir: options
@@ -630,6 +633,15 @@ fn draw_detail(
     ));
     lines.push(detail_field(options.theme, "tags", tags));
     lines.push(detail_field(options.theme, "notes", notes.to_string()));
+    lines.push(detail_field(
+        options.theme,
+        "keychain",
+        if options.keychain {
+            "saved".to_string()
+        } else {
+            "not saved".to_string()
+        },
+    ));
     if !options.active_tunnels.is_empty() {
         lines.push(detail_field(
             options.theme,

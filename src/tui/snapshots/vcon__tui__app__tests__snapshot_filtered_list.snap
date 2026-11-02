@@ -15,7 +15,6 @@ expression: screen
 │                      ││                                                      │
 │                      ││                                                      │
 │                      ││                                                      │
-│                      ││                                                      │
 └──────────────────────┘└──────────────────────────────────────────────────────┘
 ┌ web-1 ───────────────────────────────────────────────────────────────────────┐
 │connect  deploy@203.0.113.10:22                                               │
@@ -23,6 +22,7 @@ expression: screen
 │identity ssh default                                                          │
 │tags     web, prod                                                            │
 │notes    Main nginx box                                                       │
+│keychain not saved                                                            │
 │ssh      ssh -J admin@198.51.100.5 deploy@203.0.113.10                        │
 └──────────────────────────────────────────────────────────────────────────────┘
  ⏎  connect  o  session  s  snippet  t  tunnel  x  exec  a  add  e  edit  d  del

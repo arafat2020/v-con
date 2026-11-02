@@ -10,7 +10,7 @@ mod sftp;
 pub use fake::FakeFs;
 pub use local::LocalFs;
 pub use path::{file_name, join, normalize, parent_of};
-pub use sftp::{SftpFs, sftp_arguments};
+pub use sftp::{SftpFs, sftp_arguments, sftp_arguments_auth};
 
 use crate::error::Error;
 use std::future::Future;

@@ -6,7 +6,10 @@
 //! host does not stop the others.
 
 use crate::domain::host::EffectiveHost;
+use crate::infra::secrets::{self, AskpassMode, SecretStore};
+use crate::infra::ssh::command::{SshCommandOptions, exec_arguments, exec_arguments_auth};
 use std::collections::BTreeSet;
+use std::path::Path;
 use std::sync::Arc;
 use std::time::{Duration, Instant};
 use tokio::sync::{Semaphore, mpsc};
@@ -137,6 +140,49 @@ pub struct HostTarget {
     pub name: String,
     /// Arguments after the ssh binary, including the remote command as the last item.
     pub args: Vec<String>,
+    /// Askpass environment. Empty unless this host has a keychain password.
+    pub askpass: Vec<(String, String)>,
+}
+
+/// One exec target. Uses a saved keychain password when `store` has one.
+///
+/// `options.password_auth` is ignored. The store decides that.
+pub fn authenticated_target(
+    store: &dyn SecretStore,
+    cache_dir: &Path,
+    host: &EffectiveHost,
+    hosts: &[EffectiveHost],
+    remote_command: &str,
+    mode: AskpassMode,
+    options: &SshCommandOptions,
+) -> HostTarget {
+    let auth = secrets::saved_auth(store, cache_dir, host, mode);
+    let control = options.control_path_dir.as_deref();
+    let args = if auth.password_auth {
+        exec_arguments_auth(
+            host,
+            hosts,
+            options.connect_timeout,
+            options.multiplexing,
+            control,
+            remote_command,
+            true,
+        )
+    } else {
+        exec_arguments(
+            host,
+            hosts,
+            options.connect_timeout,
+            options.multiplexing,
+            control,
+            remote_command,
+        )
+    };
+    HostTarget {
+        name: host.name.clone(),
+        args,
+        askpass: auth.env,
+    }
 }
 
 /// How a single host ended.
@@ -243,6 +289,7 @@ pub trait ExecRunner: Send + Sync + 'static {
         self: Arc<Self>,
         host: String,
         args: Vec<String>,
+        askpass: Vec<(String, String)>,
         timeout: Duration,
         cancel: CancellationToken,
         lines: mpsc::Sender<JobEvent>,
@@ -328,6 +375,7 @@ async fn run_one<R: ExecRunner>(
         .run(
             target.name.clone(),
             target.args,
+            target.askpass,
             timeout,
             host_cancel,
             events.clone(),
@@ -516,6 +564,7 @@ mod tests {
             self: Arc<Self>,
             host: String,
             _args: Vec<String>,
+            _askpass: Vec<(String, String)>,
             timeout: Duration,
             cancel: CancellationToken,
             lines: mpsc::Sender<JobEvent>,
@@ -583,6 +632,7 @@ mod tests {
         HostTarget {
             name: name.to_string(),
             args: vec![name.to_string()],
+            askpass: Vec::new(),
         }
     }
 

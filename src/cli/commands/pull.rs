@@ -2,7 +2,8 @@
 
 use crate::config::Config;
 use crate::error::Error;
-use crate::infra::remote_fs::{LocalFs, SftpFs, normalize, sftp_arguments};
+use crate::infra::remote_fs::{LocalFs, SftpFs, normalize, sftp_arguments_auth};
+use crate::infra::secrets::{self, AskpassMode};
 use crate::paths::Paths;
 use crate::services::files::{copy_file, plan_copies};
 use crate::services::inventory::InventoryBundle;
@@ -46,19 +47,26 @@ pub fn run(
     let control = config
         .multiplexing
         .then(|| paths.control_dir().display().to_string());
-    let args = sftp_arguments(
+    let auth = secrets::saved_auth(
+        secrets::system_store().as_ref(),
+        &paths.cache_dir,
+        host,
+        AskpassMode::Force,
+    );
+    let args = sftp_arguments_auth(
         host,
         &bundle.hosts,
         Some(SFTP_CONNECT_TIMEOUT),
         config.multiplexing,
         control.as_deref(),
+        auth.password_auth,
     );
     let runtime = tokio::runtime::Builder::new_current_thread()
         .enable_all()
         .build()
         .map_err(|error| Error::Message(error.to_string()))?;
     let failed = runtime.block_on(async {
-        let remote = Arc::new(SftpFs::connect(program, args).await?);
+        let remote = Arc::new(SftpFs::connect_with_env(program, args, &auth.env).await?);
         let planned = plan_copies(remote.as_ref(), &LocalFs, &remote_source, &local_dest).await?;
         let cancel = CancellationToken::new();
         let mut any_failed = false;

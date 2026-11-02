@@ -26,8 +26,28 @@ pub fn sftp_arguments(
     multiplexing: bool,
     control_dir: Option<&str>,
 ) -> Vec<String> {
+    sftp_arguments_auth(
+        host,
+        hosts,
+        connect_timeout,
+        multiplexing,
+        control_dir,
+        false,
+    )
+}
+
+/// [`sftp_arguments`], using a saved keychain password when `password_auth` is set.
+pub fn sftp_arguments_auth(
+    host: &EffectiveHost,
+    hosts: &[EffectiveHost],
+    connect_timeout: Option<u64>,
+    multiplexing: bool,
+    control_dir: Option<&str>,
+    password_auth: bool,
+) -> Vec<String> {
     let options = SshCommandOptions {
-        batch_mode: true,
+        batch_mode: !password_auth,
+        password_auth,
         connect_timeout,
         multiplexing,
         control_path_dir: control_dir.map(str::to_string),
@@ -58,20 +78,28 @@ pub struct SftpFs {
 
 impl SftpFs {
     /// Spawn `program` with `args` (already including `-s sftp`) and handshake.
-    pub async fn connect(program: PathBuf, args: Vec<String>) -> Result<Self, Error> {
-        let mut child = Command::new(&program)
+    ///
+    /// `env` must not contain the password. The askpass helper reads that
+    /// from the OS keychain. Pass an empty slice when no password is saved.
+    pub async fn connect_with_env(
+        program: PathBuf,
+        args: Vec<String>,
+        env: &[(String, String)],
+    ) -> Result<Self, Error> {
+        let mut command = Command::new(&program);
+        command
             .args(&args)
             .stdin(std::process::Stdio::piped())
             .stdout(std::process::Stdio::piped())
             .stderr(std::process::Stdio::piped())
             .kill_on_drop(true)
-            .spawn()
-            .map_err(|source| {
-                Error::Message(format!(
-                    "could not start ssh sftp ({}): {source}",
-                    program.display()
-                ))
-            })?;
+            .envs(env.iter().cloned());
+        let mut child = command.spawn().map_err(|source| {
+            Error::Message(format!(
+                "could not start ssh sftp ({}): {source}",
+                program.display()
+            ))
+        })?;
         let stdin = child
             .stdin
             .take()

@@ -6,6 +6,7 @@ pub mod health;
 pub mod inventory_store;
 pub mod pty;
 pub mod remote_fs;
+pub mod secrets;
 pub mod ssh;
 pub mod ssh_config;
 pub mod state_store;

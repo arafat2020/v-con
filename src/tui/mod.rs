@@ -16,8 +16,9 @@ mod widgets;
 
 use crate::config::Config;
 use crate::error::Error;
-use crate::infra::remote_fs::{LocalFs, RemoteFs, SftpFs, normalize, parent_of, sftp_arguments};
-use crate::infra::ssh::backend::SshBackend;
+use crate::infra::remote_fs::{
+    LocalFs, RemoteFs, SftpFs, normalize, parent_of, sftp_arguments, sftp_arguments_auth,
+};
 use crate::infra::ssh::system::{self, SystemSsh};
 use crate::infra::state_store;
 use crate::paths::Paths;
@@ -485,13 +486,22 @@ fn handle_tunnels_command(
                 .ok_or_else(|| Error::Message(format!("no host `{host}`")))?;
             let host_owned = host_ref.clone();
             let hosts = app.effective_hosts().to_vec();
+            let auth = crate::infra::secrets::saved_auth(
+                app.secrets(),
+                app.cache_dir(),
+                &host_owned,
+                crate::infra::secrets::AskpassMode::Force,
+            );
+            let mut options =
+                connect::session_options(app.multiplexing_enabled(), app.control_dir_path());
+            options.password_auth = auth.password_auth;
             live.manager.start(
                 &host_owned,
                 &hosts,
                 label.clone(),
                 spec.clone(),
-                app.multiplexing_enabled(),
-                app.control_dir_path(),
+                &options,
+                &auth.env,
             )?;
             app.audit_tunnel_start(&host, &label, &spec);
             app.set_running_tunnels(live.manager.list());
@@ -582,10 +592,32 @@ fn open_session(
         .cloned()
         .or_else(|| system::find_program("ssh", std::env::var_os("PATH").as_deref()))
         .ok_or_else(|| Error::Message(system::missing_ssh_message().to_string()))?;
-    let options = connect::session_options(app.multiplexing_enabled(), app.control_dir_path());
+    let host_ref = app
+        .effective_hosts()
+        .iter()
+        .find(|candidate| candidate.name == host)
+        .cloned();
+    let mut options = connect::session_options(app.multiplexing_enabled(), app.control_dir_path());
+    let askpass = if let Some(host_ref) = host_ref.as_ref() {
+        let auth = crate::infra::secrets::saved_auth(
+            app.secrets(),
+            app.cache_dir(),
+            host_ref,
+            crate::infra::secrets::AskpassMode::Prefer,
+        );
+        options.password_auth = auth.password_auth;
+        auth.env
+    } else {
+        Vec::new()
+    };
     let plan = connect::prepare(app.effective_hosts(), app.state_path(), &options, host)?;
     let _ = state_store::save(app.state_path(), app.state());
-    live.manager.open(host, &program, &plan.args, rows, cols)
+    if askpass.is_empty() {
+        live.manager.open(host, &program, &plan.args, rows, cols)
+    } else {
+        live.manager
+            .open_with_env(host, &program, &plan.args, &askpass, rows, cols)
+    }
 }
 
 async fn handle_files_command(
@@ -705,14 +737,31 @@ async fn connect_files_host(
     let control = app
         .multiplexing_enabled()
         .then(|| app.control_dir_path().display().to_string());
-    let args = sftp_arguments(
+    let auth = crate::infra::secrets::saved_auth(
+        app.secrets(),
+        app.cache_dir(),
         &host,
-        app.effective_hosts(),
-        Some(SFTP_CONNECT_TIMEOUT),
-        app.multiplexing_enabled(),
-        control.as_deref(),
+        crate::infra::secrets::AskpassMode::Force,
     );
-    match SftpFs::connect(program, args).await {
+    let args = if auth.password_auth {
+        sftp_arguments_auth(
+            &host,
+            app.effective_hosts(),
+            Some(SFTP_CONNECT_TIMEOUT),
+            app.multiplexing_enabled(),
+            control.as_deref(),
+            true,
+        )
+    } else {
+        sftp_arguments(
+            &host,
+            app.effective_hosts(),
+            Some(SFTP_CONNECT_TIMEOUT),
+            app.multiplexing_enabled(),
+            control.as_deref(),
+        )
+    };
+    match SftpFs::connect_with_env(program, args, &auth.env).await {
         Ok(session) => {
             live.remote = Some(Arc::new(session));
             if let Some(sftp) = live.remote.as_ref() {
@@ -1021,7 +1070,7 @@ fn execute_handoff(handoff: Handoff) -> SessionEnd {
             println!("{}", spec.banner);
             let _ = io::stdout().flush();
             let ssh = SystemSsh::new(spec.program);
-            SessionEnd::Connect(ssh.interactive(&spec.args))
+            SessionEnd::Connect(ssh.interactive_with(&spec.args, &spec.askpass))
         }
         Handoff::Editor(spec) => {
             let status = Command::new(spec.program)

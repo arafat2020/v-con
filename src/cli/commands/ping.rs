@@ -3,7 +3,8 @@
 use crate::config::Config;
 use crate::domain::selector::{evaluate_selector, parse_selector};
 use crate::error::Error;
-use crate::infra::ssh::command::exec_arguments;
+use crate::infra::secrets::{self, AskpassMode};
+use crate::infra::ssh::command::SshCommandOptions;
 use crate::infra::ssh::system::SystemSsh;
 use crate::paths::Paths;
 use crate::services::exec::{self as job, EndStatus, HostTarget};
@@ -56,18 +57,26 @@ pub fn run(
     let timeout = Duration::from_secs(request.timeout.unwrap_or(10).max(1));
     let parallel = request.parallel.unwrap_or(config.parallel).max(1);
     let control = paths.control_dir().display().to_string();
+    let store = secrets::system_store();
+    let options = SshCommandOptions {
+        batch_mode: true,
+        password_auth: false,
+        connect_timeout: Some(timeout.as_secs()),
+        multiplexing: config.multiplexing,
+        control_path_dir: Some(control),
+    };
     let targets: Vec<HostTarget> = hosts
         .iter()
-        .map(|host| HostTarget {
-            name: host.name.clone(),
-            args: exec_arguments(
+        .map(|host| {
+            job::authenticated_target(
+                store.as_ref(),
+                &paths.cache_dir,
                 host,
                 &bundle.hosts,
-                Some(timeout.as_secs()),
-                config.multiplexing,
-                Some(&control),
                 "true",
-            ),
+                AskpassMode::Force,
+                &options,
+            )
         })
         .collect();
 

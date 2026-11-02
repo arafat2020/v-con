@@ -9,10 +9,9 @@ use crate::domain::host::EffectiveHost;
 use crate::domain::tunnel::TunnelSpec;
 use crate::error::Error;
 use crate::infra::ssh::command::{SshCommandOptions, build_ssh_command, command_line};
-use crate::services::connect;
 use std::collections::HashMap;
 use std::net::TcpListener;
-use std::path::{Path, PathBuf};
+use std::path::PathBuf;
 use std::process::{Child, Command, Stdio};
 use std::sync::atomic::{AtomicU64, Ordering};
 use std::sync::{Arc, Mutex};
@@ -101,14 +100,13 @@ impl TunnelManager {
         hosts: &[EffectiveHost],
         label: impl Into<String>,
         spec: TunnelSpec,
-        multiplexing: bool,
-        control_dir: &Path,
+        options: &SshCommandOptions,
+        env: &[(String, String)],
     ) -> Result<TunnelId, Error> {
         if let Some(port) = spec.local_listen_port() {
             ensure_local_port_free(port)?;
         }
-        let options = connect::session_options(multiplexing, control_dir);
-        let args = plan_forward_args(host, hosts, &options, &spec);
+        let args = plan_forward_args(host, hosts, options, &spec);
         let label = label.into();
         let mut displayed = vec![self.program.display().to_string()];
         displayed.extend(args.iter().cloned());
@@ -116,6 +114,7 @@ impl TunnelManager {
 
         let child = Command::new(&self.program)
             .args(&args)
+            .envs(env.iter().cloned())
             .stdin(Stdio::null())
             .stdout(Stdio::null())
             .stderr(Stdio::piped())
@@ -326,6 +325,7 @@ mod tests {
         let host = host();
         let options = SshCommandOptions {
             batch_mode: false,
+            password_auth: false,
             connect_timeout: None,
             multiplexing: false,
             control_path_dir: None,
