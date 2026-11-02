@@ -111,6 +111,7 @@ impl TunnelManager {
         let mut displayed = vec![self.program.display().to_string()];
         displayed.extend(args.iter().cloned());
         tracing::debug!(command = %command_line(&displayed), "starting tunnel");
+        crate::infra::ssh::system::release_dead_master(&self.program, &args);
 
         let child = Command::new(&self.program)
             .args(&args)

@@ -1867,17 +1867,20 @@ impl App {
 
     /// Show a modal when ssh could not start a shell.
     pub fn note_session_exit(&mut self, status: &ExitStatus) {
-        match status.code() {
-            Some(255) => {
-                self.modal = Some(Modal::Error(
-                    "ssh exited with code 255. The session failed before a shell started."
-                        .to_string(),
-                ));
-            }
-            Some(_) => {}
-            None => self.toast("ssh was interrupted"),
+        if self.dropped_connection(status) {
+            self.toast("Connection lost. Enter reconnects. P saves the password.");
         }
         self.dirty = true;
+    }
+
+    /// A live ssh that died, rather than a shell the user exited.
+    pub fn dropped_connection(&self, status: &ExitStatus) -> bool {
+        status.code() == Some(255) || status.code().is_none()
+    }
+
+    /// Reconnect without a prompt when this host's password is already saved.
+    pub fn can_reconnect_without_password(&self, host: &str, status: &ExitStatus) -> bool {
+        self.dropped_connection(status) && self.secrets.contains(host).unwrap_or(false)
     }
 
     /// Show a modal when the ssh process could not be spawned.
@@ -2357,15 +2360,46 @@ impl App {
     }
 
     /// Apply a session manager event.
-    pub fn apply_session_event(&mut self, event: SessionEvent) {
+    pub fn apply_session_event(&mut self, event: SessionEvent) -> Option<SessionsCommand> {
         match event {
             SessionEvent::Output(id) => {
                 self.sessions.note_output(id);
+                self.sessions.saw_output.insert(id);
+                if let Some(host) = self.sessions.hosts.get(&id) {
+                    self.sessions.reconnect_guard.remove(host);
+                }
                 self.dirty = true;
+                None
             }
             SessionEvent::Exited { id, code } => {
+                let host = self.sessions.hosts.get(&id).cloned();
+                let saw = self.sessions.saw_output.remove(&id);
                 self.sessions.mark_ended(id, code);
                 self.dirty = true;
+                let lost = code == Some(255) || code.is_none();
+                if saw
+                    && lost
+                    && let Some(host) = host
+                {
+                    let saved = self.secrets.contains(&host).unwrap_or(false);
+                    if saved && self.sessions.reconnect_guard.insert(host.clone()) {
+                        let (rows, cols) = self
+                            .sessions
+                            .last_sizes
+                            .get(&id)
+                            .copied()
+                            .unwrap_or_else(|| self.default_session_size());
+                        self.toast("connection lost, reconnecting");
+                        return Some(SessionsCommand::Reconnect {
+                            id,
+                            host,
+                            rows,
+                            cols,
+                        });
+                    }
+                    self.toast("Connection lost. Enter reconnects. P saves the password.");
+                }
+                None
             }
         }
     }
@@ -3195,7 +3229,7 @@ mod tests {
     }
 
     #[test]
-    fn ssh_255_opens_an_error_modal() {
+    fn ssh_255_lets_enter_reconnect() {
         let mut app = preview(fleet());
         let status = std::process::Command::new("sh")
             .arg("-c")
@@ -3203,11 +3237,36 @@ mod tests {
             .status()
             .unwrap();
         app.note_session_exit(&status);
-        assert!(matches!(app.modal, Some(Modal::Error(ref text)) if text.contains("255")));
-        app.on_key(KeyCode::Enter, KeyModifiers::NONE);
-        assert!(app.modal.is_some());
-        app.on_key(KeyCode::Esc, KeyModifiers::NONE);
         assert!(app.modal.is_none());
+        assert!(
+            app.toast
+                .as_ref()
+                .is_some_and(|(text, _)| text.contains("Connection lost"))
+        );
+        let commands = app.on_key(KeyCode::Enter, KeyModifiers::NONE);
+        assert!(matches!(
+            commands.as_slice(),
+            [UiCommand::Persist, UiCommand::Suspend(Handoff::Connect(_))]
+        ));
+    }
+
+    #[test]
+    fn saved_password_reconnects_a_dropped_session() {
+        let app = preview(fleet());
+        app.secrets.set("web-1", "s3cret").unwrap();
+        let status = std::process::Command::new("sh")
+            .arg("-c")
+            .arg("exit 255")
+            .status()
+            .unwrap();
+        assert!(app.can_reconnect_without_password("web-1", &status));
+        let clean = std::process::Command::new("sh")
+            .arg("-c")
+            .arg("exit 0")
+            .status()
+            .unwrap();
+        assert!(!app.can_reconnect_without_password("web-1", &clean));
+        assert!(!app.can_reconnect_without_password("db-1", &status));
     }
 
     #[test]

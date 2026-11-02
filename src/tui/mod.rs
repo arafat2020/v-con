@@ -133,10 +133,14 @@ async fn event_loop(
             session_event = live_sessions.events.recv() => {
                 if let Some(event) = session_event {
                     apply_session_side_effects(app, &live_sessions, &event);
-                    app.apply_session_event(event);
+                    if let Some(command) = app.apply_session_event(event) {
+                        effects.sessions.push(command);
+                    }
                     while let Ok(event) = live_sessions.events.try_recv() {
                         apply_session_side_effects(app, &live_sessions, &event);
-                        app.apply_session_event(event);
+                        if let Some(command) = app.apply_session_event(event) {
+                            effects.sessions.push(command);
+                        }
                     }
                 }
             }
@@ -532,7 +536,14 @@ fn handle_sessions_command(
             cols,
             place,
         } => {
-            let id = open_session(app, live, &host, rows, cols)?;
+            let id = open_session(
+                app,
+                live,
+                &host,
+                rows,
+                cols,
+                crate::infra::secrets::AskpassMode::Prefer,
+            )?;
             app.session_opened(id, host, place);
             for command in app.session_resize_commands() {
                 if let UiCommand::Sessions(sessions) = command {
@@ -572,7 +583,14 @@ fn handle_sessions_command(
             cols,
         } => {
             live.manager.close(id);
-            let new_id = open_session(app, live, &host, rows, cols)?;
+            let new_id = open_session(
+                app,
+                live,
+                &host,
+                rows,
+                cols,
+                crate::infra::secrets::AskpassMode::Force,
+            )?;
             app.session_reconnected(id, new_id, host);
             live.manager.resize(new_id, rows, cols)?;
         }
@@ -586,6 +604,7 @@ fn open_session(
     host: &str,
     rows: u16,
     cols: u16,
+    mode: crate::infra::secrets::AskpassMode,
 ) -> Result<crate::services::sessions::SessionId, Error> {
     let program = app
         .ssh_program()
@@ -599,12 +618,8 @@ fn open_session(
         .cloned();
     let mut options = connect::session_options(app.multiplexing_enabled(), app.control_dir_path());
     let askpass = if let Some(host_ref) = host_ref.as_ref() {
-        let auth = crate::infra::secrets::saved_auth(
-            app.secrets(),
-            app.cache_dir(),
-            host_ref,
-            crate::infra::secrets::AskpassMode::Prefer,
-        );
+        let auth =
+            crate::infra::secrets::saved_auth(app.secrets(), app.cache_dir(), host_ref, mode);
         options.password_auth = auth.password_auth;
         auth.env
     } else {
@@ -1042,19 +1057,39 @@ async fn run_handoff(
     app: &mut App,
     handoff: Handoff,
 ) -> Result<(), Error> {
-    terminal::suspend(terminal).map_err(|error| Error::Message(error.to_string()))?;
-    let mouse = app.mouse();
-    let joined = tokio::task::spawn_blocking(move || execute_handoff(handoff)).await;
-    terminal::resume(terminal, mouse).map_err(|error| Error::Message(error.to_string()))?;
-    drain_keys();
-    match joined {
-        Ok(SessionEnd::Connect(Ok(status))) => app.note_session_exit(&status),
-        Ok(SessionEnd::Connect(Err(error))) => app.note_session_error(&error),
-        Ok(SessionEnd::Editor(Ok(_))) => app.reload_inventory(),
-        Ok(SessionEnd::Editor(Err(error))) => {
-            app.show_error(format!("could not start editor: {error}"))
+    let mut attempt = 0;
+    loop {
+        terminal::suspend(terminal).map_err(|error| Error::Message(error.to_string()))?;
+        let mouse = app.mouse();
+        let task_handoff = handoff.clone();
+        let joined = tokio::task::spawn_blocking(move || execute_handoff(task_handoff)).await;
+        terminal::resume(terminal, mouse).map_err(|error| Error::Message(error.to_string()))?;
+        drain_keys();
+        match joined {
+            Ok(SessionEnd::Connect(Ok(status))) => {
+                let host = match &handoff {
+                    Handoff::Connect(spec) => Some(spec.host_name.clone()),
+                    Handoff::Editor(_) => None,
+                };
+                if attempt == 0
+                    && host
+                        .as_deref()
+                        .is_some_and(|name| app.can_reconnect_without_password(name, &status))
+                {
+                    attempt = 1;
+                    app.toast("connection lost, reconnecting");
+                    continue;
+                }
+                app.note_session_exit(&status);
+            }
+            Ok(SessionEnd::Connect(Err(error))) => app.note_session_error(&error),
+            Ok(SessionEnd::Editor(Ok(_))) => app.reload_inventory(),
+            Ok(SessionEnd::Editor(Err(error))) => {
+                app.show_error(format!("could not start editor: {error}"))
+            }
+            Err(error) => app.show_error(format!("session task failed: {error}")),
         }
-        Err(error) => app.show_error(format!("session task failed: {error}")),
+        break;
     }
     Ok(())
 }

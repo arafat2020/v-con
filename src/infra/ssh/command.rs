@@ -79,6 +79,18 @@ pub fn build_ssh_command(
         args.push(format!("ControlPath={dir}/%C"));
         args.push("-o".to_string());
         args.push("ControlPersist=10m".to_string());
+        // A dead network otherwise leaves the master up, and the next
+        // connection attaches to it and cannot authenticate again.
+        if !host
+            .ssh_options
+            .keys()
+            .any(|key| key.eq_ignore_ascii_case("ServerAliveInterval"))
+        {
+            args.push("-o".to_string());
+            args.push("ServerAliveInterval=15".to_string());
+            args.push("-o".to_string());
+            args.push("ServerAliveCountMax=3".to_string());
+        }
     }
 
     for (key, value) in &host.ssh_options {
@@ -383,5 +395,29 @@ mod tests {
                 .any(|pair| pair == ["-o", "NumberOfPasswordPrompts=1"])
         );
         assert!(!args.iter().any(|arg| arg.contains("password")));
+    }
+
+    #[test]
+    fn multiplexing_sends_keepalives_so_a_dead_link_ends() {
+        let web = host("web-1", "deploy", "203.0.113.10", 22);
+        let args = build_ssh_command(
+            &web,
+            std::slice::from_ref(&web),
+            &SshCommandOptions {
+                batch_mode: false,
+                password_auth: false,
+                connect_timeout: None,
+                multiplexing: true,
+                control_path_dir: Some("/tmp/vcon/cm".into()),
+            },
+        );
+        assert!(
+            args.windows(2)
+                .any(|pair| pair == ["-o", "ServerAliveInterval=15"])
+        );
+        assert!(
+            args.windows(2)
+                .any(|pair| pair == ["-o", "ServerAliveCountMax=3"])
+        );
     }
 }
