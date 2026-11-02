@@ -16,6 +16,9 @@ use std::collections::HashSet;
 pub struct SshCommandOptions {
     /// Pass `-o BatchMode=yes` so ssh never prompts.
     pub batch_mode: bool,
+    /// A password for this host is in the OS keychain. Omit batch mode and
+    /// allow one password prompt, which the askpass helper answers.
+    pub password_auth: bool,
     /// Overrides the host's `connect_timeout` when set.
     pub connect_timeout: Option<u64>,
     /// Emit `ControlMaster`, `ControlPath`, and `ControlPersist` when a directory is set.
@@ -53,9 +56,13 @@ pub fn build_ssh_command(
         args.push(jumps.join(","));
     }
 
-    if options.batch_mode {
+    if options.batch_mode && !options.password_auth {
         args.push("-o".to_string());
         args.push("BatchMode=yes".to_string());
+    }
+    if options.password_auth {
+        args.push("-o".to_string());
+        args.push("NumberOfPasswordPrompts=1".to_string());
     }
 
     if let Some(timeout) = options.connect_timeout.or(host.connect_timeout) {
@@ -86,7 +93,7 @@ pub fn build_ssh_command(
 /// Arguments after the ssh binary for a non-interactive command.
 ///
 /// `remote_command` is one argv element, so the remote shell parses quotes,
-/// `$VARS`, pipes, and `&&`. BatchMode is always on. `ConnectTimeout` uses
+/// `$VARS`, pipes, and `&&`. BatchMode is on. `ConnectTimeout` uses
 /// `connect_timeout` when it is set, otherwise the host default.
 pub fn exec_arguments(
     host: &EffectiveHost,
@@ -96,8 +103,33 @@ pub fn exec_arguments(
     control_dir: Option<&str>,
     remote_command: &str,
 ) -> Vec<String> {
+    exec_arguments_auth(
+        host,
+        hosts,
+        connect_timeout,
+        multiplexing,
+        control_dir,
+        remote_command,
+        false,
+    )
+}
+
+/// [`exec_arguments`], with keychain password auth when `password_auth` is set.
+///
+/// Batch mode stays on unless a password was saved. The password itself is
+/// not placed in the argument list.
+pub fn exec_arguments_auth(
+    host: &EffectiveHost,
+    hosts: &[EffectiveHost],
+    connect_timeout: Option<u64>,
+    multiplexing: bool,
+    control_dir: Option<&str>,
+    remote_command: &str,
+    password_auth: bool,
+) -> Vec<String> {
     let options = SshCommandOptions {
-        batch_mode: true,
+        batch_mode: !password_auth,
+        password_auth,
         connect_timeout,
         multiplexing,
         control_path_dir: control_dir.map(str::to_string),
@@ -232,6 +264,7 @@ mod tests {
             &[bastion.clone(), web.clone()],
             &SshCommandOptions {
                 batch_mode: true,
+                password_auth: false,
                 connect_timeout: None,
                 multiplexing: true,
                 control_path_dir: Some("/tmp/vcon/cm".into()),
@@ -330,5 +363,25 @@ mod tests {
         );
         assert_eq!(args.last().map(String::as_str), Some(command));
         assert!(!args.iter().any(|arg| arg == "ssh"));
+    }
+
+    #[test]
+    fn saved_password_drops_batch_mode_and_limits_prompts() {
+        let web = host("web-1", "deploy", "203.0.113.10", 22);
+        let args = exec_arguments_auth(
+            &web,
+            std::slice::from_ref(&web),
+            Some(15),
+            false,
+            None,
+            "true",
+            true,
+        );
+        assert!(!args.iter().any(|arg| arg == "BatchMode=yes"));
+        assert!(
+            args.windows(2)
+                .any(|pair| pair == ["-o", "NumberOfPasswordPrompts=1"])
+        );
+        assert!(!args.iter().any(|arg| arg.contains("password")));
     }
 }

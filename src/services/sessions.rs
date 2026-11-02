@@ -89,6 +89,19 @@ impl SessionManager {
         rows: u16,
         cols: u16,
     ) -> Result<SessionId, Error> {
+        self.open_with_env(host_name, program, args, &[], rows, cols)
+    }
+
+    /// [`open`](Self::open), with askpass environment for a saved password.
+    pub fn open_with_env(
+        &self,
+        host_name: impl Into<String>,
+        program: &Path,
+        args: &[String],
+        env: &[(String, String)],
+        rows: u16,
+        cols: u16,
+    ) -> Result<SessionId, Error> {
         let host_name = host_name.into();
         let rows = rows.max(1);
         let cols = cols.max(1);
@@ -96,6 +109,9 @@ impl SessionManager {
         let mut cmd = CommandBuilder::new(program);
         cmd.args(&argv);
         cmd.env("TERM", "xterm-256color");
+        for (key, value) in env {
+            cmd.env(key, value);
+        }
 
         let pty_system = NativePtySystem::default();
         let pair = pty_system

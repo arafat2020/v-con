@@ -164,6 +164,7 @@ const HELP_GROUPS: &[(&str, &[Action])] = &[
             Action::OpenTunnels,
             Action::Exec,
             Action::ShowExec,
+            Action::SavePassword,
         ],
     ),
     (
@@ -211,6 +212,7 @@ fn action_help_label(action: &Action) -> &'static str {
         Action::OpenSession => "open an embedded session",
         Action::OpenSnippets => "snippet picker",
         Action::OpenTunnels => "tunnels for the cursor host",
+        Action::SavePassword => "save the login password in the OS keychain",
         Action::Tick
         | Action::CloseModal
         | Action::SearchInsert(_)
@@ -322,6 +324,7 @@ fn defaults() -> HashMap<Binding, Action> {
     bind(KeyCode::Char('o'), KeyModifiers::NONE, Action::OpenSession);
     bind(KeyCode::Char('s'), KeyModifiers::NONE, Action::OpenSnippets);
     bind(KeyCode::Char('t'), KeyModifiers::NONE, Action::OpenTunnels);
+    bind(KeyCode::Char('P'), KeyModifiers::NONE, Action::SavePassword);
     map
 }
 
@@ -349,6 +352,7 @@ fn action_by_name(name: &str) -> Option<Action> {
         "open_session" | "session" => Action::OpenSession,
         "snippets" | "open_snippets" => Action::OpenSnippets,
         "tunnels" | "open_tunnels" => Action::OpenTunnels,
+        "password" => Action::SavePassword,
         "up" => Action::MoveUp,
         "down" => Action::MoveDown,
         _ => return None,

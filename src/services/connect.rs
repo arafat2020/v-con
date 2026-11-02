@@ -24,6 +24,8 @@ pub struct ConnectPlan {
     pub args: Vec<String>,
     /// Full command, for the debug log.
     pub command_line: String,
+    /// Askpass environment. Empty unless a keychain password is saved.
+    pub askpass: Vec<(String, String)>,
 }
 
 /// Resolve a single host name. An unknown name includes a close suggestion.
@@ -61,6 +63,7 @@ pub fn plan(
         banner: banner(host, hosts),
         command_line: command_line(&argv),
         args,
+        askpass: Vec::new(),
     }
 }
 
@@ -70,6 +73,7 @@ pub fn plan(
 pub fn session_options(multiplexing: bool, control_dir: &Path) -> SshCommandOptions {
     SshCommandOptions {
         batch_mode: false,
+        password_auth: false,
         connect_timeout: None,
         multiplexing,
         control_path_dir: multiplexing.then(|| control_dir.display().to_string()),
@@ -125,10 +129,17 @@ pub fn editor_command_from(spec: &str, path: &Path) -> (PathBuf, Vec<String>) {
 
 /// Replace this process with ssh. Only returns when `exec` fails.
 #[cfg(unix)]
-pub fn replace_process(program: &Path, args: &[String]) -> Result<(), Error> {
+pub fn replace_process(
+    program: &Path,
+    args: &[String],
+    env: &[(String, String)],
+) -> Result<(), Error> {
     use std::os::unix::process::CommandExt;
     use std::process::Command;
-    let error = Command::new(program).args(args).exec();
+    let error = Command::new(program)
+        .args(args)
+        .envs(env.iter().cloned())
+        .exec();
     Err(Error::Message(format!(
         "failed to exec {}: {error}",
         program.display()
@@ -137,7 +148,11 @@ pub fn replace_process(program: &Path, args: &[String]) -> Result<(), Error> {
 
 /// Replace this process with ssh. Only Unix can do that.
 #[cfg(not(unix))]
-pub fn replace_process(program: &Path, _args: &[String]) -> Result<(), Error> {
+pub fn replace_process(
+    program: &Path,
+    _args: &[String],
+    _env: &[(String, String)],
+) -> Result<(), Error> {
     Err(Error::Message(format!(
         "vcon connect cannot replace the process on this system ({})",
         program.display()

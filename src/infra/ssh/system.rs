@@ -37,19 +37,29 @@ impl SystemSsh {
             program: program.into(),
         }
     }
-}
 
-impl SshBackend for SystemSsh {
-    fn interactive(&self, args: &[String]) -> io::Result<ExitStatus> {
+    /// [`SshBackend::interactive`], with askpass environment.
+    pub fn interactive_with(
+        &self,
+        args: &[String],
+        env: &[(String, String)],
+    ) -> io::Result<ExitStatus> {
         let mut displayed = vec![self.program.display().to_string()];
         displayed.extend(args.iter().cloned());
         tracing::debug!(command = %command_line(&displayed), "starting ssh");
         Command::new(&self.program)
             .args(args)
+            .envs(env.iter().cloned())
             .stdin(Stdio::inherit())
             .stdout(Stdio::inherit())
             .stderr(Stdio::inherit())
             .status()
+    }
+}
+
+impl SshBackend for SystemSsh {
+    fn interactive(&self, args: &[String]) -> io::Result<ExitStatus> {
+        self.interactive_with(args, &[])
     }
 
     fn forward(&self, args: &[String]) -> Result<(), Error> {
@@ -79,11 +89,12 @@ impl ExecRunner for SystemSsh {
         self: Arc<Self>,
         host: String,
         args: Vec<String>,
+        askpass: Vec<(String, String)>,
         timeout: Duration,
         cancel: CancellationToken,
         lines: mpsc::Sender<JobEvent>,
     ) -> ProcessResult {
-        self.exec_lines(&host, &args, timeout, &cancel, &lines)
+        self.exec_lines(&host, &args, &askpass, timeout, &cancel, &lines)
             .await
     }
 }
@@ -97,6 +108,7 @@ impl SystemSsh {
         &self,
         host: &str,
         args: &[String],
+        env: &[(String, String)],
         timeout: Duration,
         cancel: &CancellationToken,
         lines: &mpsc::Sender<JobEvent>,
@@ -106,6 +118,7 @@ impl SystemSsh {
         tracing::debug!(command = %command_line(&displayed), "starting ssh exec");
         let mut child = match TokioCommand::new(&self.program)
             .args(args)
+            .envs(env.iter().cloned())
             .stdin(Stdio::null())
             .stdout(Stdio::piped())
             .stderr(Stdio::piped())
@@ -378,6 +391,7 @@ mod tests {
             .exec_lines(
                 "web-1",
                 &["echo '$HOME' && true".to_string()],
+                &[],
                 std::time::Duration::from_secs(2),
                 &tokio_util::sync::CancellationToken::new(),
                 &tx,
@@ -413,6 +427,7 @@ mod tests {
         let result = ssh
             .exec_lines(
                 "web-1",
+                &[],
                 &[],
                 std::time::Duration::from_millis(200),
                 &tokio_util::sync::CancellationToken::new(),

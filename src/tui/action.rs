@@ -84,6 +84,8 @@ pub enum Action {
     OpenSnippets,
     /// Open the tunnels panel for the cursor host.
     OpenTunnels,
+    /// Save or clear the cursor host's login password in the OS keychain.
+    SavePassword,
 }
 
 /// Work the event loop performs after `update` returns.
@@ -269,6 +271,8 @@ pub struct ConnectHandoff {
     pub program: std::path::PathBuf,
     /// Arguments after the binary.
     pub args: Vec<String>,
+    /// Askpass environment. Empty unless a keychain password is saved.
+    pub askpass: Vec<(String, String)>,
 }
 
 /// Editor invocation. `args` already includes the file path.

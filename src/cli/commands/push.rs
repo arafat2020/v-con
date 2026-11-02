@@ -3,7 +3,8 @@
 use crate::config::Config;
 use crate::domain::selector::{evaluate_selector, parse_selector};
 use crate::error::Error;
-use crate::infra::remote_fs::{LocalFs, SftpFs, normalize, sftp_arguments};
+use crate::infra::remote_fs::{LocalFs, SftpFs, normalize, sftp_arguments_auth};
+use crate::infra::secrets::{self, AskpassMode};
 use crate::paths::Paths;
 use crate::services::exec::{ConfirmGate, ExecSettings, confirmation_gate, needs_confirmation};
 use crate::services::files::{copy_file, plan_copies};
@@ -89,17 +90,21 @@ pub fn run(
         .enable_all()
         .build()
         .map_err(|error| Error::Message(error.to_string()))?;
+    let store = secrets::system_store();
     let mut failed = false;
     for host in &hosts {
-        let args = sftp_arguments(
+        let auth = secrets::saved_auth(store.as_ref(), &paths.cache_dir, host, AskpassMode::Force);
+        let args = sftp_arguments_auth(
             host,
             &bundle.hosts,
             Some(SFTP_CONNECT_TIMEOUT),
             config.multiplexing,
             control.as_deref(),
+            auth.password_auth,
         );
         let result = runtime.block_on(async {
-            let remote = Arc::new(SftpFs::connect(program.clone(), args).await?);
+            let remote =
+                Arc::new(SftpFs::connect_with_env(program.clone(), args, &auth.env).await?);
             let source = normalize(local_path);
             let planned = plan_copies(&LocalFs, remote.as_ref(), &source, &remote_dir).await?;
             let cancel = CancellationToken::new();

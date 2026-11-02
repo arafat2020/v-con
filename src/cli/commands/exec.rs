@@ -9,7 +9,8 @@ use crate::config::Config;
 use crate::domain::host::EffectiveHost;
 use crate::domain::selector::{evaluate_selector, parse_selector};
 use crate::error::Error;
-use crate::infra::ssh::command::{command_line, exec_arguments};
+use crate::infra::secrets::{self, AskpassMode};
+use crate::infra::ssh::command::{SshCommandOptions, command_line};
 use crate::infra::ssh::system::SystemSsh;
 use crate::paths::Paths;
 use crate::services::exec::{self, ConfirmGate, DEFAULT_TIMEOUT, EndStatus, HostTarget, JobEvent};
@@ -89,19 +90,27 @@ pub fn run(
         .map(Duration::from_secs)
         .unwrap_or(DEFAULT_TIMEOUT);
     let connect_timeout = (timeout.as_secs() > 0).then_some(timeout.as_secs());
-    let control = paths.control_dir();
+    let control = paths.control_dir().display().to_string();
+    let store = secrets::system_store();
+    let options = SshCommandOptions {
+        batch_mode: true,
+        password_auth: false,
+        connect_timeout,
+        multiplexing: config.multiplexing,
+        control_path_dir: Some(control),
+    };
     let targets: Vec<HostTarget> = hosts
         .iter()
-        .map(|host| HostTarget {
-            name: host.name.clone(),
-            args: exec_arguments(
+        .map(|host| {
+            exec::authenticated_target(
+                store.as_ref(),
+                &paths.cache_dir,
                 host,
                 &bundle.hosts,
-                connect_timeout,
-                config.multiplexing,
-                Some(&control.display().to_string()),
                 &remote,
-            ),
+                AskpassMode::Force,
+                &options,
+            )
         })
         .collect();
     if request.dry_run {
@@ -445,7 +454,14 @@ fn dry_run_lines(hosts: &[EffectiveHost], remote: &str) -> Vec<String> {
     hosts
         .iter()
         .map(|host| {
-            let args = exec_arguments(host, hosts, Some(30), false, None, remote);
+            let args = crate::infra::ssh::command::exec_arguments(
+                host,
+                hosts,
+                Some(30),
+                false,
+                None,
+                remote,
+            );
             format!(
                 "{}  {}",
                 host.name,

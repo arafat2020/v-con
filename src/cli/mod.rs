@@ -200,6 +200,14 @@ pub enum SnippetCommand {
 
 /// Parse argv and run the selected command. The process exit code is the return value.
 pub fn run() -> ExitCode {
+    // ssh can only exec a path, so the askpass shim calls `vcon askpass`.
+    // Handle it before clap and before logging so the helper stays quiet and
+    // the password never reaches a log line.
+    let mut raw = std::env::args().skip(1);
+    if raw.next().as_deref() == Some("askpass") {
+        let prompt = raw.collect::<Vec<_>>().join(" ");
+        return crate::infra::secrets::answer_askpass(&prompt);
+    }
     let cli = Cli::parse();
     init_logging(&Paths::resolve(cli.config_dir.as_deref()), cli.verbose);
     match dispatch(&cli) {

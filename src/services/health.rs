@@ -11,7 +11,8 @@ use crate::domain::health::{
 };
 use crate::domain::host::EffectiveHost;
 use crate::infra::health::SCRIPT;
-use crate::infra::ssh::command::exec_arguments;
+use crate::infra::secrets::{AskpassMode, SecretStore};
+use crate::infra::ssh::command::SshCommandOptions;
 use crate::services::exec::{
     self as job, EndStatus, ExecRunner, HostOutcome, HostTarget, JobEvent,
 };
@@ -111,11 +112,16 @@ impl HostHealth {
 }
 
 /// Build ssh targets that run the embedded health script.
-pub fn health_targets(
+///
+/// A saved keychain password is attached when `store` has one. With an empty
+/// store the argv matches a normal batch-mode health poll.
+pub fn health_targets_auth(
     hosts: &[EffectiveHost],
     names: Option<&[String]>,
     multiplexing: bool,
     control_dir: &Path,
+    store: &dyn SecretStore,
+    cache_dir: &Path,
 ) -> Vec<HostTarget> {
     let selected: Vec<&EffectiveHost> = match names {
         Some(names) if !names.is_empty() => names
@@ -126,16 +132,23 @@ pub fn health_targets(
     };
     selected
         .into_iter()
-        .map(|host| HostTarget {
-            name: host.name.clone(),
-            args: exec_arguments(
+        .map(|host| {
+            let options = SshCommandOptions {
+                batch_mode: true,
+                password_auth: false,
+                connect_timeout: Some(POLL_TIMEOUT.as_secs()),
+                multiplexing,
+                control_path_dir: Some(control_dir.display().to_string()),
+            };
+            job::authenticated_target(
+                store,
+                cache_dir,
                 host,
                 hosts,
-                Some(POLL_TIMEOUT.as_secs()),
-                multiplexing,
-                Some(&control_dir.display().to_string()),
                 SCRIPT,
-            ),
+                AskpassMode::Force,
+                &options,
+            )
         })
         .collect()
 }
@@ -461,6 +474,7 @@ mod tests {
             self: Arc<Self>,
             host: String,
             _args: Vec<String>,
+            _askpass: Vec<(String, String)>,
             _timeout: Duration,
             _cancel: CancellationToken,
             lines: mpsc::Sender<JobEvent>,
@@ -548,10 +562,12 @@ reboot_required=0
             HostTarget {
                 name: "web-1".to_string(),
                 args: vec!["ssh".to_string()],
+                askpass: Vec::new(),
             },
             HostTarget {
                 name: "db-1".to_string(),
                 args: vec!["ssh".to_string()],
+                askpass: Vec::new(),
             },
         ];
         let reports = poll_once(

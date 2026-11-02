@@ -12,9 +12,8 @@ use crate::domain::tunnel::TunnelSpec;
 use crate::error::Error;
 use crate::infra::pty::{KeyModes, encode_key, encode_paste};
 use crate::infra::remote_fs::{DirEntry, join, normalize};
-use crate::infra::ssh::command::{
-    SshCommandOptions, build_ssh_command, command_line, exec_arguments,
-};
+use crate::infra::secrets::{self, SecretStore};
+use crate::infra::ssh::command::{SshCommandOptions, build_ssh_command, command_line};
 use crate::infra::ssh::system::{self, missing_ssh_message};
 use crate::infra::ssh_config;
 use crate::infra::state_store::{self, AppState};
@@ -61,8 +60,9 @@ use ratatui::style::{Modifier, Style};
 use ratatui::text::{Line, Span};
 use ratatui::widgets::{Block, Paragraph, Tabs};
 use std::collections::{BTreeMap, BTreeSet};
-use std::path::PathBuf;
+use std::path::{Path, PathBuf};
 use std::process::ExitStatus;
+use std::sync::Arc;
 use std::time::Duration;
 
 const TABS: [&str; 5] = ["Hosts", "Health", "Files", "Sessions", "Log"];
@@ -88,6 +88,8 @@ pub enum Modal {
     Snippets(Box<SnippetsView>),
     /// Per-host tunnels panel.
     Tunnels(Box<TunnelsView>),
+    /// Masked login password for the OS keychain. The value is never logged.
+    Password { name: String, input: String },
 }
 
 /// Shell state: inventory, keymap, the Hosts screen, and the open modal.
@@ -141,6 +143,12 @@ pub struct App {
     pub(crate) running_tunnels: Vec<RunningTunnel>,
     /// When set, the next finished exec is audited as a snippet run.
     pending_snippet_audit: Option<String>,
+    /// OS keychain. Tests use an in-memory store.
+    secrets: Arc<dyn SecretStore>,
+    /// Directory that holds the askpass helper script.
+    cache_dir: PathBuf,
+    /// Whether each host has a saved password. Errors are not cached.
+    keychain_known: BTreeMap<String, bool>,
 }
 
 impl App {
@@ -206,6 +214,9 @@ impl App {
             log: LogView::default(),
             running_tunnels: Vec::new(),
             pending_snippet_audit: None,
+            secrets: secrets::system_store(),
+            cache_dir: paths.cache_dir.clone(),
+            keychain_known: BTreeMap::new(),
         };
         app.seed_health_cache();
         app.refresh_groups();
@@ -268,6 +279,9 @@ impl App {
             }
             if matches!(self.modal, Some(Modal::Tunnels(_))) {
                 return self.tunnels_key(code);
+            }
+            if matches!(self.modal, Some(Modal::Password { .. })) {
+                return self.password_key(code, modifiers);
             }
             if code == KeyCode::Esc {
                 return self.update(Action::CloseModal);
@@ -411,6 +425,7 @@ impl App {
             Action::OpenTunnels => {
                 self.open_tunnels();
             }
+            Action::SavePassword => self.open_password(),
             Action::CopySshCommand => return self.copy_command(),
             Action::Connect => return self.connect_command(),
             Action::ToggleFavorite => return self.toggle_favorite(),
@@ -521,6 +536,7 @@ impl App {
                         .collect()
                 })
                 .unwrap_or_default();
+            let keychain = self.cursor_keychain_saved();
             let options = ViewOptions {
                 theme: &theme,
                 hosts_path: &hosts_path,
@@ -531,6 +547,7 @@ impl App {
                 control_dir: &control_dir,
                 health: &health_status,
                 active_tunnels: &cursor_tunnels,
+                keychain,
             };
             hosts::draw(frame, chunks[1], &mut self.view, &self.hosts, &options);
         } else if self.screen == 2 {
@@ -879,6 +896,18 @@ impl App {
                 snippets_ui::draw(frame, area, &view, &self.theme);
                 return;
             }
+            Modal::Password { name, input } => {
+                let mask = "•".repeat(input.chars().count());
+                (
+                    "Login password",
+                    vec![
+                        Line::from(format!("Host {name}")),
+                        Line::from(format!("Password {mask}")),
+                        Line::from("Enter saves   Ctrl-U removes   Esc cancels"),
+                        Line::from("Stored in the OS keychain, not in hosts.toml."),
+                    ],
+                )
+            }
             Modal::Tunnels(view) => {
                 let running: Vec<RunningTunnel> = self
                     .running_tunnels
@@ -940,6 +969,7 @@ impl App {
             &self.hosts,
             &SshCommandOptions {
                 batch_mode: false,
+                password_auth: false,
                 connect_timeout: None,
                 multiplexing,
                 control_path_dir: multiplexing.then_some(control),
@@ -972,12 +1002,20 @@ impl App {
             self.toast("No host selected");
             return Vec::new();
         };
+        let auth = crate::infra::secrets::saved_auth(
+            self.secrets.as_ref(),
+            &self.cache_dir,
+            &host,
+            crate::infra::secrets::AskpassMode::Prefer,
+        );
+        let mut options = self.session_options();
+        options.password_auth = auth.password_auth;
         let ConnectPlan {
             host_name,
             banner,
             args,
             ..
-        } = connect::plan(&host, &self.hosts, &self.session_options());
+        } = connect::plan(&host, &self.hosts, &options);
         self.state.record_connect(&host_name, Utc::now());
         self.refresh_groups();
         vec![
@@ -987,6 +1025,7 @@ impl App {
                 banner,
                 program,
                 args,
+                askpass: auth.env,
             })),
         ]
     }
@@ -1155,6 +1194,89 @@ impl App {
         ))));
     }
 
+    pub(crate) fn secrets(&self) -> &dyn SecretStore {
+        self.secrets.as_ref()
+    }
+
+    pub(crate) fn cache_dir(&self) -> &Path {
+        &self.cache_dir
+    }
+
+    /// Cached keychain presence for the host under the cursor.
+    ///
+    /// A lookup error is not cached, so a locked keychain can be retried.
+    fn cursor_keychain_saved(&mut self) -> bool {
+        let Some(name) = self.view.cursor_name.clone() else {
+            return false;
+        };
+        if let Some(saved) = self.keychain_known.get(&name).copied() {
+            return saved;
+        }
+        match self.secrets.contains(&name) {
+            Ok(saved) => {
+                self.keychain_known.insert(name, saved);
+                saved
+            }
+            Err(_) => false,
+        }
+    }
+
+    fn open_password(&mut self) {
+        let Some(name) = self.active_cursor_name() else {
+            self.toast("No host selected");
+            return;
+        };
+        self.modal = Some(Modal::Password {
+            name,
+            input: String::new(),
+        });
+    }
+
+    fn password_key(&mut self, code: KeyCode, modifiers: KeyModifiers) -> Vec<UiCommand> {
+        self.dirty = true;
+        let Some(Modal::Password { name, mut input }) = self.modal.take() else {
+            return Vec::new();
+        };
+        match code {
+            KeyCode::Esc => {}
+            KeyCode::Enter => match self.secrets.set(&name, &input) {
+                Ok(()) => {
+                    self.keychain_known.insert(name, true);
+                    self.toast("saved in the login keychain");
+                }
+                Err(error) => {
+                    self.modal = Some(Modal::Password { name, input });
+                    self.toast(error.to_string());
+                }
+            },
+            KeyCode::Char('u') if modifiers.contains(KeyModifiers::CONTROL) => {
+                match self.secrets.delete(&name) {
+                    Ok(()) => {
+                        self.keychain_known.insert(name, false);
+                        self.toast("removed from the login keychain");
+                    }
+                    Err(error) => {
+                        self.modal = Some(Modal::Password { name, input });
+                        self.toast(error.to_string());
+                    }
+                }
+            }
+            KeyCode::Backspace => {
+                input.pop();
+                self.modal = Some(Modal::Password { name, input });
+            }
+            KeyCode::Char(ch)
+                if !modifiers.contains(KeyModifiers::CONTROL)
+                    && !modifiers.contains(KeyModifiers::ALT) =>
+            {
+                input.push(ch);
+                self.modal = Some(Modal::Password { name, input });
+            }
+            _ => self.modal = Some(Modal::Password { name, input }),
+        }
+        Vec::new()
+    }
+
     fn active_cursor_name(&self) -> Option<String> {
         if self.screen == 2 {
             self.health.cursor_name.clone()
@@ -1285,7 +1407,12 @@ impl App {
                             self.view.cursor_name = None;
                         }
                         self.install_bundle(bundle);
-                        self.toast(format!("deleted {name}"));
+                        let keychain_note = match self.secrets.delete(&name) {
+                            Ok(()) => String::new(),
+                            Err(error) => format!(" (keychain: {error})"),
+                        };
+                        self.keychain_known.remove(&name);
+                        self.toast(format!("deleted {name}{keychain_note}"));
                         vec![UiCommand::Persist]
                     }
                     Err(error) => {
@@ -1498,18 +1625,25 @@ impl App {
         let connect_timeout = (timeout.as_secs() > 0).then_some(timeout.as_secs());
         let control = self.control_dir.display().to_string();
         let names: Vec<String> = hosts.iter().map(|host| host.name.clone()).collect();
+        let options = SshCommandOptions {
+            batch_mode: true,
+            password_auth: false,
+            connect_timeout,
+            multiplexing: self.multiplexing,
+            control_path_dir: Some(control),
+        };
         let targets = hosts
             .iter()
-            .map(|host| job::HostTarget {
-                name: host.name.clone(),
-                args: exec_arguments(
+            .map(|host| {
+                job::authenticated_target(
+                    self.secrets.as_ref(),
+                    &self.cache_dir,
                     host,
                     &self.hosts,
-                    connect_timeout,
-                    self.multiplexing,
-                    Some(&control),
                     &remote,
-                ),
+                    crate::infra::secrets::AskpassMode::Force,
+                    &options,
+                )
             })
             .collect();
         job::push_history(&mut self.state.ui.exec_history, &command);
@@ -1612,8 +1746,14 @@ impl App {
     )> {
         let program = self.ssh.clone()?;
         let settings = HealthSettings::from_config(&self.health_config, self.parallel, program);
-        let targets =
-            health_svc::health_targets(&self.hosts, None, self.multiplexing, &self.control_dir);
+        let targets = health_svc::health_targets_auth(
+            &self.hosts,
+            None,
+            self.multiplexing,
+            &self.control_dir,
+            self.secrets.as_ref(),
+            &self.cache_dir,
+        );
         Some((targets, settings, self.health.hosts.clone()))
     }
 
@@ -1676,7 +1816,8 @@ impl App {
                         | Action::OpenFiles
                         | Action::OpenSession
                         | Action::OpenSnippets
-                        | Action::OpenTunnels),
+                        | Action::OpenTunnels
+                        | Action::SavePassword),
                     ) = self.keymap.lookup(code, modifiers)
                 {
                     return self.update(action);
@@ -2809,6 +2950,9 @@ mod tests {
             log: LogView::default(),
             running_tunnels: Vec::new(),
             pending_snippet_audit: None,
+            secrets: Arc::new(secrets::MemoryStore::default()),
+            cache_dir: PathBuf::from("/tmp/vcon-cache"),
+            keychain_known: BTreeMap::new(),
         }
     }
 
