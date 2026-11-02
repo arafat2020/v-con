@@ -86,6 +86,7 @@ impl SftpFs {
         args: Vec<String>,
         env: &[(String, String)],
     ) -> Result<Self, Error> {
+        crate::infra::ssh::system::release_dead_master(&program, &args);
         let mut command = Command::new(&program);
         command
             .args(&args)

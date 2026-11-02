@@ -47,6 +47,7 @@ impl SystemSsh {
         let mut displayed = vec![self.program.display().to_string()];
         displayed.extend(args.iter().cloned());
         tracing::debug!(command = %command_line(&displayed), "starting ssh");
+        release_dead_master(&self.program, args);
         Command::new(&self.program)
             .args(args)
             .envs(env.iter().cloned())
@@ -54,6 +55,101 @@ impl SystemSsh {
             .stdout(Stdio::inherit())
             .stderr(Stdio::inherit())
             .status()
+    }
+}
+
+/// Remove a ControlMaster socket whose master process is gone.
+///
+/// A dropped connection leaves the socket behind. The next ssh then attaches
+/// to nothing and exits, so the user has to start over and type the password.
+pub fn release_dead_master(program: &Path, args: &[String]) {
+    let mut probe = Command::new(program);
+    probe.arg("-G").args(args);
+    let Some(output) = output_bounded(probe, Duration::from_millis(500)) else {
+        return;
+    };
+    let text = String::from_utf8_lossy(&output.stdout);
+    let mut control = None;
+    let mut user = None;
+    let mut host = None;
+    let mut port = None;
+    for line in text.lines() {
+        if let Some(value) = line.strip_prefix("controlpath ") {
+            control = Some(value.trim().to_string());
+        } else if let Some(value) = line.strip_prefix("user ") {
+            user = Some(value.trim().to_string());
+        } else if let Some(value) = line.strip_prefix("hostname ") {
+            host = Some(value.trim().to_string());
+        } else if let Some(value) = line.strip_prefix("port ") {
+            port = Some(value.trim().to_string());
+        }
+    }
+    let Some(control) = control else {
+        return;
+    };
+    if control.is_empty() || control == "none" {
+        return;
+    }
+    let path = PathBuf::from(&control);
+    if !path.exists() {
+        return;
+    }
+    let (Some(user), Some(host)) = (user, host) else {
+        return;
+    };
+    let mut check = Command::new(program);
+    check
+        .arg("-o")
+        .arg(format!("ControlPath={control}"))
+        .arg("-o")
+        .arg("BatchMode=yes");
+    if let Some(port) = port.filter(|port| port != "22") {
+        check.arg("-p").arg(port);
+    }
+    check
+        .arg("-O")
+        .arg("check")
+        .arg(format!("{user}@{host}"))
+        .stdin(Stdio::null())
+        .stdout(Stdio::null())
+        .stderr(Stdio::null());
+    let alive = output_bounded(check, Duration::from_millis(500))
+        .is_some_and(|output| output.status.success());
+    if !alive {
+        let _ = std::fs::remove_file(path);
+    }
+}
+
+/// Run `command` and stop it if it has not exited within `limit`.
+fn output_bounded(mut command: Command, limit: Duration) -> Option<std::process::Output> {
+    use std::io::Read;
+    command
+        .stdin(Stdio::null())
+        .stdout(Stdio::piped())
+        .stderr(Stdio::null());
+    let mut child = command.spawn().ok()?;
+    let started = std::time::Instant::now();
+    loop {
+        match child.try_wait() {
+            Ok(Some(status)) => {
+                let mut stdout = Vec::new();
+                if let Some(mut pipe) = child.stdout.take() {
+                    let _ = pipe.read_to_end(&mut stdout);
+                }
+                return Some(std::process::Output {
+                    status,
+                    stdout,
+                    stderr: Vec::new(),
+                });
+            }
+            Ok(None) if started.elapsed() >= limit => {
+                let _ = child.kill();
+                let _ = child.wait();
+                return None;
+            }
+            Ok(None) => std::thread::sleep(Duration::from_millis(15)),
+            Err(_) => return None,
+        }
     }
 }
 
@@ -116,6 +212,7 @@ impl SystemSsh {
         let mut displayed = vec![self.program.display().to_string()];
         displayed.extend(args.iter().cloned());
         tracing::debug!(command = %command_line(&displayed), "starting ssh exec");
+        release_dead_master(&self.program, args);
         let mut child = match TokioCommand::new(&self.program)
             .args(args)
             .envs(env.iter().cloned())
@@ -358,6 +455,38 @@ mod tests {
         let ssh = SystemSsh::new("true");
         let status = ssh.interactive(&[]).unwrap();
         assert!(status.success());
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn dead_control_socket_is_removed() {
+        let ssh = std::path::PathBuf::from("/usr/bin/ssh");
+        if !ssh.exists() {
+            return;
+        }
+        let dir = tempfile::tempdir().unwrap();
+        let control = format!("ControlPath={}/cm/%C", dir.path().display());
+        let probed = std::process::Command::new(&ssh)
+            .args(["-G", "-o", &control, "deploy@203.0.113.10"])
+            .output()
+            .unwrap();
+        let text = String::from_utf8_lossy(&probed.stdout);
+        let path = text
+            .lines()
+            .find_map(|line| line.strip_prefix("controlpath "))
+            .expect("ssh -G controlpath");
+        std::fs::create_dir_all(std::path::Path::new(path).parent().unwrap()).unwrap();
+        let listener = std::os::unix::net::UnixListener::bind(path).unwrap();
+        drop(listener);
+        assert!(std::path::Path::new(path).exists());
+        super::release_dead_master(
+            &ssh,
+            &["-o".to_string(), control, "deploy@203.0.113.10".to_string()],
+        );
+        assert!(
+            !std::path::Path::new(path).exists(),
+            "a dead control socket must not block the next connection"
+        );
     }
 
     #[cfg(unix)]

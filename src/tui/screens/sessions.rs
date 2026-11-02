@@ -113,6 +113,10 @@ pub struct SessionsView {
     pub hosts: HashMap<SessionId, String>,
     /// Ended sessions still shown with a banner.
     pub ended: HashMap<SessionId, Option<u32>>,
+    /// Sessions that received terminal output, so a later exit is a drop.
+    pub saw_output: HashSet<SessionId>,
+    /// Hosts already auto-reconnected since the last shell output.
+    pub reconnect_guard: HashSet<String>,
     /// Pending close confirmation.
     pub confirm_close: Option<SessionId>,
     /// Last pane sizes used for resize.
