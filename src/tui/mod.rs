@@ -1071,11 +1071,7 @@ async fn run_handoff(
                     Handoff::Connect(spec) => Some(spec.host_name.clone()),
                     Handoff::Editor(_) => None,
                 };
-                if attempt == 0
-                    && host
-                        .as_deref()
-                        .is_some_and(|name| app.can_reconnect_without_password(name, &status))
-                {
+                if attempt == 0 && host.is_some() && app.should_auto_reconnect(&status) {
                     attempt = 1;
                     app.toast("connection lost, reconnecting");
                     continue;

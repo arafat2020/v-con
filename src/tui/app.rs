@@ -1878,9 +1878,12 @@ impl App {
         status.code() == Some(255) || status.code().is_none()
     }
 
-    /// Reconnect without a prompt when this host's password is already saved.
-    pub fn can_reconnect_without_password(&self, host: &str, status: &ExitStatus) -> bool {
-        self.dropped_connection(status) && self.secrets.contains(host).unwrap_or(false)
+    /// Reconnect once when ssh died, even if no keychain password is saved.
+    ///
+    /// Key/agent hosts reconnect silently. Password hosts reuse a saved
+    /// secret when present; otherwise the next attempt can prompt.
+    pub fn should_auto_reconnect(&self, status: &ExitStatus) -> bool {
+        self.dropped_connection(status)
     }
 
     /// Show a modal when the ssh process could not be spawned.
@@ -2381,8 +2384,7 @@ impl App {
                     && lost
                     && let Some(host) = host
                 {
-                    let saved = self.secrets.contains(&host).unwrap_or(false);
-                    if saved && self.sessions.reconnect_guard.insert(host.clone()) {
+                    if self.sessions.reconnect_guard.insert(host.clone()) {
                         let (rows, cols) = self
                             .sessions
                             .last_sizes
@@ -3251,22 +3253,48 @@ mod tests {
     }
 
     #[test]
-    fn saved_password_reconnects_a_dropped_session() {
+    fn dropped_ssh_auto_reconnects_without_a_saved_password() {
         let app = preview(fleet());
-        app.secrets.set("web-1", "s3cret").unwrap();
         let status = std::process::Command::new("sh")
             .arg("-c")
             .arg("exit 255")
             .status()
             .unwrap();
-        assert!(app.can_reconnect_without_password("web-1", &status));
+        assert!(app.should_auto_reconnect(&status));
+        assert!(!app.secrets.contains("web-1").unwrap());
         let clean = std::process::Command::new("sh")
             .arg("-c")
             .arg("exit 0")
             .status()
             .unwrap();
-        assert!(!app.can_reconnect_without_password("web-1", &clean));
-        assert!(!app.can_reconnect_without_password("db-1", &status));
+        assert!(!app.should_auto_reconnect(&clean));
+    }
+
+    #[test]
+    fn embedded_session_reconnects_after_a_drop() {
+        let mut app = preview(fleet());
+        let id = SessionId::from_raw(7);
+        app.session_opened(id, "web-1".into(), SessionPlace::NewTab);
+        app.sessions.saw_output.insert(id);
+        app.sessions.last_sizes.insert(id, (24, 80));
+        let command = app.apply_session_event(SessionEvent::Exited {
+            id,
+            code: Some(255),
+        });
+        assert_eq!(
+            command,
+            Some(SessionsCommand::Reconnect {
+                id,
+                host: "web-1".into(),
+                rows: 24,
+                cols: 80,
+            })
+        );
+        assert!(
+            app.toast
+                .as_ref()
+                .is_some_and(|(text, _)| text.contains("reconnecting"))
+        );
     }
 
     #[test]
