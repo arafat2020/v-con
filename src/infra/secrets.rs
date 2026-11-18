@@ -426,27 +426,28 @@ impl Drop for GateGuard {
     }
 }
 
-/// Abstract-namespace socket that hands a password to the askpass helper.
+/// Socket that hands a password to the askpass helper.
 ///
 /// OpenSSH closes inherited descriptors before it runs askpass, so a pipe does
-/// not survive. The socket name is not the password. Nothing is written to a
-/// file. The listener accepts one connection, then goes away.
+/// not survive. On Linux the socket is in the abstract namespace and has no
+/// path. Elsewhere it is a socket file whose contents are not the password.
+/// The listener accepts one connection, then goes away.
 pub struct SecretChannel {
+    /// Value for `VCON_ASKPASS_SOCK`. `@name` is abstract. A path is a socket file.
     name: String,
+    /// Socket file to remove. Empty for an abstract address.
+    path: Option<std::path::PathBuf>,
 }
 
 impl SecretChannel {
-    /// Bind an abstract socket and serve `secret` to the first connection.
+    /// Bind a socket and serve `secret` to the first connection.
     pub fn create(secret: &str) -> std::io::Result<Self> {
-        let name = format!(
+        let token = format!(
             "vcon-{}-{}",
             std::process::id(),
             token_hex().map_err(std::io::Error::other)?
         );
-        use std::os::linux::net::SocketAddrExt;
-        let addr = std::os::unix::net::SocketAddr::from_abstract_name(name.as_bytes())
-            .map_err(|error| std::io::Error::new(std::io::ErrorKind::InvalidInput, error))?;
-        let listener = std::os::unix::net::UnixListener::bind_addr(&addr)?;
+        let (name, path, listener) = bind_secret_socket(&token)?;
         let payload = {
             let mut bytes = secret.as_bytes().to_vec();
             bytes.push(b'\n');
@@ -459,12 +460,50 @@ impl SecretChannel {
             use std::io::Write;
             let _ = stream.write_all(&payload);
         });
-        Ok(Self { name })
+        Ok(Self { name, path })
     }
 
-    /// Abstract name to publish as `VCON_ASKPASS_SOCK`. It does not contain the secret.
+    /// Address to publish as `VCON_ASKPASS_SOCK`. It does not contain the secret.
     pub fn name(&self) -> &str {
         &self.name
+    }
+}
+
+impl Drop for SecretChannel {
+    fn drop(&mut self) {
+        if let Some(path) = self.path.take() {
+            let _ = std::fs::remove_file(path);
+        }
+    }
+}
+
+fn bind_secret_socket(
+    token: &str,
+) -> std::io::Result<(
+    String,
+    Option<std::path::PathBuf>,
+    std::os::unix::net::UnixListener,
+)> {
+    #[cfg(target_os = "linux")]
+    {
+        use std::os::linux::net::SocketAddrExt;
+        let addr = std::os::unix::net::SocketAddr::from_abstract_name(token.as_bytes())
+            .map_err(|error| std::io::Error::new(std::io::ErrorKind::InvalidInput, error))?;
+        let listener = std::os::unix::net::UnixListener::bind_addr(&addr)?;
+        Ok((format!("@{token}"), None, listener))
+    }
+    #[cfg(not(target_os = "linux"))]
+    {
+        let dir = std::env::temp_dir().join(token);
+        std::fs::create_dir_all(&dir)?;
+        #[cfg(unix)]
+        {
+            use std::os::unix::fs::PermissionsExt;
+            let _ = std::fs::set_permissions(&dir, std::fs::Permissions::from_mode(0o700));
+        }
+        let path = dir.join("sock");
+        let listener = std::os::unix::net::UnixListener::bind(&path)?;
+        Ok((path.display().to_string(), Some(path), listener))
     }
 }
 
@@ -477,13 +516,10 @@ fn token_hex() -> std::io::Result<String> {
 }
 
 fn read_socket_secret(name: &str) -> Result<String, ()> {
-    if name.is_empty() || name.len() > 200 {
+    if name.is_empty() || name.len() > 512 {
         return Err(());
     }
-    use std::os::linux::net::SocketAddrExt;
-    let addr =
-        std::os::unix::net::SocketAddr::from_abstract_name(name.as_bytes()).map_err(|_| ())?;
-    let mut stream = std::os::unix::net::UnixStream::connect_addr(&addr).map_err(|_| ())?;
+    let mut stream = connect_secret_socket(name)?;
     let _ = stream.set_read_timeout(Some(std::time::Duration::from_secs(2)));
     use std::io::Read;
     let mut buf = String::new();
@@ -494,6 +530,17 @@ fn read_socket_secret(name: &str) -> Result<String, ()> {
     } else {
         Ok(secret)
     }
+}
+
+fn connect_secret_socket(name: &str) -> Result<std::os::unix::net::UnixStream, ()> {
+    #[cfg(target_os = "linux")]
+    if let Some(abstract_name) = name.strip_prefix('@') {
+        use std::os::linux::net::SocketAddrExt;
+        let addr = std::os::unix::net::SocketAddr::from_abstract_name(abstract_name.as_bytes())
+            .map_err(|_| ())?;
+        return std::os::unix::net::UnixStream::connect_addr(&addr).map_err(|_| ());
+    }
+    std::os::unix::net::UnixStream::connect(name).map_err(|_| ())
 }
 
 /// Pipe that carries a password to the askpass helper.

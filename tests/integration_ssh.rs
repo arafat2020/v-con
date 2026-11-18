@@ -526,6 +526,24 @@ fn with_password_fixture(test: impl FnOnce(&PasswordFix)) {
         DockerGate::Fail(error) => panic!("DOCKER is set but docker/compose is unusable: {error}"),
         DockerGate::Run => {}
     }
+    for tool in [
+        "dbus-launch",
+        "gnome-keyring-daemon",
+        "secret-tool",
+        "sshpass",
+        "python3",
+    ] {
+        let found = Command::new("sh")
+            .args(["-c", &format!("command -v {tool}")])
+            .stdout(Stdio::null())
+            .stderr(Stdio::null())
+            .status()
+            .is_ok_and(|status| status.success());
+        if !found {
+            eprintln!("skipping password test: `{tool}` is not installed");
+            return;
+        }
+    }
     let root = tempfile::tempdir().unwrap().keep();
     let key = root.join("id_ed25519");
     let status = Command::new("ssh-keygen")
