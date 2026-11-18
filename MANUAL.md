@@ -244,8 +244,11 @@ One-shot from the shell:
 ```bash
 vcon status @prod
 vcon status --json --sort cpu
+vcon status --no-cpu
 vcon ping @web -t 5
 ```
+
+`--no-cpu` skips the second sample. CPU percent and network rates stay empty.
 
 ---
 

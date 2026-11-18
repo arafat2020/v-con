@@ -1,5 +1,7 @@
-# Minimal OpenSSH server for ignored integration tests.
-# Not started by default CI; use with DOCKER=1 cargo test -- --ignored.
+# OpenSSH server for ignored integration tests.
+# Not started by default CI. The tests generate a key and pass it in:
+#   VCON_TEST_PUBLIC_KEY  one-line public key (required)
+#   VCON_TEST_SSH_PORT    host port, default 2222
 services:
   sshd:
     image: lscr.io/linuxserver/openssh-server:latest
@@ -7,9 +9,8 @@ services:
       PUID: "1000"
       PGID: "1000"
       TZ: Utc
-      PASSWORD_ACCESS: "true"
-      USER_PASSWORD: "test"
       USER_NAME: test
+      PASSWORD_ACCESS: "false"
+      PUBLIC_KEY: ${VCON_TEST_PUBLIC_KEY:?set VCON_TEST_PUBLIC_KEY}
     ports:
-      - "2222:2222"
-    # Replace with a generated key + authorized_keys volume for real suites.
+      - "127.0.0.1:${VCON_TEST_SSH_PORT:-2222}:2222"

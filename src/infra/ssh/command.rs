@@ -6,6 +6,7 @@
 
 use crate::domain::host::{EffectiveHost, is_plain_jump};
 use std::collections::HashSet;
+use std::path::Path;
 
 /// Flags that depend on the caller rather than the host record.
 ///
@@ -73,6 +74,10 @@ pub fn build_ssh_command(
     if options.multiplexing
         && let Some(dir) = &options.control_path_dir
     {
+        // OpenSSH will not create the socket directory. A missing
+        // `~/.cache/vcon/cm` fails every multiplexed command with
+        // `unix_listener: cannot bind ... No such file or directory`.
+        ensure_control_dir(dir);
         args.push("-o".to_string());
         args.push("ControlMaster=auto".to_string());
         args.push("-o".to_string());
@@ -212,6 +217,29 @@ pub fn jump_labels(host: &EffectiveHost, hosts: &[EffectiveHost]) -> Vec<String>
     }
     chain.reverse();
     chain
+}
+
+/// Create the ControlPath directory before ssh tries to bind the socket.
+///
+/// Mode is `0700` on unix. A failure is logged; ssh then reports the bind error.
+fn ensure_control_dir(dir: &str) {
+    if dir.is_empty() || dir == "none" {
+        return;
+    }
+    let path = Path::new(dir);
+    if let Err(error) = crate::infra::fsutil::create_dir_secure(path) {
+        tracing::warn!(
+            "could not create control directory {}: {error}",
+            path.display()
+        );
+        return;
+    }
+    if let Err(error) = crate::infra::fsutil::set_mode(path, crate::infra::fsutil::DIR_MODE) {
+        tracing::warn!(
+            "could not set permissions on control directory {}: {error}",
+            path.display()
+        );
+    }
 }
 
 fn jump_destination(host: &EffectiveHost) -> String {
@@ -395,6 +423,67 @@ mod tests {
                 .any(|pair| pair == ["-o", "NumberOfPasswordPrompts=1"])
         );
         assert!(!args.iter().any(|arg| arg.contains("password")));
+    }
+
+    #[test]
+    fn multiplexing_creates_the_control_directory() {
+        let dir = tempfile::tempdir().unwrap();
+        let control = dir.path().join("cm");
+        assert!(!control.exists());
+        let web = host("web-1", "deploy", "203.0.113.10", 22);
+        let args = build_ssh_command(
+            &web,
+            std::slice::from_ref(&web),
+            &SshCommandOptions {
+                batch_mode: true,
+                password_auth: false,
+                connect_timeout: None,
+                multiplexing: true,
+                control_path_dir: Some(control.display().to_string()),
+            },
+        );
+        assert!(control.is_dir(), "control directory should be created");
+        #[cfg(unix)]
+        {
+            use std::os::unix::fs::PermissionsExt;
+            let mode = std::fs::metadata(&control).unwrap().permissions().mode() & 0o777;
+            assert_eq!(mode, 0o700);
+        }
+        assert!(args.windows(2).any(|pair| pair[0] == "-o"
+            && pair[1] == format!("ControlPath={}/cm/%C", dir.path().display())));
+        // A second build must tolerate the directory already existing.
+        let again = build_ssh_command(
+            &web,
+            std::slice::from_ref(&web),
+            &SshCommandOptions {
+                batch_mode: true,
+                password_auth: false,
+                connect_timeout: None,
+                multiplexing: true,
+                control_path_dir: Some(control.display().to_string()),
+            },
+        );
+        assert!(again.iter().any(|arg| arg.contains("ControlPath=")));
+    }
+
+    #[test]
+    fn without_multiplexing_does_not_create_a_control_directory() {
+        let dir = tempfile::tempdir().unwrap();
+        let control = dir.path().join("cm");
+        let web = host("web-1", "deploy", "203.0.113.10", 22);
+        let args = build_ssh_command(
+            &web,
+            std::slice::from_ref(&web),
+            &SshCommandOptions {
+                batch_mode: true,
+                password_auth: false,
+                connect_timeout: None,
+                multiplexing: false,
+                control_path_dir: Some(control.display().to_string()),
+            },
+        );
+        assert!(!control.exists());
+        assert!(!args.iter().any(|arg| arg.contains("ControlPath")));
     }
 
     #[test]
