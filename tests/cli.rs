@@ -151,16 +151,24 @@ fn push_and_pull_write_transfer_audit() {
     let lines: Vec<&str> = audit.lines().filter(|line| !line.is_empty()).collect();
     assert_eq!(lines.len(), 2, "{audit}");
     assert!(lines[0].contains("\"action\":\"transfer\""), "{audit}");
-    assert!(lines[0].contains("upload"), "{audit}");
-    assert!(lines[0].contains("web-1"), "{audit}");
+    assert!(lines[0].contains("\"direction\":\"upload\""), "{audit}");
+    assert!(lines[0].contains("\"src\":"), "{audit}");
     assert!(lines[0].contains(local.to_str().unwrap()), "{audit}");
+    assert!(lines[0].contains("\"dst\":\"/var/www\""), "{audit}");
+    assert!(lines[0].contains("web-1"), "{audit}");
     assert!(lines[0].contains("/var/www"), "{audit}");
-    assert!(lines[0].contains("\"web-1\":1"), "{audit}");
+    assert!(
+        lines[0].contains("\"web-1\":255"),
+        "audit should keep ssh exit 255, got {audit}"
+    );
     assert!(lines[1].contains("\"action\":\"transfer\""), "{audit}");
-    assert!(lines[1].contains("download"), "{audit}");
-    assert!(lines[1].contains("/var/log/app.log"), "{audit}");
+    assert!(lines[1].contains("\"direction\":\"download\""), "{audit}");
+    assert!(lines[1].contains("\"src\":\"/var/log/app.log\""), "{audit}");
     assert!(lines[1].contains(dest.to_str().unwrap()), "{audit}");
-    assert!(lines[1].contains("\"web-1\":1"), "{audit}");
+    assert!(
+        lines[1].contains("\"web-1\":255"),
+        "audit should keep ssh exit 255, got {audit}"
+    );
 
     let mut log = with_config_dir(&config);
     isolate(&mut log, &state, &cache, &data, &bin);
@@ -170,7 +178,8 @@ fn push_and_pull_write_transfer_audit() {
         .stdout(
             predicate::str::contains("transfer")
                 .and(predicate::str::contains("upload"))
-                .and(predicate::str::contains("download")),
+                .and(predicate::str::contains("download"))
+                .and(predicate::str::contains("255")),
         );
 }
 

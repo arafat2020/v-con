@@ -1,6 +1,3 @@
 /target
-.gitignore
-config.bat
-node_modules
 .vscode/
 .DS_Store

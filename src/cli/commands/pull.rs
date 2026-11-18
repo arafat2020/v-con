@@ -95,7 +95,7 @@ pub fn run(
     let exit_code = match &outcome {
         Ok(false) => 0,
         Ok(true) => i32::from(EXIT_SOME_FAILED),
-        Err(_) => 1,
+        Err(error) => error.remote_code().unwrap_or(1),
     };
     crate::services::audit::record_transfer(
         &paths.audit_file(),

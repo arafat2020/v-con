@@ -132,7 +132,10 @@ pub fn run(
             }
             Ok::<(), Error>(())
         });
-        let exit_code = if result.is_ok() { 0 } else { 1 };
+        let exit_code = match &result {
+            Ok(()) => 0,
+            Err(error) => error.remote_code().unwrap_or(1),
+        };
         crate::services::audit::record_transfer(
             &paths.audit_file(),
             &config.audit,

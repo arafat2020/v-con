@@ -79,6 +79,19 @@ pub(crate) fn forward_args(
         "-o".to_string(),
         "ControlPath=none".to_string(),
     ];
+    // Keepalives are added for multiplexed sessions only. Tunnels turn
+    // multiplexing off, so install the same defaults here unless the host
+    // record already set an interval (OpenSSH keeps the first value).
+    if !host
+        .ssh_options
+        .keys()
+        .any(|key| key.eq_ignore_ascii_case("ServerAliveInterval"))
+    {
+        isolated.push("-o".to_string());
+        isolated.push("ServerAliveInterval=15".to_string());
+        isolated.push("-o".to_string());
+        isolated.push("ServerAliveCountMax=3".to_string());
+    }
     isolated.append(&mut args);
     isolated
 }
@@ -88,15 +101,58 @@ struct ForwardChild(Child);
 
 impl ForwardChild {
     fn spawn(program: &Path, args: &[String]) -> Result<Self, Error> {
-        let child = Command::new(program)
+        let mut command = Command::new(program);
+        command
             .args(args)
             .stdin(Stdio::null())
             .stdout(Stdio::inherit())
-            .stderr(Stdio::inherit())
+            .stderr(Stdio::inherit());
+        #[cfg(unix)]
+        isolate_tunnel_child(&mut command);
+        let child = command
             .spawn()
             .map_err(|error| Error::Message(format!("failed to start tunnel: {error}")))?;
         Ok(Self(child))
     }
+}
+
+/// Keep the ssh child from surviving `kill -9` of vcon.
+///
+/// On Linux the child asks to be sent SIGTERM when its parent dies, and it
+/// runs in its own process group.
+#[cfg(unix)]
+fn isolate_tunnel_child(command: &mut Command) {
+    use std::os::unix::process::CommandExt;
+    #[cfg(target_os = "linux")]
+    {
+        let parent = std::process::id();
+        // SAFETY: `pre_exec` runs in the forked child before exec. The armed
+        // path calls `prctl`, `getppid`, and, if the parent is already gone,
+        // `raise` and `_exit`.
+        unsafe {
+            command.pre_exec(move || arm_parent_death_signal(parent));
+        }
+    }
+    command.process_group(0);
+}
+
+/// `PR_SET_PDEATHSIG(SIGTERM)`, then exit if the parent is already gone.
+///
+/// The signal is not delivered for a parent that died before `prctl`, so
+/// compare `getppid` with the pid captured before the spawn.
+#[cfg(target_os = "linux")]
+fn arm_parent_death_signal(parent: u32) -> io::Result<()> {
+    let rc = unsafe { libc::prctl(libc::PR_SET_PDEATHSIG, libc::SIGTERM as libc::c_ulong) };
+    if rc != 0 {
+        return Err(io::Error::last_os_error());
+    }
+    if unsafe { libc::getppid() } != parent as libc::pid_t {
+        unsafe {
+            libc::raise(libc::SIGTERM);
+            libc::_exit(1);
+        }
+    }
+    Ok(())
 }
 
 impl Drop for ForwardChild {
@@ -220,6 +276,32 @@ mod tests {
         assert!(args.iter().any(|arg| arg == "-N"));
         assert!(args.iter().any(|arg| arg == "-L"));
         assert_eq!(args.last().map(String::as_str), Some("root@10.0.0.1"));
+    }
+
+    #[test]
+    fn tunnel_args_send_keepalives_without_multiplexing() {
+        let host = host();
+        let spec = TunnelSpec::parse("L:3000:localhost:3000").unwrap();
+        let args = forward_args(&host, std::slice::from_ref(&host), &spec);
+        let path_none = args
+            .iter()
+            .position(|arg| arg == "ControlPath=none")
+            .expect("ControlPath=none");
+        let interval = args
+            .iter()
+            .position(|arg| arg == "ServerAliveInterval=15")
+            .expect("ServerAliveInterval=15");
+        let count = args
+            .iter()
+            .position(|arg| arg == "ServerAliveCountMax=3")
+            .expect("ServerAliveCountMax=3");
+        let host_master = args
+            .iter()
+            .position(|arg| arg == "ControlMaster=auto")
+            .expect("host ControlMaster");
+        assert!(path_none < interval);
+        assert!(interval < count);
+        assert!(count < host_master);
     }
 
     #[cfg(unix)]

@@ -29,6 +29,15 @@ pub struct AuditEntry {
     /// Command or transfer path summary (may be redacted).
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub command: Option<String>,
+    /// `upload` or `download` for a transfer. Absent on older lines and other actions.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub direction: Option<String>,
+    /// Source path for a transfer. Local for upload, remote for download.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub src: Option<String>,
+    /// Destination path for a transfer.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub dst: Option<String>,
     /// Per-host exit codes when the action produced them.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub results: Option<BTreeMap<String, i32>>,
@@ -53,6 +62,11 @@ pub fn append(
 ) -> Result<(), String> {
     if let Some(command) = entry.command.as_mut() {
         *command = redact_command(command, redact);
+    }
+    for path in [&mut entry.src, &mut entry.dst] {
+        if let Some(path) = path.as_mut() {
+            *path = redact_command(path, redact);
+        }
     }
     if let Some(parent) = path.parent() {
         fsutil::create_dir_secure(parent).map_err(|error| error.to_string())?;
@@ -122,6 +136,17 @@ fn rotate_if_needed(path: &Path, max_bytes: u64) -> Result<(), String> {
     Ok(())
 }
 
+impl AuditEntry {
+    /// Text for a log line. Transfers use the structured paths when they are present.
+    pub fn summary(&self) -> String {
+        if let (Some(direction), Some(src), Some(dst)) = (&self.direction, &self.src, &self.dst) {
+            format!("{direction} {src} → {dst}")
+        } else {
+            self.command.clone().unwrap_or_else(|| "-".into())
+        }
+    }
+}
+
 fn rotated_path(path: &Path) -> PathBuf {
     let mut rotated = path.as_os_str().to_os_string();
     rotated.push(".1");
@@ -157,6 +182,9 @@ mod tests {
             selector: Some("@web".into()),
             hosts: vec!["web-1".into()],
             command: Some("uptime".into()),
+            direction: None,
+            src: None,
+            dst: None,
             results: Some(BTreeMap::from([("web-1".into(), 0)])),
             duration_ms: Some(12),
         };
@@ -177,6 +205,9 @@ mod tests {
             selector: None,
             hosts: vec!["db".into()],
             command: Some("mysql -psecret password=hunter2".into()),
+            direction: None,
+            src: None,
+            dst: None,
             results: None,
             duration_ms: None,
         };
@@ -204,6 +235,9 @@ mod tests {
             selector: None,
             hosts: vec!["web-1".into()],
             command: None,
+            direction: None,
+            src: None,
+            dst: None,
             results: None,
             duration_ms: None,
         };
@@ -216,5 +250,18 @@ mod tests {
         );
         let text = fs::read_to_string(&path).unwrap();
         assert!(text.contains("session_open"));
+    }
+
+    #[test]
+    fn old_transfer_line_without_structured_fields_still_parses() {
+        let line = r#"{"ts":"2020-01-02T03:04:05Z","action":"transfer","hosts":["web-1"],"command":"upload a → b","results":{"web-1":1}}"#;
+        let entry: AuditEntry = serde_json::from_str(line).unwrap();
+        assert_eq!(entry.action, "transfer");
+        assert_eq!(entry.command.as_deref(), Some("upload a → b"));
+        assert!(entry.direction.is_none());
+        assert!(entry.src.is_none());
+        assert!(entry.dst.is_none());
+        assert_eq!(entry.results.as_ref().unwrap().get("web-1"), Some(&1));
+        assert_eq!(entry.summary(), "upload a → b");
     }
 }

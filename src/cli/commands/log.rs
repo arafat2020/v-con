@@ -78,7 +78,7 @@ pub fn run(paths: &Paths, request: &LogRequest<'_>) -> Result<ExitCode, Error> {
 
 fn format_line(entry: &AuditEntry) -> String {
     let hosts = entry.hosts.join(",");
-    let command = entry.command.as_deref().unwrap_or("-");
+    let command = entry.summary();
     let result = entry
         .results
         .as_ref()

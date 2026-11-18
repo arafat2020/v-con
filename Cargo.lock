@@ -3671,6 +3671,7 @@ dependencies = [
  "glob",
  "insta",
  "keyring",
+ "libc",
  "nucleo",
  "openssh-sftp-client",
  "portable-pty",
