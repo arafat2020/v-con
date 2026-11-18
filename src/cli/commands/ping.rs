@@ -23,6 +23,8 @@ pub struct PingRequest<'a> {
     pub parallel: Option<usize>,
     /// Per-host timeout in seconds.
     pub timeout: Option<u64>,
+    /// Emit one JSON object instead of the table.
+    pub json: bool,
 }
 
 /// Connect with `true` and print round-trip time per host.
@@ -83,6 +85,8 @@ pub fn run(
     let runner = Arc::new(SystemSsh::new(program));
     let (tx, mut rx) = mpsc::channel(128);
     let started = Instant::now();
+    let json = request.json;
+    let mut rows: Vec<PingRow> = Vec::new();
     let summary = tokio::runtime::Builder::new_current_thread()
         .enable_all()
         .build()
@@ -92,39 +96,78 @@ pub fn run(
             let join = tokio::spawn(job::run_job(runner, targets, timeout, parallel, cancel, tx));
             while let Some(event) = rx.recv().await {
                 if let job::JobEvent::HostFinished { host, outcome } = event {
-                    match outcome.status {
-                        EndStatus::Ok => {
-                            println!(
-                                "{:<16} ok    {:>7.1} ms",
-                                host,
-                                outcome.duration.as_secs_f64() * 1000.0
-                            );
-                        }
-                        _ => {
-                            println!(
-                                "{:<16} fail  {} ({:.1} ms)",
-                                host,
-                                outcome.reason,
-                                outcome.duration.as_secs_f64() * 1000.0
-                            );
-                        }
+                    let row = PingRow::from_outcome(&host, &outcome);
+                    if !json {
+                        println!("{}", row.text());
                     }
+                    rows.push(row);
                 }
             }
             join.await
                 .map_err(|error| Error::Message(error.to_string()))
         })?;
 
-    eprintln!(
-        "{} hosts in {:.1}s: {} ok, {} failed",
-        hosts.len(),
-        started.elapsed().as_secs_f64(),
-        summary.ok,
-        summary.failed + summary.skipped
-    );
+    if json {
+        let payload = serde_json::json!({
+            "ok": summary.ok,
+            "failed": summary.failed + summary.skipped,
+            "hosts": rows,
+        });
+        println!(
+            "{}",
+            serde_json::to_string_pretty(&payload)
+                .map_err(|error| Error::Message(error.to_string()))?
+        );
+    } else {
+        eprintln!(
+            "{} hosts in {:.1}s: {} ok, {} failed",
+            hosts.len(),
+            started.elapsed().as_secs_f64(),
+            summary.ok,
+            summary.failed + summary.skipped
+        );
+    }
     Ok(if summary.failed + summary.skipped > 0 {
         ExitCode::from(3)
     } else {
         ExitCode::SUCCESS
     })
+}
+
+#[derive(Debug, serde::Serialize)]
+struct PingRow {
+    host: String,
+    ok: bool,
+    ms: f64,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    reason: Option<String>,
+}
+
+impl PingRow {
+    fn from_outcome(host: &str, outcome: &job::HostOutcome) -> Self {
+        let ok = outcome.status == EndStatus::Ok;
+        Self {
+            host: host.to_string(),
+            ok,
+            ms: outcome.duration.as_secs_f64() * 1000.0,
+            reason: if ok {
+                None
+            } else {
+                Some(outcome.reason.clone())
+            },
+        }
+    }
+
+    fn text(&self) -> String {
+        if self.ok {
+            format!("{:<16} ok    {:>7.1} ms", self.host, self.ms)
+        } else {
+            format!(
+                "{:<16} fail  {} ({:.1} ms)",
+                self.host,
+                self.reason.as_deref().unwrap_or("failed"),
+                self.ms
+            )
+        }
+    }
 }

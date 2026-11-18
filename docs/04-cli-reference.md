@@ -27,12 +27,12 @@ to add once the matching TUI feature exists.
 | `vcon connect <name>` (`c`) | 2 | Interactive SSH straight from your shell (replaces the process with ssh) |
 | `vcon exec <selector> -- <command>` (`x`) | 4 | Parallel command; grouped or `--stream` output; exit code 3 if any host failed |
 | `vcon status [selector]` (`st`) | 5 | One-shot health table or `--json` |
-| `vcon push <selector> <local> <remote>` | 6 | Upload via rsync/scp |
-| `vcon pull <name> <remote> <local>` | 6 | Download via rsync/scp |
+| `vcon push <selector> <local> <remote>` | 6 | Upload via SFTP |
+| `vcon pull <name> <remote> <local>` | 6 | Download via SFTP |
 | `vcon tunnel <name> <spec or saved name>` | 8 | Foreground port forward, Ctrl+C to stop |
 | `vcon snippet run <name> <selector> [--var k=v]` | 8 | Run a saved snippet |
 | `vcon log [--host h] [--since 1d]` | 8 | Print the audit log |
-| `vcon doctor` | 9 | Check ssh/rsync, config validity, agent keys |
+| `vcon doctor` | 9 | Check ssh, config validity, agent keys |
 | `vcon completions <shell>` | 9 | Shell completion script (bash/zsh/fish/powershell/elvish) |
 | `vcon man` | 9 | Print the man page (troff) to stdout |
 
@@ -44,7 +44,7 @@ to add once the matching TUI feature exists.
 | `-t`, `--timeout <secs>` | Per-host timeout |
 | `--stream` / `--grouped` | Output mode (grouped is default) |
 | `--only-failed` | Only show output of failed hosts |
-| `--dry-run` | Show hosts and exact ssh commands, run nothing |
+| `--dry-run` | Show hosts and exact ssh commands, run nothing. Put it before the command; after the command words it is rejected unless it follows `--` |
 | `--sudo` | Prefix with `sudo -n` (fail instead of hanging on a password) |
 
 ## Example

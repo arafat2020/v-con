@@ -430,6 +430,13 @@ fn end_status(result: &ProcessResult) -> EndStatus {
 }
 
 fn reason_for(result: &ProcessResult) -> String {
+    if let Some(line) = result
+        .stderr
+        .lines()
+        .find(|line| line.contains("saved password was rejected"))
+    {
+        return line.to_string();
+    }
     if let Some(error) = &result.spawn_error {
         return error.clone();
     }

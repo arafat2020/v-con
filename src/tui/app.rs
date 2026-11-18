@@ -903,7 +903,8 @@ impl App {
                     vec![
                         Line::from(format!("Host {name}")),
                         Line::from(format!("Password {mask}")),
-                        Line::from("Enter saves   Ctrl-U removes   Esc cancels"),
+                        Line::from("Enter checks the password, then saves"),
+                        Line::from("Ctrl-U removes   Esc cancels"),
                         Line::from("Stored in the OS keychain, not in hosts.toml."),
                     ],
                 )
@@ -1239,16 +1240,65 @@ impl App {
         };
         match code {
             KeyCode::Esc => {}
-            KeyCode::Enter => match self.secrets.set(&name, &input) {
-                Ok(()) => {
-                    self.keychain_known.insert(name, true);
-                    self.toast("saved in the login keychain");
-                }
-                Err(error) => {
+            KeyCode::Enter => {
+                if input.is_empty() {
+                    self.toast("password is empty");
                     self.modal = Some(Modal::Password { name, input });
-                    self.toast(error.to_string());
+                    return Vec::new();
                 }
-            },
+                let Some(host) = self.hosts.iter().find(|host| host.name == name).cloned() else {
+                    self.toast(format!("no host `{name}`"));
+                    return Vec::new();
+                };
+                let Some(program) = self.ssh.clone().or_else(|| {
+                    crate::infra::ssh::system::find_program(
+                        "ssh",
+                        std::env::var_os("PATH").as_deref(),
+                    )
+                }) else {
+                    self.toast("ssh was not found");
+                    self.modal = Some(Modal::Password { name, input });
+                    return Vec::new();
+                };
+                let hosts = self.hosts.clone();
+                let cache = self.cache_dir.clone();
+                let control = self.control_dir.clone();
+                let multiplexing = self.multiplexing;
+                let secret = input.clone();
+                let checked = std::thread::spawn(move || {
+                    crate::services::login::password_works(
+                        &program,
+                        &host,
+                        &hosts,
+                        &cache,
+                        &secret,
+                        multiplexing,
+                        &control,
+                    )
+                })
+                .join();
+                match checked {
+                    Ok(Ok(())) => match self.secrets.set(&name, &input) {
+                        Ok(()) => {
+                            crate::infra::secrets::clear_rejection(&name);
+                            self.keychain_known.insert(name, true);
+                            self.toast("saved in the login keychain");
+                        }
+                        Err(error) => {
+                            self.modal = Some(Modal::Password { name, input });
+                            self.toast(error.to_string());
+                        }
+                    },
+                    Ok(Err(error)) => {
+                        self.modal = Some(Modal::Password { name, input });
+                        self.toast(error.to_string());
+                    }
+                    Err(_) => {
+                        self.modal = Some(Modal::Password { name, input });
+                        self.toast("could not check the password");
+                    }
+                }
+            }
             KeyCode::Char('u') if modifiers.contains(KeyModifiers::CONTROL) => {
                 match self.secrets.delete(&name) {
                     Ok(()) => {

@@ -74,13 +74,20 @@ the session — so record "last connected" **before** exec'ing.
 
 ---
 
-## D7: Never store passwords
+## D7: Keep login passwords in the OS keychain, not in the inventory
 
-**Why:** Passwords in a config file are a liability. Key-based auth +
-ssh-agent is the standard. All non-interactive operations use
-`BatchMode=yes`, so a host that wants a password fails fast instead of
-hanging a parallel run. Optional OS keychain support (`keyring`) for key
-passphrases is a phase 8 stretch goal.
+**Decision:** vcon does not write passwords into `hosts.toml`. When vcon
+itself obtains a login password and ssh accepts it, the secret is stored in
+the operating-system keychain under the host name. Later connections reuse
+it through an askpass helper. The helper answers only that host's login
+prompt. A saved password that ssh rejects is tried once. On a terminal vcon
+asks for a new one, checks it, and replaces the keychain entry. Without a
+terminal the command fails and says to update the entry with `P`.
+
+**Why:** Passwords in a config file are a liability. The keychain is
+unlocked with the user session, and the secret is not placed on argv or in
+ssh's environment. Key-based auth and ssh-agent still work and are preferred
+when a key is configured. `P` in the TUI is the same check-then-save path.
 
 ---
 

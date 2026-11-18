@@ -22,7 +22,7 @@ and keep an audit trail — driven by system OpenSSH (agent, jump hosts,
 | | |
 |--|--|
 | **Platforms** | macOS · Linux |
-| **Needs** | `ssh` on `PATH` (optional `rsync`) |
+| **Needs** | `ssh` on `PATH` |
 | **UI** | Full-screen TUI — run `vcon` |
 | **Scripting** | Same engine via CLI subcommands |
 | **Docs** | [User manual](MANUAL.md) · [Changelog](CHANGELOG.md) · [Design notes](docs/README.md) |
@@ -289,8 +289,9 @@ vcon man | man -l -
 ## Not in scope
 
 Provisioning (Terraform), config management (Ansible), a web UI, Windows
-hosts, storing passwords, or replacing every tmux feature. vcon is for
-**interactive, ad-hoc** fleet work on Linux servers.
+hosts, or replacing every tmux feature. vcon is for **interactive, ad-hoc**
+fleet work on Linux servers. Login passwords are kept in the OS keychain
+after a successful prompt (see MANUAL), not in `hosts.toml`.
 
 ---
 

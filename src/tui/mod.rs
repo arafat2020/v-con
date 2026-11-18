@@ -490,22 +490,36 @@ fn handle_tunnels_command(
                 .ok_or_else(|| Error::Message(format!("no host `{host}`")))?;
             let host_owned = host_ref.clone();
             let hosts = app.effective_hosts().to_vec();
-            let auth = crate::infra::secrets::saved_auth(
-                app.secrets(),
-                app.cache_dir(),
-                &host_owned,
-                crate::infra::secrets::AskpassMode::Force,
-            );
-            let mut options =
-                connect::session_options(app.multiplexing_enabled(), app.control_dir_path());
-            options.password_auth = auth.password_auth;
-            live.manager.start(
+            let program = app
+                .ssh_program()
+                .cloned()
+                .or_else(|| system::find_program("ssh", std::env::var_os("PATH").as_deref()))
+                .ok_or_else(|| Error::Message(system::missing_ssh_message().to_string()))?;
+            let store_auth = crate::services::login::prepare_host_auth(
+                &crate::services::login::Prepare {
+                    store: app.secrets(),
+                    cache_dir: app.cache_dir(),
+                    program: &program,
+                    host: &host_owned,
+                    hosts: &hosts,
+                    interactive: true,
+                    multiplexing: false,
+                    control_dir: app.control_dir_path(),
+                },
+                &crate::services::login::TtyPrompt,
+            )?;
+            let args = crate::cli::commands::tunnel::forward_args(
                 &host_owned,
                 &hosts,
+                &spec,
+                store_auth.password_auth,
+            );
+            live.manager.start(
+                &host_owned,
                 label.clone(),
                 spec.clone(),
-                &options,
-                &auth.env,
+                args,
+                &store_auth.env,
             )?;
             app.audit_tunnel_start(&host, &label, &spec);
             app.set_running_tunnels(live.manager.list());
@@ -604,7 +618,7 @@ fn open_session(
     host: &str,
     rows: u16,
     cols: u16,
-    mode: crate::infra::secrets::AskpassMode,
+    _mode: crate::infra::secrets::AskpassMode,
 ) -> Result<crate::services::sessions::SessionId, Error> {
     let program = app
         .ssh_program()
@@ -618,10 +632,21 @@ fn open_session(
         .cloned();
     let mut options = connect::session_options(app.multiplexing_enabled(), app.control_dir_path());
     let askpass = if let Some(host_ref) = host_ref.as_ref() {
-        let auth =
-            crate::infra::secrets::saved_auth(app.secrets(), app.cache_dir(), host_ref, mode);
-        options.password_auth = auth.password_auth;
-        auth.env
+        let ready = crate::services::login::prepare_host_auth(
+            &crate::services::login::Prepare {
+                store: app.secrets(),
+                cache_dir: app.cache_dir(),
+                program: &program,
+                host: host_ref,
+                hosts: app.effective_hosts(),
+                interactive: true,
+                multiplexing: app.multiplexing_enabled(),
+                control_dir: app.control_dir_path(),
+            },
+            &crate::services::login::TtyPrompt,
+        )?;
+        options.password_auth = ready.password_auth;
+        ready.env
     } else {
         Vec::new()
     };
@@ -1057,6 +1082,13 @@ async fn run_handoff(
     app: &mut App,
     handoff: Handoff,
 ) -> Result<(), Error> {
+    let handoff = match prepare_handoff(app, handoff) {
+        Ok(handoff) => handoff,
+        Err(error) => {
+            app.show_error(error.to_string());
+            return Ok(());
+        }
+    };
     let mut attempt = 0;
     loop {
         terminal::suspend(terminal).map_err(|error| Error::Message(error.to_string()))?;
@@ -1093,6 +1125,43 @@ async fn run_handoff(
 enum SessionEnd {
     Connect(io::Result<std::process::ExitStatus>),
     Editor(io::Result<std::process::ExitStatus>),
+}
+
+fn prepare_handoff(app: &App, handoff: Handoff) -> Result<Handoff, Error> {
+    let Handoff::Connect(spec) = &handoff else {
+        return Ok(handoff);
+    };
+    let Some(host) = app
+        .effective_hosts()
+        .iter()
+        .find(|candidate| candidate.name == spec.host_name)
+        .cloned()
+    else {
+        return Ok(handoff);
+    };
+    let ready = crate::services::login::prepare_host_auth(
+        &crate::services::login::Prepare {
+            store: app.secrets(),
+            cache_dir: app.cache_dir(),
+            program: &spec.program,
+            host: &host,
+            hosts: app.effective_hosts(),
+            interactive: true,
+            multiplexing: app.multiplexing_enabled(),
+            control_dir: app.control_dir_path(),
+        },
+        &crate::services::login::TtyPrompt,
+    )?;
+    let mut options = connect::session_options(app.multiplexing_enabled(), app.control_dir_path());
+    options.password_auth = ready.password_auth;
+    let plan = connect::plan(&host, app.effective_hosts(), &options);
+    Ok(Handoff::Connect(crate::tui::action::ConnectHandoff {
+        host_name: spec.host_name.clone(),
+        banner: spec.banner.clone(),
+        program: spec.program.clone(),
+        args: plan.args,
+        askpass: ready.env,
+    }))
 }
 
 fn execute_handoff(handoff: Handoff) -> SessionEnd {

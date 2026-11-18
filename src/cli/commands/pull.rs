@@ -7,6 +7,7 @@ use crate::infra::secrets::{self, AskpassMode};
 use crate::paths::Paths;
 use crate::services::files::{copy_file, plan_copies};
 use crate::services::inventory::InventoryBundle;
+use std::io::IsTerminal;
 use std::path::Path;
 use std::process::ExitCode;
 use std::sync::Arc;
@@ -47,12 +48,21 @@ pub fn run(
     let control = config
         .multiplexing
         .then(|| paths.control_dir().display().to_string());
-    let auth = secrets::saved_auth(
-        secrets::system_store().as_ref(),
-        &paths.cache_dir,
-        host,
-        AskpassMode::Force,
-    );
+    let store = secrets::system_store();
+    crate::services::login::prepare_host_auth(
+        &crate::services::login::Prepare {
+            store: store.as_ref(),
+            cache_dir: &paths.cache_dir,
+            program: &program,
+            host,
+            hosts: &bundle.hosts,
+            interactive: std::io::stdin().is_terminal(),
+            multiplexing: config.multiplexing,
+            control_dir: &paths.control_dir(),
+        },
+        &crate::services::login::TtyPrompt,
+    )?;
+    let auth = secrets::saved_auth(store.as_ref(), &paths.cache_dir, host, AskpassMode::Force);
     let args = sftp_arguments_auth(
         host,
         &bundle.hosts,

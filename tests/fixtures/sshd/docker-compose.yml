@@ -14,3 +14,16 @@ services:
       PUBLIC_KEY: ${VCON_TEST_PUBLIC_KEY:?set VCON_TEST_PUBLIC_KEY}
     ports:
       - "127.0.0.1:${VCON_TEST_SSH_PORT:-2222}:2222"
+  sshd-pw:
+    profiles: ["password"]
+    image: lscr.io/linuxserver/openssh-server:latest
+    environment:
+      PUID: "1000"
+      PGID: "1000"
+      TZ: Utc
+      USER_NAME: alice
+      USER_PASSWORD: ${VCON_TEST_PASSWORD:-Correct-Horse-1}
+      PASSWORD_ACCESS: "true"
+      PUBLIC_KEY: ${VCON_TEST_PUBLIC_KEY:?set VCON_TEST_PUBLIC_KEY}
+    ports:
+      - "127.0.0.1:${VCON_TEST_PW_PORT:-2231}:2222"

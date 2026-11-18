@@ -5,11 +5,12 @@
 
 use crate::config::Config;
 use crate::error::Error;
-use crate::infra::secrets::{self, AskpassMode};
 use crate::infra::ssh::system;
 use crate::paths::Paths;
 use crate::services::connect::{self, ConnectPlan};
 use crate::services::inventory::InventoryBundle;
+use crate::services::login::{self, TtyPrompt};
+use std::io::IsTerminal;
 
 /// Resolve `name`, record it, and replace the process with ssh.
 pub fn run(
@@ -20,16 +21,24 @@ pub fn run(
 ) -> Result<ConnectPlan, Error> {
     let program = system::find_ssh()?;
     let host = connect::resolve_host(name, &bundle.hosts).map_err(Error::Message)?;
-    let auth = secrets::saved_auth(
-        secrets::system_store().as_ref(),
-        &paths.cache_dir,
-        host,
-        AskpassMode::Prefer,
-    );
+    let store = crate::infra::secrets::system_store();
+    let ready = login::prepare_host_auth(
+        &login::Prepare {
+            store: store.as_ref(),
+            cache_dir: &paths.cache_dir,
+            program: &program,
+            host,
+            hosts: &bundle.hosts,
+            interactive: std::io::stdin().is_terminal(),
+            multiplexing: config.multiplexing,
+            control_dir: &paths.control_dir(),
+        },
+        &TtyPrompt,
+    )?;
     let mut options = connect::session_options(config.multiplexing, &paths.control_dir());
-    options.password_auth = auth.password_auth;
+    options.password_auth = ready.password_auth;
     let mut plan = connect::prepare(&bundle.hosts, &paths.state_file(), &options, name)?;
-    plan.askpass = auth.env;
+    plan.askpass = ready.env;
     println!("{}", plan.banner);
     connect::replace_process(&program, &plan.args, &plan.askpass)?;
     Ok(plan)

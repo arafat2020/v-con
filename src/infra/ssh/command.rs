@@ -51,11 +51,7 @@ pub fn build_ssh_command(
         args.push(shellexpand::tilde(identity).into_owned());
     }
 
-    let jumps = jump_chain(host, hosts);
-    if !jumps.is_empty() {
-        args.push("-J".to_string());
-        args.push(jumps.join(","));
-    }
+    emit_jump(&mut args, host, hosts);
 
     if options.batch_mode && !options.password_auth {
         args.push("-o".to_string());
@@ -64,6 +60,11 @@ pub fn build_ssh_command(
     if options.password_auth {
         args.push("-o".to_string());
         args.push("NumberOfPasswordPrompts=1".to_string());
+        // keyboard-interactive is a second password prompt. One failure is enough.
+        args.push("-o".to_string());
+        args.push("KbdInteractiveAuthentication=no".to_string());
+        args.push("-o".to_string());
+        args.push("PreferredAuthentications=publickey,password".to_string());
     }
 
     if let Some(timeout) = options.connect_timeout.or(host.connect_timeout) {
@@ -165,12 +166,170 @@ pub fn command_line(args: &[String]) -> String {
         .join(" ")
 }
 
+/// How to reach `host` through its jump chain.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub(crate) enum JumpDirective {
+    /// OpenSSH `-J` list, client first. No hop needs its own identity file.
+    ProxyJump(String),
+    /// Shell command for `-o ProxyCommand=`. Each hop can carry `-i`.
+    ProxyCommand(String),
+}
+
+/// Add `-J` or a `ProxyCommand` that logs into each hop with its own key.
+fn emit_jump(args: &mut Vec<String>, host: &EffectiveHost, hosts: &[EffectiveHost]) {
+    let Some(directive) = jump_directive(host, hosts) else {
+        return;
+    };
+    match directive {
+        JumpDirective::ProxyJump(spec) => {
+            args.push("-J".to_string());
+            args.push(spec);
+        }
+        JumpDirective::ProxyCommand(command) => {
+            args.push("-o".to_string());
+            args.push(format!("ProxyCommand={command}"));
+        }
+    }
+}
+
+/// `-J` when every hop can authenticate without its own key. Otherwise a
+/// `ProxyCommand` so each hop is started with `-i` and `IdentitiesOnly=yes`.
+pub(crate) fn jump_directive(
+    host: &EffectiveHost,
+    hosts: &[EffectiveHost],
+) -> Option<JumpDirective> {
+    let hops = resolved_hops(host, hosts);
+    if hops.is_empty() {
+        return None;
+    }
+    let needs_key = hops
+        .iter()
+        .any(|hop| matches!(hop, Hop::Inventory(host) if host.identity_file.is_some()));
+    if needs_key {
+        Some(JumpDirective::ProxyCommand(proxy_command(&hops)))
+    } else {
+        let spec = hops
+            .iter()
+            .map(|hop| match hop {
+                Hop::Inventory(host) => jump_destination(host),
+                Hop::Raw(spec) => spec.clone(),
+            })
+            .collect::<Vec<_>>()
+            .join(",");
+        Some(JumpDirective::ProxyJump(spec))
+    }
+}
+
+/// One hop between the client and the target, client first.
+#[derive(Debug, Clone)]
+enum Hop<'a> {
+    Inventory(&'a EffectiveHost),
+    Raw(String),
+}
+
+/// Jump hops for `host`, client first. A cycle or an unknown name stops the walk.
+fn resolved_hops<'a>(host: &'a EffectiveHost, hosts: &'a [EffectiveHost]) -> Vec<Hop<'a>> {
+    let mut chain = Vec::new();
+    let mut seen = HashSet::from([host.name.clone()]);
+    let mut next = host.jump.clone();
+    while let Some(jump) = next {
+        if is_plain_jump(&jump) {
+            if !seen.insert(jump.clone()) {
+                break;
+            }
+            if let Some(hop) = hosts.iter().find(|candidate| candidate.name == jump) {
+                chain.push(Hop::Inventory(hop));
+                next = hop.jump.clone();
+                continue;
+            }
+        }
+        chain.push(Hop::Raw(jump));
+        break;
+    }
+    chain.reverse();
+    chain
+}
+
+/// Shell command that tunnels to `%h:%p` through `hops` (client first).
+///
+/// Only the outermost `-W` uses `%h:%p`. Earlier hops use a literal address so
+/// OpenSSH's percent expansion does not rewrite them to the final target.
+fn proxy_command(hops: &[Hop<'_>]) -> String {
+    fn build(hops: &[Hop<'_>], w_dest: &str) -> String {
+        let hop = hops.last().expect("hop");
+        let earlier = &hops[..hops.len() - 1];
+        let mut parts = hop_ssh_args(hop);
+        if !earlier.is_empty() {
+            let via = literal_hostport(hop);
+            let inner = build(earlier, &via);
+            parts.push("-o".to_string());
+            parts.push(format!("ProxyCommand={inner}"));
+        }
+        parts.push("-W".to_string());
+        parts.push(w_dest.to_string());
+        parts.push(hop_login(hop));
+        parts
+            .iter()
+            .map(|part| shell_quote(part))
+            .collect::<Vec<_>>()
+            .join(" ")
+    }
+    build(hops, "%h:%p")
+}
+
+fn hop_ssh_args(hop: &Hop<'_>) -> Vec<String> {
+    let mut parts = vec!["ssh".to_string()];
+    if let Hop::Inventory(host) = hop
+        && let Some(identity) = &host.identity_file
+    {
+        parts.push("-i".to_string());
+        parts.push(shellexpand::tilde(identity).into_owned());
+        parts.push("-o".to_string());
+        parts.push("IdentitiesOnly=yes".to_string());
+    }
+    if let Hop::Inventory(host) = hop
+        && host.port != 22
+    {
+        parts.push("-p".to_string());
+        parts.push(host.port.to_string());
+    }
+    parts.push("-o".to_string());
+    parts.push("BatchMode=yes".to_string());
+    parts
+}
+
+fn hop_login(hop: &Hop<'_>) -> String {
+    match hop {
+        Hop::Inventory(host) => host.destination(),
+        Hop::Raw(spec) => spec.clone(),
+    }
+}
+
+fn literal_hostport(hop: &Hop<'_>) -> String {
+    match hop {
+        Hop::Inventory(host) => format!("{}:{}", host.address, host.port),
+        Hop::Raw(spec) => raw_hostport(spec),
+    }
+}
+
+/// `user@host[:port]` or `host[:port]` as `host:port`.
+fn raw_hostport(spec: &str) -> String {
+    let hostpart = spec.rsplit('@').next().unwrap_or(spec);
+    if let Some((host, port)) = hostpart.rsplit_once(':')
+        && !host.is_empty()
+        && port.chars().all(|ch| ch.is_ascii_digit())
+    {
+        return format!("{host}:{port}");
+    }
+    format!("{hostpart}:22")
+}
+
 /// Resolved `-J` hops for `host`, client first.
 ///
 /// Plain names are looked up in `hosts` and the walk follows each hop's own
 /// jump. A raw `user@host[:port]` stops the walk. A repeated name stops it too,
-/// so an invalid cycle cannot loop forever. The hop's identity file is not
-/// included: ssh-agent or `~/.ssh/config` authenticates the bastion.
+/// so an invalid cycle cannot loop forever. When a hop has `identity_file`,
+/// [`jump_directive`] emits a ProxyCommand instead of this list.
 pub fn jump_chain(host: &EffectiveHost, hosts: &[EffectiveHost]) -> Vec<String> {
     let mut chain = Vec::new();
     let mut seen = HashSet::from([host.name.clone()]);
@@ -317,10 +476,17 @@ mod tests {
             args.windows(2)
                 .any(|pair| pair[0] == "-i" && pair[1].ends_with("/.ssh/db_key"))
         );
-        assert!(
-            args.windows(2)
-                .any(|pair| pair == ["-J", "admin@198.51.100.5"])
-        );
+        let proxy = args
+            .windows(2)
+            .find(|pair| pair[0] == "-o" && pair[1].starts_with("ProxyCommand="))
+            .map(|pair| pair[1].as_str())
+            .expect("bastion identity_file needs a ProxyCommand");
+        assert!(proxy.contains("id_ed25519"), "hop key missing from {proxy}");
+        assert!(proxy.contains("IdentitiesOnly=yes"), "{proxy}");
+        assert!(proxy.contains("-W"), "{proxy}");
+        assert!(proxy.contains("%h:%p"), "{proxy}");
+        assert!(proxy.contains("admin@198.51.100.5"), "{proxy}");
+        assert!(!args.iter().any(|arg| arg == "-J"));
         assert!(args.windows(2).any(|pair| pair == ["-o", "BatchMode=yes"]));
         assert!(
             args.windows(2)
@@ -346,6 +512,7 @@ mod tests {
                     && !pair[1].starts_with("Batch")
                     && !pair[1].starts_with("Connect")
                     && !pair[1].starts_with("Control")
+                    && !pair[1].starts_with("ProxyCommand=")
             })
             .map(|pair| pair[1].as_str())
             .collect();
@@ -371,6 +538,35 @@ mod tests {
                 .any(|pair| pair == ["-J", "root@198.51.100.1,admin@198.51.100.5:2222"])
         );
         assert_eq!(args.last().map(String::as_str), Some("deploy@10.0.0.8"));
+    }
+
+    #[test]
+    fn jump_identity_is_shell_quoted_and_a_chain_keeps_literal_hops() {
+        let mut edge = host("edge", "root", "198.51.100.1", 22);
+        edge.identity_file = Some("/keys/edge key".into());
+        let mut bastion = host("bastion", "admin", "198.51.100.5", 2222);
+        bastion.identity_file = Some("/keys/bastion".into());
+        bastion.jump = Some("edge".into());
+        let mut web = host("web-1", "deploy", "10.0.0.8", 22);
+        web.jump = Some("bastion".into());
+        let args = build_ssh_command(
+            &web,
+            &[edge, bastion, web.clone()],
+            &SshCommandOptions::default(),
+        );
+        let proxy = args
+            .windows(2)
+            .find(|pair| pair[0] == "-o" && pair[1].starts_with("ProxyCommand="))
+            .unwrap()[1]
+            .clone();
+        assert!(
+            proxy.contains("'/keys/edge key'") || proxy.contains("'/keys/edge key'"),
+            "{proxy}"
+        );
+        assert!(proxy.contains("/keys/edge key"), "{proxy}");
+        assert!(proxy.contains("198.51.100.5:2222"), "{proxy}");
+        assert!(proxy.contains("%h:%p"), "{proxy}");
+        assert!(!args.iter().any(|arg| arg == "-J"));
     }
 
     #[test]
@@ -422,7 +618,11 @@ mod tests {
             args.windows(2)
                 .any(|pair| pair == ["-o", "NumberOfPasswordPrompts=1"])
         );
-        assert!(!args.iter().any(|arg| arg.contains("password")));
+        assert!(
+            args.windows(2)
+                .any(|pair| pair == ["-o", "KbdInteractiveAuthentication=no"])
+        );
+        assert!(!args.iter().any(|arg| arg.contains("s3cret")));
     }
 
     #[test]

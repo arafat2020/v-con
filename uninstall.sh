@@ -95,6 +95,9 @@ discover_manifests() {
         fi
     done
     if [[ ${#found[@]} -eq 0 ]]; then
+        if [[ "$PURGE" -eq 1 ]]; then
+            return 0
+        fi
         printf 'vcon does not look installed (no manifest under ~/.local or /usr/local).\n' >&2
         printf 'If you used another prefix: ./uninstall.sh --prefix DIR\n' >&2
         exit 0
@@ -218,7 +221,7 @@ for manifest in "${MANIFESTS[@]}"; do
     rmdir "${prefix}/share/fish/vendor_completions.d" 2>/dev/null || true
 done
 
-if [[ "$PURGE" -eq 1 && "$processed" -eq 1 ]]; then
+if [[ "$PURGE" -eq 1 && ( "$processed" -eq 1 || ${#MANIFESTS[@]} -eq 0 ) ]]; then
     HOME_DIR="$(user_home)"
     for dir in \
         "${XDG_CONFIG_HOME:-${HOME_DIR}/.config}/vcon" \
