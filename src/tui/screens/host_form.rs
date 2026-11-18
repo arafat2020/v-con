@@ -453,6 +453,70 @@ mod tests {
         }
     }
 
+    fn type_text(form: &mut HostForm, inventory: &Inventory, text: &str) {
+        for ch in text.chars() {
+            on_key(form, inventory, KeyCode::Char(ch), KeyModifiers::NONE);
+        }
+    }
+
+    fn focus_field(form: &mut HostForm, inventory: &Inventory, id: &str) {
+        for _ in 0..form.form.fields.len() {
+            if form
+                .form
+                .fields
+                .get(form.form.focus)
+                .is_some_and(|field| field.id == id)
+            {
+                return;
+            }
+            on_key(form, inventory, KeyCode::Down, KeyModifiers::NONE);
+        }
+        panic!("no field {id}");
+    }
+
+    #[test]
+    fn pending_tags_are_saved_without_enter() {
+        let inventory = inventory();
+        let mut form = add_form(&inventory, "ada");
+        type_text(&mut form, &inventory, "edge");
+        on_key(&mut form, &inventory, KeyCode::Down, KeyModifiers::NONE);
+        type_text(&mut form, &inventory, "10.0.0.1");
+        focus_field(&mut form, &inventory, "tags");
+        type_text(&mut form, &inventory, " alpha, beta, ,alpha ");
+        match on_key(
+            &mut form,
+            &inventory,
+            KeyCode::Char('s'),
+            KeyModifiers::CONTROL,
+        ) {
+            HostFormEvent::Submit {
+                host,
+                original_name,
+            } => {
+                assert!(original_name.is_none());
+                assert_eq!(host.name, "edge");
+                assert_eq!(host.tags, vec!["alpha".to_string(), "beta".to_string()]);
+            }
+            other => panic!("expected submit, got {other:?}"),
+        }
+    }
+
+    #[test]
+    fn save_button_commits_pending_tags_and_skips_duplicates() {
+        let inventory = inventory();
+        let existing = inventory.hosts[0].clone();
+        let mut form = edit_form(&existing, &inventory, "ada");
+        focus_field(&mut form, &inventory, "tags");
+        type_text(&mut form, &inventory, "web, staging");
+        focus_field(&mut form, &inventory, "save");
+        match on_key(&mut form, &inventory, KeyCode::Enter, KeyModifiers::NONE) {
+            HostFormEvent::Submit { host, .. } => {
+                assert_eq!(host.tags, vec!["web".to_string(), "staging".to_string()]);
+            }
+            other => panic!("expected submit, got {other:?}"),
+        }
+    }
+
     #[test]
     fn a_missing_identity_file_is_a_warning() {
         let inventory = Inventory::default();

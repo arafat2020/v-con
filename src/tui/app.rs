@@ -2251,10 +2251,8 @@ impl App {
     }
 
     fn sessions_key(&mut self, code: KeyCode, modifiers: KeyModifiers) -> Vec<UiCommand> {
-        let is_prefix = code == self.session_prefix.0
-            && modifiers
-                .intersection(KeyModifiers::CONTROL | KeyModifiers::ALT | KeyModifiers::SHIFT)
-                == self.session_prefix.1;
+        let (code, modifiers) = keymap::canonical_session_key(code, modifiers, self.session_prefix);
+        let is_prefix = keymap::is_session_prefix(code, modifiers, self.session_prefix);
 
         if !self.sessions.focused
             && self.sessions.prefix_until.is_none()
@@ -3537,5 +3535,46 @@ jump = "web-1"
                 .any(|command| matches!(command, UiCommand::Suspend(_))),
             "Enter must not connect from Files: {commands:?}"
         );
+    }
+
+    #[test]
+    fn embedded_prefix_accepts_ctrl_bracket_and_legacy_ctrl_five() {
+        let mut app = preview(fleet());
+        app.screen = 4;
+        app.sessions
+            .open_tab(SessionId::from_raw(7), "web-1".into());
+
+        let armed = app.on_key(KeyCode::Char('5'), KeyModifiers::CONTROL);
+        assert!(
+            armed.is_empty(),
+            "legacy Ctrl+] should arm the prefix: {armed:?}"
+        );
+        assert!(app.sessions.prefix_until.is_some());
+
+        let sent = app.on_key(KeyCode::Char('5'), KeyModifiers::CONTROL);
+        match sent.as_slice() {
+            [UiCommand::Sessions(SessionsCommand::Write { id, bytes })] => {
+                assert_eq!(*id, SessionId::from_raw(7));
+                assert_eq!(bytes.as_slice(), b"\x1d");
+            }
+            other => panic!("second Ctrl+] should be sent to the shell, got {other:?}"),
+        }
+
+        let typed = app.on_key(KeyCode::Char('5'), KeyModifiers::NONE);
+        match typed.as_slice() {
+            [UiCommand::Sessions(SessionsCommand::Write { bytes, .. })] => {
+                assert_eq!(bytes.as_slice(), b"5");
+            }
+            other => panic!("plain 5 should reach the shell, got {other:?}"),
+        }
+
+        let armed = app.on_key(KeyCode::Char(']'), KeyModifiers::CONTROL);
+        assert!(armed.is_empty(), "Ctrl+] should arm the prefix: {armed:?}");
+        let jumped = app.on_key(KeyCode::Char('1'), KeyModifiers::NONE);
+        assert!(
+            jumped.is_empty(),
+            "prefix then 1 switches tabs and must not be typed: {jumped:?}"
+        );
+        assert!(app.sessions.prefix_until.is_none());
     }
 }
