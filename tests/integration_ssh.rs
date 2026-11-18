@@ -533,16 +533,7 @@ fn with_password_fixture(test: impl FnOnce(&PasswordFix)) {
         "sshpass",
         "python3",
     ] {
-        let found = Command::new("sh")
-            .args(["-c", &format!("command -v {tool}")])
-            .stdout(Stdio::null())
-            .stderr(Stdio::null())
-            .status()
-            .is_ok_and(|status| status.success());
-        if !found {
-            eprintln!("skipping password test: `{tool}` is not installed");
-            return;
-        }
+        require_password_tool(tool);
     }
     let root = tempfile::tempdir().unwrap().keep();
     let key = root.join("id_ed25519");
@@ -687,33 +678,60 @@ fn wait_for_password(port: u16, password: &str) -> bool {
     false
 }
 
+/// `DOCKER=1` means the password test must run. A missing tool is a failure.
+fn require_password_tool(name: &str) {
+    let found = Command::new("sh")
+        .args(["-c", &format!("command -v {name}")])
+        .stdout(Stdio::null())
+        .stderr(Stdio::null())
+        .status()
+        .is_ok_and(|status| status.success());
+    if !found {
+        panic!("DOCKER is set but `{name}` was not found");
+    }
+}
+
 fn start_keyring() -> Vec<(String, String)> {
     let launch = Command::new("dbus-launch")
         .arg("--sh-syntax")
         .output()
-        .expect("dbus-launch");
-    assert!(launch.status.success(), "dbus-launch failed");
+        .unwrap_or_else(|error| panic!("DOCKER is set but `dbus-launch` was not found: {error}"));
+    if !launch.status.success() {
+        panic!(
+            "keyring could not start: dbus-launch failed: {}",
+            String::from_utf8_lossy(&launch.stderr).trim()
+        );
+    }
     let mut env = parse_shell_env(&String::from_utf8_lossy(&launch.stdout));
     let mut daemon = Command::new("gnome-keyring-daemon");
     daemon
         .args(["--unlock", "--components=secrets"])
         .stdin(Stdio::piped())
         .stdout(Stdio::piped())
-        .stderr(Stdio::null());
+        .stderr(Stdio::piped());
     for (key, value) in &env {
         daemon.env(key, value);
     }
-    let mut child = daemon.spawn().expect("gnome-keyring-daemon");
+    let mut child = daemon.spawn().unwrap_or_else(|error| {
+        panic!("DOCKER is set but `gnome-keyring-daemon` was not found: {error}")
+    });
     if let Some(mut stdin) = child.stdin.take() {
         use std::io::Write;
         let _ = stdin.write_all(b"\n");
     }
-    let out = child.wait_with_output().expect("keyring");
+    let out = child.wait_with_output().unwrap_or_else(|error| {
+        panic!("keyring could not start: gnome-keyring-daemon failed: {error}")
+    });
+    if !out.status.success() {
+        panic!(
+            "keyring could not start: gnome-keyring-daemon failed: {}",
+            String::from_utf8_lossy(&out.stderr).trim()
+        );
+    }
     env.extend(parse_shell_env(&String::from_utf8_lossy(&out.stdout)));
-    assert!(
-        env.iter().any(|(key, _)| key == "DBUS_SESSION_BUS_ADDRESS"),
-        "dbus session missing"
-    );
+    if !env.iter().any(|(key, _)| key == "DBUS_SESSION_BUS_ADDRESS") {
+        panic!("keyring could not start: dbus session missing");
+    }
     env
 }
 
