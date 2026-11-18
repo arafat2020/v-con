@@ -134,6 +134,7 @@ Inside the TUI: `?` for keys, `1`–`5` for screens, `q` to quit.
 vcon ls @prod --json
 vcon x @web -- 'uptime'
 vcon status @prod --sort disk
+vcon status @prod --no-cpu          # one sample; CPU % and net rates stay empty
 vcon snippet run disk all
 vcon tunnel web-1 grafana          # Ctrl+C to stop
 vcon log --host web-1 --since 1d

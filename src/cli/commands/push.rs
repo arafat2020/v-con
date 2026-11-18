@@ -93,6 +93,7 @@ pub fn run(
     let store = secrets::system_store();
     let mut failed = false;
     for host in &hosts {
+        let started = std::time::Instant::now();
         let auth = secrets::saved_auth(store.as_ref(), &paths.cache_dir, host, AskpassMode::Force);
         let args = sftp_arguments_auth(
             host,
@@ -131,6 +132,20 @@ pub fn run(
             }
             Ok::<(), Error>(())
         });
+        let exit_code = if result.is_ok() { 0 } else { 1 };
+        crate::services::audit::record_transfer(
+            &paths.audit_file(),
+            &config.audit,
+            crate::services::audit::TransferAudit {
+                direction: "upload".into(),
+                selector: Some(request.selector.to_string()),
+                host: host.name.clone(),
+                src: local_path.to_string(),
+                dst: request.remote.to_string(),
+                exit_code,
+                duration_ms: started.elapsed().as_millis() as u64,
+            },
+        );
         match result {
             Ok(()) => println!("{} ok", host.name),
             Err(error) => {

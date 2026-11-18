@@ -65,7 +65,8 @@ pub fn run(
         .enable_all()
         .build()
         .map_err(|error| Error::Message(error.to_string()))?;
-    let failed = runtime.block_on(async {
+    let started = std::time::Instant::now();
+    let outcome = runtime.block_on(async {
         let remote = Arc::new(SftpFs::connect_with_env(program, args, &auth.env).await?);
         let planned = plan_copies(remote.as_ref(), &LocalFs, &remote_source, &local_dest).await?;
         let cancel = CancellationToken::new();
@@ -90,10 +91,28 @@ pub fn run(
             let _ = sftp.close().await;
         }
         Ok::<bool, Error>(any_failed)
-    })?;
-    if failed {
-        Ok(ExitCode::from(EXIT_SOME_FAILED))
-    } else {
-        Ok(ExitCode::SUCCESS)
+    });
+    let exit_code = match &outcome {
+        Ok(false) => 0,
+        Ok(true) => i32::from(EXIT_SOME_FAILED),
+        Err(_) => 1,
+    };
+    crate::services::audit::record_transfer(
+        &paths.audit_file(),
+        &config.audit,
+        crate::services::audit::TransferAudit {
+            direction: "download".into(),
+            selector: Some(host.name.clone()),
+            host: host.name.clone(),
+            src: request.remote.to_string(),
+            dst: local_dir.to_string(),
+            exit_code,
+            duration_ms: started.elapsed().as_millis() as u64,
+        },
+    );
+    match outcome {
+        Ok(false) => Ok(ExitCode::SUCCESS),
+        Ok(true) => Ok(ExitCode::from(EXIT_SOME_FAILED)),
+        Err(error) => Err(error),
     }
 }
