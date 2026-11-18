@@ -39,9 +39,25 @@ pub enum Error {
     /// A problem that is already a complete sentence, such as "hosts.toml already exists".
     #[error("{0}")]
     Message(String),
+    /// ssh, scp, or sftp exited. `code` is the process status, not a collapsed 0/1.
+    #[error("{message}")]
+    RemoteExit {
+        /// What failed, including the exit code when it is known.
+        message: String,
+        /// Process exit code.
+        code: i32,
+    },
 }
 
 impl Error {
+    /// Exit code when `ssh`, `scp`, or `sftp` itself failed.
+    pub fn remote_code(&self) -> Option<i32> {
+        match self {
+            Self::RemoteExit { code, .. } => Some(*code),
+            _ => None,
+        }
+    }
+
     /// Build a parse error, converting a byte span into a 1-based line.
     pub fn parse(
         path: impl Into<PathBuf>,

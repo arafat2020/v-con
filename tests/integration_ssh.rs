@@ -21,15 +21,47 @@ const COMPOSE_FILE: &str = "tests/fixtures/sshd/docker-compose.yml";
 const PROJECT: &str = "vcon-sshd-test";
 const PORT: u16 = 2222;
 
-fn docker_available() -> bool {
-    std::env::var_os("DOCKER").is_some_and(|value| value != "0")
-        && Command::new("docker")
-            .arg("info")
-            .stdout(Stdio::null())
-            .stderr(Stdio::null())
-            .status()
-            .map(|status| status.success())
-            .unwrap_or(false)
+/// What an ignored Docker test should do for this process.
+#[derive(Debug, PartialEq, Eq)]
+enum DockerGate {
+    /// `DOCKER` is unset. The test passes without touching a daemon.
+    Skip,
+    /// `DOCKER` is set and `docker` / `docker compose` both work.
+    Run,
+    /// `DOCKER` is set but docker or compose cannot be used.
+    Fail(String),
+}
+
+fn decide_docker(env_set: bool, usable: Result<(), String>) -> DockerGate {
+    if !env_set {
+        DockerGate::Skip
+    } else {
+        match usable {
+            Ok(()) => DockerGate::Run,
+            Err(error) => DockerGate::Fail(error),
+        }
+    }
+}
+
+fn docker_usable() -> Result<(), String> {
+    for args in [["info"].as_slice(), ["compose", "version"].as_slice()] {
+        let output = Command::new("docker")
+            .args(args)
+            .output()
+            .map_err(|error| format!("docker {}: {error}", args.join(" ")))?;
+        if !output.status.success() {
+            let stderr = String::from_utf8_lossy(&output.stderr);
+            let stdout = String::from_utf8_lossy(&output.stdout);
+            return Err(format!(
+                "docker {} exited {}: {} {}",
+                args.join(" "),
+                output.status,
+                stderr.trim(),
+                stdout.trim()
+            ));
+        }
+    }
+    Ok(())
 }
 
 struct Fixture {
@@ -37,6 +69,29 @@ struct Fixture {
     state: PathBuf,
     cache: PathBuf,
     data: PathBuf,
+    /// Stops the sshd container when the fixture drops, including after a panic.
+    _compose: ComposeGuard,
+}
+
+/// Runs `docker compose down` with the same public key `up` interpolated.
+struct ComposeGuard {
+    program: PathBuf,
+    pubkey: String,
+}
+
+impl ComposeGuard {
+    fn arm(pubkey: String) -> Self {
+        Self {
+            program: PathBuf::from("docker"),
+            pubkey,
+        }
+    }
+}
+
+impl Drop for ComposeGuard {
+    fn drop(&mut self) {
+        let _ = compose_down(&self.program, &self.pubkey);
+    }
 }
 
 impl Fixture {
@@ -71,8 +126,9 @@ impl Fixture {
             .env("VCON_TEST_SSH_PORT", PORT.to_string())
             .output()
             .map_err(|error| format!("docker compose: {error}"))?;
+        // Armed before any later failure or panic so `down` still runs.
+        let compose = ComposeGuard::arm(pubkey);
         if !up.status.success() {
-            let _ = compose_down();
             let _ = fs::remove_dir_all(&root);
             return Err(format!(
                 "docker compose up failed: {}",
@@ -80,7 +136,6 @@ impl Fixture {
             ));
         }
         if !wait_for_ssh(&key) {
-            let _ = compose_down();
             let _ = fs::remove_dir_all(&root);
             return Err("sshd fixture did not accept pubkey auth".into());
         }
@@ -103,6 +158,7 @@ ssh_options = {{ StrictHostKeyChecking = "no", UserKnownHostsFile = "/dev/null",
             state: root.join("state"),
             cache: root.join("cache"),
             data: root.join("data"),
+            _compose: compose,
         })
     }
 
@@ -119,16 +175,18 @@ ssh_options = {{ StrictHostKeyChecking = "no", UserKnownHostsFile = "/dev/null",
 
 impl Drop for Fixture {
     fn drop(&mut self) {
-        let _ = compose_down();
+        // `compose` drops with this value and stops sshd even if the test panicked.
         if let Some(root) = self.config.parent() {
             let _ = fs::remove_dir_all(root);
         }
     }
 }
 
-fn compose_down() -> std::io::Result<std::process::ExitStatus> {
-    Command::new("docker")
+fn compose_down(program: &Path, pubkey: &str) -> std::io::Result<std::process::ExitStatus> {
+    Command::new(program)
         .args(["compose", "-f", COMPOSE_FILE, "-p", PROJECT, "down", "-v"])
+        .env("VCON_TEST_PUBLIC_KEY", pubkey)
+        .env("VCON_TEST_SSH_PORT", PORT.to_string())
         .status()
 }
 
@@ -174,9 +232,15 @@ where
 {
     static LOCK: std::sync::Mutex<()> = std::sync::Mutex::new(());
     let _guard = LOCK.lock().unwrap_or_else(|poisoned| poisoned.into_inner());
-    if !docker_available() {
-        eprintln!("skipping: set DOCKER=1 with a working docker daemon");
-        return;
+    match decide_docker(std::env::var_os("DOCKER").is_some(), docker_usable()) {
+        DockerGate::Skip => {
+            eprintln!("skipping: DOCKER is unset");
+            return;
+        }
+        DockerGate::Fail(error) => {
+            panic!("DOCKER is set but docker/compose is unusable: {error}");
+        }
+        DockerGate::Run => {}
     }
     let fixture = Fixture::start().expect("start sshd fixture");
     test(&fixture);
@@ -215,4 +279,54 @@ fn status_against_fixture_host() {
                     .and(predicate::str::contains("fixture")),
             );
     });
+}
+
+#[cfg(test)]
+mod gate {
+    use super::*;
+
+    #[test]
+    fn unset_docker_skips_and_set_without_daemon_fails() {
+        assert_eq!(
+            decide_docker(false, Ok(())),
+            DockerGate::Skip,
+            "unset DOCKER skips even when a daemon exists"
+        );
+        assert_eq!(decide_docker(false, Err("down".into())), DockerGate::Skip);
+        assert!(matches!(
+            decide_docker(true, Err("docker info exited 1".into())),
+            DockerGate::Fail(_)
+        ));
+        assert_eq!(decide_docker(true, Ok(())), DockerGate::Run);
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn compose_guard_runs_down_when_the_test_panics() {
+        use std::os::unix::fs::PermissionsExt;
+        let dir = tempfile::tempdir().unwrap();
+        let log = dir.path().join("called");
+        let script = dir.path().join("docker");
+        let body = format!(
+            "#!/bin/sh\nprintf '%s\\n' \"$VCON_TEST_PUBLIC_KEY\" >> '{}'\nprintf '%s\\n' \"$VCON_TEST_SSH_PORT\" >> '{}'\nprintf '%s\\n' \"$*\" >> '{}'\n",
+            log.display(),
+            log.display(),
+            log.display()
+        );
+        fs::write(&script, body).unwrap();
+        fs::set_permissions(&script, fs::Permissions::from_mode(0o755)).unwrap();
+        let caught = std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| {
+            let mut guard = ComposeGuard::arm("ssh-ed25519 AAAATEST".into());
+            guard.program = script.clone();
+            panic!("fixture test panicked");
+        }));
+        assert!(caught.is_err());
+        let text = fs::read_to_string(&log).expect("down should have recorded the call");
+        assert!(
+            text.contains("ssh-ed25519 AAAATEST"),
+            "down must receive VCON_TEST_PUBLIC_KEY, got {text}"
+        );
+        assert!(text.contains("2222"), "{text}");
+        assert!(text.contains("down"), "{text}");
+    }
 }

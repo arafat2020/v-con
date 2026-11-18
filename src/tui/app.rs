@@ -1919,8 +1919,15 @@ impl App {
                     )
                 });
             if let Some((direction, source, destination, host)) = finished {
-                let command = format!("{direction:?} {source} → {destination}");
+                let direction_name = match direction {
+                    crate::services::files::TransferDirection::Upload => "upload",
+                    crate::services::files::TransferDirection::Download => "download",
+                };
+                let command = format!("{direction_name} {source} → {destination}");
                 let mut entry = audit::entry("transfer", vec![host.clone()], Some(command));
+                entry.direction = Some(direction_name.to_string());
+                entry.src = Some(source.clone());
+                entry.dst = Some(destination.clone());
                 let code = if *state == crate::services::files::TransferState::Done {
                     0
                 } else {

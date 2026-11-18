@@ -86,10 +86,13 @@ impl LogView {
         }
         if !self.search.is_empty() {
             let hay = format!(
-                "{} {} {} {}",
+                "{} {} {} {} {} {} {}",
                 entry.action,
                 entry.hosts.join(" "),
-                entry.command.as_deref().unwrap_or(""),
+                entry.summary(),
+                entry.direction.as_deref().unwrap_or(""),
+                entry.src.as_deref().unwrap_or(""),
+                entry.dst.as_deref().unwrap_or(""),
                 entry
                     .results
                     .as_ref()
@@ -203,7 +206,7 @@ pub fn draw(frame: &mut Frame, area: Rect, view: &mut LogView, theme: &Theme) {
         let entry = &view.entries[*index];
         let time = entry.ts.format("%m-%d %H:%M").to_string();
         let hosts = entry.hosts.join(",");
-        let command = entry.command.as_deref().unwrap_or("-");
+        let command = entry.summary();
         let result = entry
             .results
             .as_ref()
@@ -219,7 +222,7 @@ pub fn draw(frame: &mut Frame, area: Rect, view: &mut LogView, theme: &Theme) {
             time,
             entry.action.clone(),
             hosts,
-            truncate(command, 40),
+            truncate(&command, 40),
             result,
         ])
     });
@@ -273,12 +276,15 @@ fn draw_detail(frame: &mut Frame, area: Rect, entry: &AuditEntry, theme: &Theme)
         })
         .unwrap_or_else(|| "-".into());
     let text = format!(
-        "time: {}\naction: {}\nhosts: {}\nselector: {}\ncommand: {}\nduration_ms: {}\n\nresults:\n{}\n\nEsc closes",
+        "time: {}\naction: {}\nhosts: {}\nselector: {}\ncommand: {}\ndirection: {}\nsrc: {}\ndst: {}\nduration_ms: {}\n\nresults:\n{}\n\nEsc closes",
         entry.ts,
         entry.action,
         entry.hosts.join(", "),
         entry.selector.as_deref().unwrap_or("-"),
-        entry.command.as_deref().unwrap_or("-"),
+        entry.summary(),
+        entry.direction.as_deref().unwrap_or("-"),
+        entry.src.as_deref().unwrap_or("-"),
+        entry.dst.as_deref().unwrap_or("-"),
         entry
             .duration_ms
             .map(|ms| ms.to_string())

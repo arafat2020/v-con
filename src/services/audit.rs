@@ -14,6 +14,9 @@ pub fn entry(action: impl Into<String>, hosts: Vec<String>, command: Option<Stri
         selector: None,
         hosts,
         command,
+        direction: None,
+        src: None,
+        dst: None,
         results: None,
         duration_ms: None,
     }
@@ -76,6 +79,9 @@ pub fn record_transfer(path: &Path, config: &AuditConfig, audit: TransferAudit) 
     let command = format!("{} {} → {}", audit.direction, audit.src, audit.dst);
     let mut entry = entry("transfer", vec![audit.host.clone()], Some(command));
     entry.selector = audit.selector;
+    entry.direction = Some(audit.direction);
+    entry.src = Some(audit.src);
+    entry.dst = Some(audit.dst);
     entry.results = Some(BTreeMap::from([(audit.host, audit.exit_code)]));
     entry.duration_ms = Some(audit.duration_ms);
     if let Err(error) = append(path, entry, config) {
@@ -132,6 +138,10 @@ mod tests {
             loaded[0].command.as_deref(),
             Some("upload /tmp/site → /var/www")
         );
+        assert_eq!(loaded[0].direction.as_deref(), Some("upload"));
+        assert_eq!(loaded[0].src.as_deref(), Some("/tmp/site"));
+        assert_eq!(loaded[0].dst.as_deref(), Some("/var/www"));
+        assert_eq!(loaded[0].summary(), "upload /tmp/site → /var/www");
         assert_eq!(loaded[0].results.as_ref().unwrap().get("web-1"), Some(&0));
         assert_eq!(loaded[0].duration_ms, Some(15));
         assert_eq!(loaded[1].action, "transfer");
@@ -139,6 +149,9 @@ mod tests {
             loaded[1].command.as_deref(),
             Some("download /var/log/app.log → ./logs")
         );
+        assert_eq!(loaded[1].direction.as_deref(), Some("download"));
+        assert_eq!(loaded[1].src.as_deref(), Some("/var/log/app.log"));
+        assert_eq!(loaded[1].dst.as_deref(), Some("./logs"));
         assert_eq!(loaded[1].results.as_ref().unwrap().get("web-1"), Some(&1));
     }
 }

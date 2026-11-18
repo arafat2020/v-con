@@ -135,18 +135,22 @@ impl SftpFs {
         let sftp = match Sftp::new(stdin, stdout, SftpOptions::new()).await {
             Ok(sftp) => sftp,
             Err(error) => {
-                let _ = child.kill().await;
+                let code = ssh_exit_code(&mut child).await;
                 tokio::time::sleep(Duration::from_millis(50)).await;
                 let detail = notes
                     .lock()
                     .unwrap_or_else(|error| error.into_inner())
                     .trim()
                     .to_string();
-                let message = if detail.is_empty() {
+                let mut message = if detail.is_empty() {
                     format!("sftp handshake failed: {error}")
                 } else {
                     format!("sftp handshake failed: {error} ({detail})")
                 };
+                if let Some(code) = code {
+                    message = format!("{message} (ssh exit {code})");
+                    return Err(Error::RemoteExit { message, code });
+                }
                 return Err(Error::Message(message));
             }
         };
@@ -193,6 +197,23 @@ impl SftpFs {
         let mut child = child.into_inner();
         let _ = child.kill().await;
         Ok(())
+    }
+}
+
+/// Status of `ssh` when the SFTP handshake fails.
+///
+/// A process that already exited keeps its code. One that is still running is
+/// killed; that has no ssh exit code to record.
+async fn ssh_exit_code(child: &mut Child) -> Option<i32> {
+    if let Ok(Some(status)) = child.try_wait() {
+        return status.code();
+    }
+    match tokio::time::timeout(Duration::from_millis(200), child.wait()).await {
+        Ok(Ok(status)) => status.code(),
+        _ => {
+            let _ = child.kill().await;
+            None
+        }
     }
 }
 
