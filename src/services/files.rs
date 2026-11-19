@@ -374,9 +374,7 @@ fn destination_escapes(path: &str) -> bool {
     path.split('/').any(|part| part == "..")
 }
 
-/// Refuse a destination that walks through a symlink. `stat` does not follow
-/// links, so a listing name like `sub/pwned.txt` cannot leave `dest` when
-/// `sub` points outside it.
+/// Refuse a symlink component whose target leaves its parent directory.
 async fn refuse_symlink_destination<F: RemoteFs>(fs: &F, destination: &str) -> Result<(), Error> {
     let absolute = destination.starts_with('/');
     let mut acc = String::new();
@@ -397,13 +395,37 @@ async fn refuse_symlink_destination<F: RemoteFs>(fs: &F, destination: &str) -> R
         }
         match fs.stat(&acc).await {
             Ok(entry) if entry.kind == EntryKind::Symlink => {
-                return Err(Error::Message(format!("refusing to follow symlink {acc}")));
+                if symlink_leaves_parent(&acc, entry.target.as_deref()) {
+                    return Err(Error::Message(format!("refusing to follow symlink {acc}")));
+                }
             }
             Err(_) => break,
             Ok(_) => {}
         }
     }
     Ok(())
+}
+
+/// True when `link`'s target is outside the directory that contains the link.
+///
+/// A root symlink such as macOS `/var` → `/private/var` stays inside `/`.
+fn symlink_leaves_parent(link: &str, target: Option<&str>) -> bool {
+    let Some(parent) = parent_of(link) else {
+        return false;
+    };
+    if parent == "/" {
+        return false;
+    }
+    let Some(target) = target.filter(|target| !target.is_empty()) else {
+        return true;
+    };
+    let resolved = normalize(&if target.starts_with('/') {
+        target.to_string()
+    } else {
+        join(&parent, target)
+    });
+    let parent = normalize(&parent);
+    resolved != parent && !resolved.starts_with(&format!("{parent}/"))
 }
 
 /// Opening a FIFO for write blocks until a reader exists. Hold a nonblocking
