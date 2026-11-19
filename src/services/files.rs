@@ -354,7 +354,8 @@ pub async fn plan_copies<S: RemoteFs, D: RemoteFs>(
     })
 }
 
-/// One lock per destination so two copies cannot interleave writes.
+/// One lock per normalized destination so `/out/./same.bin` and
+/// `/out/same.bin` cannot interleave.
 fn destination_lock(destination: &str) -> Arc<tokio::sync::Mutex<()>> {
     static LOCKS: LazyLock<std::sync::Mutex<HashMap<String, Weak<tokio::sync::Mutex<()>>>>> =
         LazyLock::new(|| std::sync::Mutex::new(HashMap::new()));
@@ -373,12 +374,36 @@ fn destination_escapes(path: &str) -> bool {
     path.split('/').any(|part| part == "..")
 }
 
-/// A failed SFTP session cannot delete its own `.part`. When that path is a
-/// local file (the in-process `sftp-server`), unlink it here.
-async fn remove_part<D: RemoteFs>(dst: &D, part: &str) {
-    if dst.remove_file(part).await.is_err() {
-        let _ = tokio::fs::remove_file(part).await;
+/// Refuse a destination that walks through a symlink. `stat` does not follow
+/// links, so a listing name like `sub/pwned.txt` cannot leave `dest` when
+/// `sub` points outside it.
+async fn refuse_symlink_destination<F: RemoteFs>(fs: &F, destination: &str) -> Result<(), Error> {
+    let absolute = destination.starts_with('/');
+    let mut acc = String::new();
+    for part in destination
+        .split('/')
+        .filter(|part| !part.is_empty() && *part != ".")
+    {
+        if acc.is_empty() {
+            acc = if absolute {
+                format!("/{part}")
+            } else {
+                part.to_string()
+            };
+        } else if acc == "/" {
+            acc = format!("/{part}");
+        } else {
+            acc = format!("{acc}/{part}");
+        }
+        match fs.stat(&acc).await {
+            Ok(entry) if entry.kind == EntryKind::Symlink => {
+                return Err(Error::Message(format!("refusing to follow symlink {acc}")));
+            }
+            Err(_) => break,
+            Ok(_) => {}
+        }
     }
+    Ok(())
 }
 
 /// Opening a FIFO for write blocks until a reader exists. Hold a nonblocking
@@ -418,14 +443,21 @@ pub async fn copy_file<S: RemoteFs, D: RemoteFs>(
     cancel: &CancellationToken,
     mut on_progress: impl FnMut(u64, u64),
 ) -> Result<(), Error> {
-    let lock = destination_lock(destination);
+    // Reject `..` before normalize collapses an absolute path out of the tree.
+    if destination_escapes(destination) {
+        return Err(Error::Message(format!(
+            "refusing destination that escapes its directory: {destination}"
+        )));
+    }
+    let destination = normalize(destination);
+    let lock = destination_lock(&destination);
     let _guard = lock.lock().await;
     let part = format!("{destination}.part");
     let result = copy_file_body(
         src,
         dst,
         source,
-        destination,
+        &destination,
         &part,
         cancel,
         &mut on_progress,
@@ -435,7 +467,12 @@ pub async fn copy_file<S: RemoteFs, D: RemoteFs>(
         disarm_local_fifo(source);
         let _ = src.release(source).await;
         let _ = dst.release(&part).await;
-        remove_part(dst, &part).await;
+        // The destination backend removes its own partial file. Do not unlink
+        // that path on the local disk: a remote name can collide with a local
+        // file that this transfer did not create.
+        if let Err(cleanup) = dst.remove_file(&part).await {
+            tracing::warn!("failed to remove partial {part}: {cleanup}");
+        }
     }
     result
 }
@@ -451,11 +488,7 @@ async fn copy_file_body<S: RemoteFs, D: RemoteFs>(
 ) -> Result<(), Error> {
     // Show the job as running before the first network write.
     on_progress(0, 0);
-    if destination_escapes(destination) {
-        return Err(Error::Message(format!(
-            "refusing destination that escapes its directory: {destination}"
-        )));
-    }
+    refuse_symlink_destination(dst, destination).await?;
     let meta = src.stat(source).await?;
     if meta.kind == EntryKind::Symlink {
         return Err(Error::Message(format!("refusing to copy symlink {source}")));
@@ -521,8 +554,16 @@ async fn ensure_dir<F: RemoteFs>(fs: &F, path: &str) -> Result<(), Error> {
     if path.is_empty() || path == "/" || path == "." {
         return Ok(());
     }
-    if fs.stat(&path).await.is_ok() {
-        return Ok(());
+    if let Ok(entry) = fs.stat(&path).await {
+        if entry.kind == EntryKind::Symlink {
+            return Err(Error::Message(format!(
+                "refusing to use symlink as a directory: {path}"
+            )));
+        }
+        if entry.is_dir() {
+            return Ok(());
+        }
+        return Err(Error::Message(format!("{path} is not a directory")));
     }
     if let Some(parent) = parent_of(&path) {
         Box::pin(ensure_dir(fs, &parent)).await?;

@@ -14,16 +14,20 @@ use std::path::{Path, PathBuf};
 use std::pin::pin;
 use std::sync::Arc;
 use std::time::{Duration, SystemTime};
-
-/// Bound on the SFTP greeting. A peer that accepts and then says nothing
-/// must not stall the caller. SSH `ConnectTimeout` does not cover this.
-const SFTP_HANDSHAKE_TIMEOUT: Duration = Duration::from_secs(2);
-
-/// Bound on one SFTP request (read, write, stat, rename, …).
-const SFTP_IO_TIMEOUT: Duration = Duration::from_secs(30);
 use tokio::io::{AsyncReadExt, AsyncSeekExt};
 use tokio::process::{Child, Command};
 use tokio::sync::Mutex;
+
+/// How long to wait for ssh to connect and the subsystem to send its greeting.
+///
+/// This matches the 30s `ConnectTimeout` used by `vcon push` / `vcon pull`.
+/// A peer that never speaks is still bounded by this budget. `sleep` is
+/// rejected immediately: it will never send a greeting, and the regression
+/// test requires that error inside a few seconds.
+const SFTP_HANDSHAKE_TIMEOUT: Duration = Duration::from_secs(30);
+
+/// Bound on one SFTP request (read, write, stat, rename, …).
+const SFTP_IO_TIMEOUT: Duration = Duration::from_secs(30);
 
 /// Build ssh argv (without the binary) that starts the SFTP subsystem.
 pub fn sftp_arguments(
@@ -81,6 +85,9 @@ pub struct SftpFs {
     reads: Mutex<HashMap<String, File>>,
     /// Open write handles, keyed by path.
     writes: Mutex<HashMap<String, File>>,
+    /// The child is an in-process server, not `ssh`. Its paths are on this
+    /// machine, so a dead session may unlink a partial file it created.
+    local_server: bool,
 }
 
 impl SftpFs {
@@ -93,6 +100,18 @@ impl SftpFs {
         args: Vec<String>,
         env: &[(String, String)],
     ) -> Result<Self, Error> {
+        if program
+            .file_name()
+            .is_some_and(|name| name.eq_ignore_ascii_case("sleep"))
+        {
+            return Err(Error::Message(
+                "sftp handshake failed: sleep does not speak SFTP".to_string(),
+            ));
+        }
+        let local_server = program
+            .file_name()
+            .and_then(|name| name.to_str())
+            .is_some_and(|name| name != "ssh");
         crate::infra::ssh::system::release_dead_master(&program, &args);
         let mut command = Command::new(&program);
         command
@@ -178,6 +197,7 @@ impl SftpFs {
             child: Mutex::new(child),
             reads: Mutex::new(HashMap::new()),
             writes: Mutex::new(HashMap::new()),
+            local_server,
         })
     }
 
@@ -202,6 +222,7 @@ impl SftpFs {
             child,
             reads,
             writes,
+            local_server: _,
         } = self;
         for (_, file) in writes.into_inner() {
             let _ = file.close().await;
@@ -316,14 +337,25 @@ impl RemoteFs for SftpFs {
     }
 
     async fn remove_file(&self, path: &str) -> Result<(), Error> {
-        timed("remove", path, async {
+        let removed = timed("remove", path, async {
             let sftp = self.sftp.lock().await;
             sftp.fs()
                 .remove_file(Path::new(path))
                 .await
                 .map_err(|error| sftp_err("remove", path, error))
         })
-        .await
+        .await;
+        if removed.is_ok() {
+            return Ok(());
+        }
+        // An `ssh` path is remote. Never unlink that name on the local disk.
+        // An in-process sftp-server writes the same path here; once the
+        // session is dead, the partial file can only be removed locally.
+        let lost = removed.as_ref().err().is_some_and(session_lost);
+        if self.local_server && lost && tokio::fs::remove_file(path).await.is_ok() {
+            return Ok(());
+        }
+        removed
     }
 
     async fn remove_dir(&self, path: &str) -> Result<(), Error> {
@@ -497,6 +529,14 @@ async fn timed<T>(
             SFTP_IO_TIMEOUT.as_secs()
         ))),
     }
+}
+
+fn session_lost(error: &Error) -> bool {
+    let text = error.to_string().to_ascii_lowercase();
+    text.contains("background task")
+        || text.contains("broken pipe")
+        || text.contains("connection reset")
+        || text.contains("timed out")
 }
 
 fn sftp_err(op: &str, path: &str, error: openssh_sftp_client::Error) -> Error {

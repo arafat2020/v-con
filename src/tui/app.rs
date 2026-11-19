@@ -2106,7 +2106,10 @@ impl App {
                 let skipped = self.files.conflict.take().map(|dialog| dialog.path);
                 self.dirty = true;
                 match action {
-                    ConflictAction::Overwrite | ConflictAction::OverwriteAll => {
+                    ConflictAction::Overwrite => {
+                        self.queue_files_copy_overwrite_one(skipped.as_deref())
+                    }
+                    ConflictAction::OverwriteAll => {
                         self.queue_files_copy(false, ConflictAction::Overwrite)
                     }
                     ConflictAction::Skip => {
@@ -2242,6 +2245,44 @@ impl App {
         if !skip_all && let Some(path) = self.conflicting_destination(&sources, &dest_dir) {
             self.files.conflict = Some(ConflictDialog { id: 0, path });
             self.dirty = true;
+            return Vec::new();
+        }
+        self.files_copy_command(host, sources, dest_dir, ConflictAction::Overwrite)
+    }
+
+    /// Overwrite the file named by the dialog. Other conflicting names stay
+    /// for another prompt. Names that do not conflict are copied with it.
+    fn queue_files_copy_overwrite_one(&mut self, prompted: Option<&str>) -> Vec<UiCommand> {
+        let Some(host) = self.files.host.clone() else {
+            self.toast("Choose a remote host (H)");
+            return Vec::new();
+        };
+        let dest_dir = self.files.other().path.clone();
+        let existing: Vec<String> = self
+            .files
+            .other()
+            .entries
+            .iter()
+            .map(|entry| entry.name.clone())
+            .collect();
+        let selected = self.files.selected_paths();
+        let mut sources = Vec::new();
+        let mut deferred: Option<String> = None;
+        for source in selected {
+            let name = crate::infra::remote_fs::file_name(&source);
+            let dest = join(&dest_dir, name);
+            let conflicts = existing.iter().any(|entry| entry == name);
+            if Some(dest.as_str()) == prompted || !conflicts {
+                sources.push(source);
+            } else if deferred.is_none() {
+                deferred = Some(dest);
+            }
+        }
+        if let Some(path) = deferred {
+            self.files.conflict = Some(ConflictDialog { id: 0, path });
+            self.dirty = true;
+        }
+        if sources.is_empty() {
             return Vec::new();
         }
         self.files_copy_command(host, sources, dest_dir, ConflictAction::Overwrite)
