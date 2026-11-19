@@ -1,6 +1,130 @@
 # vcon QA report — file transfer
 
-Verdict: **NO-GO** for production.
+## Retest of PR #19 (`9affe2a`, `cursor/fix-file-transfer-83c7`)
+
+Verdict for PR #19: **NO-GO**.
+
+The 13 original defects are fixed on the paths the first tests cover, `rustix` is 1.1.6, and the developer's suite is green. The patch also adds four new failures: a hostile listing name can still leave the destination through a symlink directory, a failed remote cleanup deletes a local `.part` file, a 3 second SSH startup is killed by a 2 second handshake timeout, and `/out/same.bin` is not the same lock as `/out/./same.bin`. `o` overwrites every marked name.
+
+Checked out `origin/cursor/fix-file-transfer-83c7` in a separate worktree. Product code on this QA branch was not modified.
+
+### Commands on the fix
+
+| Command | Result |
+|---|---|
+| `cargo test -- --skip qa_retest_` with `VCON_QA_LARGE=1` | bin 244 passed (includes every original `qa_*` test and the 2 GiB copy); `tests/cli.rs` 6 passed; `tests/integration_ssh.rs` 2 passed, 3 ignored (no local Docker); `tests/qa_cli_transfer.rs` 6 passed, including the three that failed before the fix |
+| `VCON_QA_LARGE=1 cargo test --bin vcon -- --nocapture qa_large_file_streams` | pass. 2147483648 bytes in 3.52 s (582 MiB/s), RSS 9140 KiB → 16760 KiB (+7620 KiB), HWM 16760 KiB |
+| `cargo fmt --all -- --check` | pass |
+| `cargo clippy --all-targets -- -D warnings` | pass |
+| `cargo audit` 0.23.0 | exit 0. `rustix` 1.1.6 is no longer reported. Five warnings remain: unmaintained `chrono`, `zbus_names`, `zvariant`, `zvariant_derive`; yanked `async-executor` 1.14.0 |
+| `cargo build --release` | pass |
+
+New tests were run on the fix before they were committed here: 3 passed, 5 failed. The failures are the new bugs below.
+
+### GitHub Actions run 44456088116 (this VM has no Docker)
+
+| Job | Result |
+|---|---|
+| test (ubuntu-latest) | success. fmt, clippy, 244 + 6 + 6 passed. The 3 Docker tests stayed ignored |
+| test (macos-latest) | success. 243 + 6 + 6 passed (one Linux-only test is absent) |
+| integration (docker) | success. `password_reuse_reprompt_tunnel_and_single_failure`, `exec_true_on_fixture_host`, and `status_against_fixture_host` passed (3 passed in 254 s) |
+
+CI does not set `VCON_QA_LARGE`, so the 2 GiB test did not run there. It ran locally, above. The Docker job does not exercise `push` or `pull`.
+
+### Were the original tests weakened?
+
+Diff of `tests/` and `qa/` from `d0eed6a` (this branch's first commit) to `9affe2a`:
+
+- `tests/qa_cli_transfer.rs`: no diff.
+- `qa/tui_conflict.rs`: no diff on the fix commit.
+- `qa/file_transfer_tests.rs`: one test renamed. `qa_metadata_failure_is_currently_ignored` became `qa_metadata_failure_is_surfaced`.
+
+That rename is legitimate. The old test required `Ok(())` and a mode other than `0600`, which recorded the bug. The new test requires an error whose text contains `metadata`, and it requires the destination not to be published (`mode_of("/out")` is `None`). The implementation applies metadata to `.part` and renames only after that succeeds (`src/services/files.rs:508-513` on the fix). No other assertion was deleted or loosened.
+
+### Original bugs
+
+| # | Bug | On `9affe2a` | Evidence |
+|---|---|---|---|
+| 1 | Listing `../../file` escapes the destination | **fixed** | `qa_hostile_directory_entry_cannot_escape_the_destination` passed. `destination_escapes` rejects a `..` component (`src/services/files.rs:372-374`) before create. Absolute names, `..\..\escaped.bin`, `%2e%2e/...`, and `.` stayed inside dest (`qa_retest_absolute_backslash_and_dot_names_stay_inside_dest`) |
+| 2 | Size 0 reader never stops (`/dev/zero`) | **fixed** | `qa_dev_zero_copy_must_stop` and `qa_zero_size_infinite_reader_must_stop` passed. Non-regular files are refused; a size of 0 that still returns bytes is an error (`src/services/files.rs:463-486`). `qa_retest_declared_u64_max_does_not_copy_forever` passed: immediate EOF at `u64::MAX` is an error, not a hang |
+| 3 | Early EOF reported as success | **fixed** | `qa_short_read_must_not_report_success` passed. A short or empty read before `total` returns an error (`src/services/files.rs:494-497`) |
+| 4 | Symlink copied as a regular file | **fixed** for the symlink itself | `qa_symlink_outside_the_tree_is_not_copied_as_bytes` and `qa_sftp_symlink_is_not_followed` passed. `kind == Symlink` is refused (`src/services/files.rs:460-462`). A symlink directory component is still followed (new bug A) |
+| 5 | `push ../secret` uploads `./secret` | **fixed** | `qa_normalize_keeps_relative_parent_segments` and `qa_cli_push_relative_dotdot_uploads_that_file` passed. `normalize("../secret")` stays `../secret` (`src/infra/remote_fs/path.rs:56-61`) |
+| 6 | Failed rename deletes the old file | **fixed** | `qa_rename_failure_must_not_delete_the_existing_destination` passed. Rename is no longer preceded by `remove_file` (`src/services/files.rs:511-513`) |
+| 7 | Concurrent copies to one path interleave | **fixed** for the identical path string | `qa_concurrent_transfers_to_the_same_destination_do_not_overlap` passed. The lock is keyed by the raw string (`src/services/files.rs:358-368`), so `/out/same.bin` and `/out/./same.bin` still interleave (new bug B) |
+| 8 | FIFO copy blocks | **fixed** | `qa_fifo_copy_must_not_block` passed. A FIFO is not a regular file and is refused before `read` |
+| 9 | Stalled SFTP handshake hangs | **fixed** for a peer that never speaks | `qa_sftp_handshake_times_out_on_a_stalled_peer` passed. The timeout is 2 s (`src/infra/remote_fs/sftp.rs:20`), which also kills a slow but valid start (new bug C) |
+| 10 | CLI drops the I/O error | **fixed** | `qa_cli_push_reports_the_filesystem_error` and `qa_cli_pull_reports_the_filesystem_error` passed. Stderr now includes the underlying error (`src/cli/commands/push.rs:138-140`, `src/cli/commands/pull.rs:96`) |
+| 11 | Conflict dialog never opens | **partially fixed** | `qa_tui_existing_name_does_not_open_the_conflict_dialog` and `qa_tui_conflict_choice_is_not_discarded` passed. Skip and Esc were checked with `qa_retest_skip_leaves_the_other_conflict_and_cancel_copies_nothing` (passed on the fix). `o` still replaces every marked name (new bug D) |
+| 12 | SFTP drop leaves `.part` | **fixed** for the local `sftp-server` case | `qa_sftp_connection_drop_does_not_commit_a_partial_file` passed. The fallback that makes that pass deletes a local file (new bug E) |
+| 13 | `set_meta` failure ignored | **fixed** | `qa_metadata_failure_is_surfaced` passed, as described above |
+| — | `rustix` 1.1.5 unsound xattr | **fixed** | `Cargo.toml` pins `rustix = "1.1.6"`. `Cargo.lock` resolves 1.1.6. `cargo audit` no longer lists RUSTSEC-2026-0486 |
+
+### New bugs
+
+**A. A listing name with a slash writes through a symlink directory**
+
+- Area: backend
+- Severity: **high**
+- Test: `qa_retest_symlink_component_in_listing_name_cannot_escape` (failed on `9affe2a`)
+- Steps: `{dest}/inbox/sub` is a symlink to `{tmp}/outside`. A directory listing returns one file named `sub/pwned.txt`. `plan_copies` + `copy_file` into `{dest}`.
+- Expected: the name is rejected, or the bytes stay under `{dest}`.
+- Actual: `Ok(())`, and the bytes are `{tmp}/outside/pwned.txt`.
+- Evidence: `destination_escapes` only looks for a component equal to `..` (`src/services/files.rs:372-374`). `ensure_dir` treats any successful `stat` as a directory (`src/services/files.rs:524-526`). `LocalFs::create` then follows the symlink. The same hostile-listing threat as bug 1, with a slash instead of `..`. Encoded `%2e%2e`, a backslash, an absolute name, and a name that is only `.` did not escape (`qa_retest_absolute_backslash_and_dot_names_stay_inside_dest`).
+
+**B. Equivalent destination paths are not one lock**
+
+- Area: backend
+- Severity: **high**
+- Test: `qa_retest_equivalent_destination_paths_do_not_interleave` (failed on `9affe2a`; repeated runs)
+- Steps: `run_queue` of two jobs, destinations `/out/same.bin` and `/out/./same.bin`, sources `0x11` and `0x22`, each `2*CHUNK`.
+- Expected: one lock, and the file is entirely one source.
+- Actual: the writes overlapped. In 5 of 8 runs the file mixed the two sources, for example first byte `0x22` and the byte at `CHUNK` `0x11` (`Some((524288, Some(34), Some(17)))`).
+- Evidence: `destination_lock` uses the destination string as the map key (`src/services/files.rs:358-363`) and does not normalize it. `LabFs` (and the local filesystem) treat `/out/./same.bin` as `/out/same.bin`.
+
+**C. The handshake timeout is shorter than a slow SSH startup**
+
+- Area: backend
+- Severity: **high**
+- Test: `qa_retest_sftp_slow_handshake_is_not_killed` (failed on `9affe2a`)
+- Steps: the spawned program sleeps 3 seconds, then execs `sftp-server`. `connect_with_env` is given 15 seconds.
+- Expected: the session comes up. Three seconds is inside the 30 second `ConnectTimeout` `push` passes to ssh.
+- Actual: `sftp handshake timed out waiting for the server`.
+- Evidence: `SFTP_HANDSHAKE_TIMEOUT` is 2 seconds (`src/infra/remote_fs/sftp.rs:20-20`) and it wraps `Sftp::new` (`src/infra/remote_fs/sftp.rs:142-154`), which cannot return until ssh has connected and started the subsystem. A peer that never speaks is correctly cut off (bug 9). A peer that speaks after 3 seconds is not.
+
+**D. Overwrite-one replaces every marked name**
+
+- Area: frontend
+- Severity: **medium**
+- Test: `qa_retest_overwrite_one_does_not_replace_every_marked_name` (failed on `9affe2a`)
+- Steps: mark `a.txt` and `b.txt`. Both names already exist on the other pane. Press `c`, then `o`.
+- Expected: replace only the file the dialog named, or ask again about the other.
+- Actual: one `Copy` command with sources `["/tmp/local/a.txt", "/tmp/local/b.txt"]` and `conflict=None`.
+- Evidence: `Overwrite` and `OverwriteAll` share one arm (`src/tui/app.rs:2109-2111`) and `queue_files_copy(false, ...)` copies every selected path (`src/tui/app.rs:2185-2201`). Skip and Esc do what the dialog says (`qa_retest_skip_leaves_the_other_conflict_and_cancel_copies_nothing` passed on the fix).
+
+**E. Failed remote cleanup deletes a local file**
+
+- Area: backend
+- Severity: **high**
+- Test: `qa_retest_failed_cleanup_does_not_unlink_a_local_part_file` (failed on `9affe2a`)
+- Steps: a real file `{tmp}/notes.txt.part` contains `LOCAL-KEEP`. The destination backend's `remove_file` returns an error and `set_meta` fails, so the copy fails.
+- Expected: the local file is untouched. It is not the remote `.part`.
+- Actual: the file is gone (`read` returned `[]`).
+- Evidence: `remove_part` (`src/services/files.rs:378-382`) calls `tokio::fs::remove_file(part)` whenever `dst.remove_file` fails. For an upload, `part` is the remote path plus `.part`. A dead SFTP session then unlinks that path on the local machine. This is what makes bug 12's test pass when `sftp-server` is a local process.
+
+### Still not tested
+
+- `push` / `pull` with a password. The Docker password test that passed is exec, tunnel, and a single auth failure, not a file transfer.
+- Multi-GB bytes over SFTP. The 2 GiB run is `LocalFs` to `LocalFs`.
+- Release-build throughput. `cargo build --release` succeeded; the 582 MiB/s figure is the debug test binary.
+- A file that grows or shrinks during `read_at` was inspected, not executed. The loop stops at the size from `stat` and treats an early empty read as an error, so a shrink fails the copy and growth past that size is not copied.
+- No secret-bearing error string showed up. Push and pull now append the I/O error, which includes paths, not file bytes or the keychain password.
+
+---
+
+## First pass (before PR #19)
+
+Verdict at that commit: **NO-GO** for production.
 
 File transfer is a client pull over SFTP (`ssh -s sftp`, `openssh-sftp-client`), 256 KiB chunks (`CHUNK` in `src/services/files.rs`), two transfers at a time, written to `destination.part` and renamed into place. SSH is the only integrity layer. There is no application checksum, no resume, and no cap on a peer that never returns EOF.
 
