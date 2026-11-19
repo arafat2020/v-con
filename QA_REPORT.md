@@ -1,5 +1,20 @@
 # vcon QA report — file transfer
 
+## Password push/pull and symlink-parent usability
+
+These tests live on `cursor/qa-file-transfer-134b`. This branch does not contain PR #19's fixes. The product source is unchanged.
+
+`tests/integration_ssh.rs` gained four `#[ignore]` tests. They run only in the integration (docker) job, against the fixture sshd, the same way as the existing ignored tests (`DOCKER=1 cargo test --test integration_ssh -- --ignored`).
+
+| Test | What it checks |
+|---|---|
+| `password_push_and_pull_round_trip_matches_bytes` | Password-authenticated `vcon push` and `vcon pull`. Byte-for-byte for a 64-byte file, a 256 KiB chunk-boundary file, a 256 KiB + 1 file, and a 3 MiB file. The password must not appear in the transfer output or the log. |
+| `wrong_password_push_and_pull_fail_without_leaking` | A wrong saved password exits non-zero, creates no remote file and no local file, and does not put the password in argv, `vcon.log`, `audit.jsonl`, the askpass script, or the error text. |
+| `password_pull_replaces_existing_file` | Pull onto a local file that already exists. The published bytes match the remote file and no `.part` sibling remains. |
+| `user_chosen_symlink_parent_destination_succeeds` | Usability check, separate from the hostile-listing escape test. A destination the user chose under a symlink parent (Linux stand-in for macOS `/tmp` → `/private/tmp`) must succeed. `ensure_dir` must not refuse that link. |
+
+CI results for this commit are recorded below once the integration job finishes.
+
 ## Retest 2 of PR #19 at `ba2e7be`
 
 Verdict: **NO-GO**.
