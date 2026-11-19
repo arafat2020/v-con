@@ -13,7 +13,18 @@ These tests live on `cursor/qa-file-transfer-134b`. This branch does not contain
 | `password_pull_replaces_existing_file` | Pull onto a local file that already exists. The published bytes match the remote file and no `.part` sibling remains. |
 | `user_chosen_symlink_parent_destination_succeeds` | Usability check, separate from the hostile-listing escape test. A destination the user chose under a symlink parent (Linux stand-in for macOS `/tmp` → `/private/tmp`) must succeed. `ensure_dir` must not refuse that link. |
 
-CI results for this commit are recorded below once the integration job finishes.
+CI run [44464002119](https://github.com/arafat2020/v-con/actions/runs/44464002119) on `4d1c140`. The integration (docker) job ran `cargo test --test integration_ssh -- --ignored` and finished `ok. 7 passed; 0 failed` in 503.66 s. All four new tests passed:
+
+| Test | Result |
+|---|---|
+| `password_push_and_pull_round_trip_matches_bytes` | pass |
+| `wrong_password_push_and_pull_fail_without_leaking` | pass |
+| `password_pull_replaces_existing_file` | pass |
+| `user_chosen_symlink_parent_destination_succeeds` | pass |
+
+The three older ignored tests also passed. The ubuntu and macOS `test` jobs are still red: those jobs run the QA assertions that describe behavior this branch does not have. This commit does not change that.
+
+The existing-file pull passed on the current copy path, which still removes the destination before renaming the `.part` into place. The fixture rename succeeded, so the published bytes matched and no `.part` was left. The test does not inject a rename failure after that removal. The symlink-parent pull passed because `ensure_dir` on this branch still accepts a symlink that already exists. PR #19's `ensure_dir` refuses every symlink directory, including a root link such as macOS `/tmp` → `/private/tmp`. That refusal is not in this branch. The new test is the usability check for it, and it is separate from the hostile-listing escape test.
 
 ## Retest 2 of PR #19 at `ba2e7be`
 
