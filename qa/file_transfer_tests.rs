@@ -2081,3 +2081,194 @@ async fn qa_retest_declared_u64_max_does_not_copy_forever() {
         "u64::MAX size with an immediate EOF was reported as success"
     );
 }
+
+/// `~/Downloads` → an external volume. The link's parent is the home directory
+/// and the target is outside that parent. The user picked this destination.
+#[cfg(unix)]
+#[tokio::test]
+async fn qa_retest3_symlink_root_outside_its_parent_is_usable() {
+    let base = tempfile::tempdir().unwrap();
+    let home = base.path().join("home");
+    std::fs::create_dir(&home).unwrap();
+    let volume = base.path().join("Volumes/Ext/Downloads");
+    std::fs::create_dir_all(&volume).unwrap();
+    let link = home.join("Downloads");
+    std::os::unix::fs::symlink(&volume, &link).unwrap();
+    let src = base.path().join("payload.bin");
+    std::fs::write(&src, b"picked-by-user").unwrap();
+    let dest = link.join("payload.bin");
+    let result = copy_file(
+        &LocalFs,
+        &LocalFs,
+        &path_str(&src),
+        &path_str(&dest),
+        &CancellationToken::new(),
+        |_, _| {},
+    )
+    .await;
+    assert!(
+        result.is_ok(),
+        "a user-picked destination root whose target leaves the link's parent must succeed: {result:?}"
+    );
+    assert_eq!(
+        std::fs::read(volume.join("payload.bin")).unwrap(),
+        b"picked-by-user"
+    );
+}
+
+/// A symlink created under the resolved destination must not receive the file.
+#[cfg(unix)]
+#[tokio::test]
+async fn qa_retest3_child_symlink_cannot_escape_the_resolved_root() {
+    let base = tempfile::tempdir().unwrap();
+    let root = base.path().join("Downloads");
+    let secret = base.path().join("secret");
+    std::fs::create_dir_all(&root).unwrap();
+    std::fs::create_dir(&secret).unwrap();
+    std::os::unix::fs::symlink(&secret, root.join("leak")).unwrap();
+    let src = base.path().join("payload.bin");
+    std::fs::write(&src, b"must-stay").unwrap();
+    let err = copy_file(
+        &LocalFs,
+        &LocalFs,
+        &path_str(&src),
+        &path_str(&root.join("leak/pwned.txt")),
+        &CancellationToken::new(),
+        |_, _| {},
+    )
+    .await
+    .expect_err("a child symlink that leaves the resolved root must be refused");
+    assert!(
+        !secret.join("pwned.txt").exists() && !secret.join("pwned.txt.part").exists(),
+        "child symlink escaped the resolved root ({err})"
+    );
+}
+
+/// `create`, `write_at`, and `set_meta` must not follow a symlink at the final
+/// path component. A parent swapped after the file is opened must not redirect
+/// the bytes already going to that descriptor.
+#[cfg(unix)]
+#[tokio::test]
+async fn qa_retest3_nofollow_final_component_and_parent_swap_after_open() {
+    let dir = tempfile::tempdir().unwrap();
+    let outside = dir.path().join("outside");
+    std::fs::create_dir(&outside).unwrap();
+    std::fs::write(outside.join("secret"), b"SECRET").unwrap();
+    let link = dir.path().join("out.bin");
+    std::os::unix::fs::symlink(outside.join("secret"), &link).unwrap();
+    let link_str = path_str(&link);
+    let created = LocalFs.create(&link_str).await;
+    assert!(
+        created.is_err(),
+        "create followed a symlink at the final component ({created:?})"
+    );
+    assert_eq!(std::fs::read(outside.join("secret")).unwrap(), b"SECRET");
+    let wrote = LocalFs.write_at(&link_str, 0, b"PWNED").await;
+    assert!(
+        wrote.is_err(),
+        "write_at followed a symlink at the final component ({wrote:?})"
+    );
+    let meta = LocalFs.set_meta(&link_str, Some(0o100777), None).await;
+    assert!(
+        meta.is_err(),
+        "set_meta followed a symlink at the final component ({meta:?})"
+    );
+    assert_eq!(std::fs::read(outside.join("secret")).unwrap(), b"SECRET");
+
+    let parent = dir.path().join("inbox");
+    std::fs::create_dir(&parent).unwrap();
+    let part = parent.join("file.bin.part");
+    let part_str = path_str(&part);
+    LocalFs.create(&part_str).await.unwrap();
+    let held = dir.path().join("inbox-real");
+    std::fs::rename(&parent, &held).unwrap();
+    std::os::unix::fs::symlink(&outside, &parent).unwrap();
+    LocalFs.write_at(&part_str, 0, b"BYTES").await.unwrap();
+    LocalFs
+        .set_meta(&part_str, Some(0o100600), None)
+        .await
+        .unwrap();
+    assert_eq!(
+        std::fs::read(held.join("file.bin.part")).unwrap(),
+        b"BYTES",
+        "a parent swapped after open redirected the held descriptor"
+    );
+    assert!(
+        !outside.join("file.bin.part").exists(),
+        "bytes landed in the swapped parent symlink"
+    );
+    let _ = LocalFs.release(&part_str).await;
+}
+
+/// Opening the parent follows a symlink. `copy_file` refuses that shape when
+/// the link is already in place; this checks a swap that lands on the open.
+#[cfg(unix)]
+#[tokio::test]
+async fn qa_retest3_parent_swapped_for_a_symlink_during_copy() {
+    let dir = tempfile::tempdir().unwrap();
+    let home = dir.path().join("home");
+    std::fs::create_dir(&home).unwrap();
+    let outside = dir.path().join("Volumes/Ext");
+    std::fs::create_dir_all(&outside).unwrap();
+    let via = home.join("Downloads");
+    std::os::unix::fs::symlink(&outside, &via).unwrap();
+    let planted = via.join("direct.bin");
+    LocalFs.create(&path_str(&planted)).await.unwrap();
+    LocalFs
+        .write_at(&path_str(&planted), 0, b"VIA")
+        .await
+        .unwrap();
+    let _ = LocalFs.release(&path_str(&planted)).await;
+    assert_eq!(
+        std::fs::read(outside.join("direct.bin")).unwrap(),
+        b"VIA",
+        "create/write_at did not follow a parent symlink"
+    );
+    std::fs::remove_file(&via).unwrap();
+    std::fs::remove_file(outside.join("direct.bin")).unwrap();
+
+    let parent = home.join("inbox");
+    let held = home.join("inbox-real");
+    std::fs::create_dir(&parent).unwrap();
+    let src = dir.path().join("src.bin");
+    std::fs::write(&src, b"race-bytes").unwrap();
+    let dest = parent.join("race.bin");
+    let stop = Arc::new(AtomicBool::new(false));
+    let stop_flag = Arc::clone(&stop);
+    let parent_flip = parent.clone();
+    let held_flip = held.clone();
+    let outside_flip = outside.clone();
+    let spinner = std::thread::spawn(move || {
+        while !stop_flag.load(Ordering::Relaxed) {
+            let _ = std::fs::rename(&parent_flip, &held_flip);
+            let _ = std::os::unix::fs::symlink(&outside_flip, &parent_flip);
+            let _ = std::fs::remove_file(&parent_flip);
+            let _ = std::fs::rename(&held_flip, &parent_flip);
+        }
+    });
+    for _ in 0..400 {
+        let _ = copy_file(
+            &LocalFs,
+            &LocalFs,
+            &path_str(&src),
+            &path_str(&dest),
+            &CancellationToken::new(),
+            |_, _| {},
+        )
+        .await;
+        let leaked = outside.join("race.bin").exists() || outside.join("race.bin.part").exists();
+        if leaked {
+            stop.store(true, Ordering::Relaxed);
+            let _ = spinner.join();
+            let bytes = std::fs::read(outside.join("race.bin"))
+                .or_else(|_| std::fs::read(outside.join("race.bin.part")))
+                .unwrap_or_default();
+            panic!(
+                "parent swap during copy wrote {} bytes outside the destination",
+                bytes.len()
+            );
+        }
+    }
+    stop.store(true, Ordering::Relaxed);
+    let _ = spinner.join();
+}
