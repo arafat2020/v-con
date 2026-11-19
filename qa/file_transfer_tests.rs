@@ -72,6 +72,7 @@ struct LabFs {
     stat_missing_as_file: AtomicBool,
     fail_rename: AtomicBool,
     fail_meta: AtomicBool,
+    fail_remove: AtomicBool,
     discard: AtomicBool,
     written: AtomicU64,
     reads: AtomicUsize,
@@ -91,6 +92,7 @@ impl LabFs {
             stat_missing_as_file: AtomicBool::new(false),
             fail_rename: AtomicBool::new(false),
             fail_meta: AtomicBool::new(false),
+            fail_remove: AtomicBool::new(false),
             discard: AtomicBool::new(false),
             written: AtomicU64::new(0),
             reads: AtomicUsize::new(0),
@@ -248,6 +250,9 @@ impl RemoteFs for LabFs {
     }
 
     async fn remove_file(&self, path: &str) -> Result<(), Error> {
+        if self.fail_remove.load(Ordering::SeqCst) {
+            return Err(Error::Message(format!("injected remove failure {path}")));
+        }
         let path = normalize(path);
         let mut nodes = self.nodes.lock().expect("lab");
         match nodes.get(&path) {
@@ -1811,4 +1816,233 @@ proptest::proptest! {
         let _ = crate::infra::remote_fs::parent_of(&normalized);
         let _ = crate::infra::remote_fs::file_name(&normalized);
     }
+}
+
+fn arm_hostile(name: &str, payload: &[u8]) -> LabFs {
+    let src = LabFs::new();
+    src.insert_dir("/inbox");
+    *src.payload.lock().unwrap() = payload.to_vec();
+    src.stat_missing_as_file.store(true, Ordering::SeqCst);
+    *src.hostile.lock().unwrap() = Some((
+        "/inbox".to_string(),
+        vec![file_entry(name, payload.len() as u64)],
+    ));
+    src
+}
+
+async fn copy_hostile(name: &str, dest: &Path) -> Result<(), Error> {
+    let src = arm_hostile(name, b"PWNED");
+    let planned = plan_copies(&src, &LocalFs, "/inbox", &path_str(dest)).await?;
+    for (source, destination, _) in planned.files {
+        copy_file(
+            &src,
+            &LocalFs,
+            &source,
+            &destination,
+            &CancellationToken::new(),
+            |_, _| {},
+        )
+        .await?;
+    }
+    Ok(())
+}
+
+#[tokio::test]
+async fn qa_retest_symlink_component_in_listing_name_cannot_escape() {
+    let dir = tempfile::tempdir().unwrap();
+    let outside = dir.path().join("outside");
+    std::fs::create_dir(&outside).unwrap();
+    let dest = dir.path().join("dest");
+    let inbox = dest.join("inbox");
+    std::fs::create_dir_all(&inbox).unwrap();
+    std::os::unix::fs::symlink(&outside, inbox.join("sub")).unwrap();
+    let copied = copy_hostile("sub/pwned.txt", &dest).await;
+    let leaked = outside.join("pwned.txt");
+    assert!(
+        !leaked.exists(),
+        "listing name sub/pwned.txt wrote through a symlinked directory ({copied:?}) at {}",
+        leaked.display()
+    );
+}
+
+#[tokio::test]
+async fn qa_retest_absolute_backslash_and_dot_names_stay_inside_dest() {
+    let dir = tempfile::tempdir().unwrap();
+    let dest = dir.path().join("dest");
+    std::fs::create_dir(&dest).unwrap();
+    let outside_marker = dir.path().join("escaped.bin");
+    for name in [
+        "/tmp/escaped.bin",
+        r"..\..\escaped.bin",
+        "%2e%2e/%2e%2e/escaped.bin",
+        ".",
+    ] {
+        let _ = copy_hostile(name, &dest).await;
+        assert!(
+            !outside_marker.exists(),
+            "name {name:?} created {}",
+            outside_marker.display()
+        );
+    }
+    // Payload must not appear as a sibling of dest.
+    let mut leaked = Vec::new();
+    for entry in std::fs::read_dir(dir.path()).unwrap() {
+        let entry = entry.unwrap();
+        if entry.path() == dest {
+            continue;
+        }
+        if entry.path().is_file() {
+            leaked.push(entry.path());
+        }
+    }
+    assert!(
+        leaked.is_empty(),
+        "hostile names wrote siblings of dest: {leaked:?}"
+    );
+}
+
+#[tokio::test]
+async fn qa_retest_failed_cleanup_does_not_unlink_a_local_part_file() {
+    let dir = tempfile::tempdir().unwrap();
+    let dest = dir.path().join("notes.txt");
+    let part = dir.path().join("notes.txt.part");
+    std::fs::write(&part, b"LOCAL-KEEP").unwrap();
+    let src = LabFs::new();
+    src.insert_file("/in", b"remote-body");
+    let dst = LabFs::new();
+    dst.fail_meta.store(true, Ordering::SeqCst);
+    dst.fail_remove.store(true, Ordering::SeqCst);
+    let _ = copy_file(
+        &src,
+        &dst,
+        "/in",
+        &path_str(&dest),
+        &CancellationToken::new(),
+        |_, _| {},
+    )
+    .await;
+    let kept = std::fs::read(&part).unwrap_or_default();
+    assert_eq!(
+        kept, b"LOCAL-KEEP",
+        "failed transfer cleanup deleted a local file at the remote .part path"
+    );
+}
+
+#[tokio::test]
+async fn qa_retest_equivalent_destination_paths_do_not_interleave() {
+    let dir = tempfile::tempdir().unwrap();
+    let left = dir.path().join("left.bin");
+    let right = dir.path().join("right.bin");
+    std::fs::write(&left, vec![0x11_u8; CHUNK * 2]).unwrap();
+    std::fs::write(&right, vec![0x22_u8; CHUNK * 2]).unwrap();
+    let dst = Arc::new(LabFs::new());
+    *dst.delay.lock().unwrap() = Duration::from_millis(40);
+    let jobs = vec![
+        TransferJob {
+            id: 1,
+            direction: TransferDirection::Upload,
+            source: path_str(&left),
+            destination: "/out/same.bin".to_string(),
+            host: "h".to_string(),
+            total: (CHUNK * 2) as u64,
+            done: 0,
+            state: TransferState::Queued,
+            error: None,
+            started: None,
+        },
+        TransferJob {
+            id: 2,
+            direction: TransferDirection::Upload,
+            source: path_str(&right),
+            destination: "/out/./same.bin".to_string(),
+            host: "h".to_string(),
+            total: (CHUNK * 2) as u64,
+            done: 0,
+            state: TransferState::Queued,
+            error: None,
+            started: None,
+        },
+    ];
+    let (tx, _rx) = mpsc::channel(32);
+    run_queue(
+        Arc::new(LocalFs),
+        Arc::clone(&dst),
+        jobs,
+        CancellationToken::new(),
+        tx,
+    )
+    .await;
+    assert!(
+        !dst.overlapped.load(Ordering::SeqCst),
+        "equivalent destination paths were not serialized; bytes={:?}",
+        dst.snapshot("/out/same.bin").map(|bytes| (
+            bytes.len(),
+            bytes.first().copied(),
+            bytes.get(CHUNK).copied()
+        ))
+    );
+}
+
+#[tokio::test]
+async fn qa_retest_sftp_slow_handshake_is_not_killed() {
+    let Some(server) = sftp_server() else {
+        eprintln!("SKIP sftp-server missing");
+        return;
+    };
+    let dir = tempfile::tempdir().unwrap();
+    let script = dir.path().join("slow.sh");
+    std::fs::write(
+        &script,
+        format!("#!/bin/sh\nsleep 3\nexec {}\n", server.display()),
+    )
+    .unwrap();
+    #[cfg(unix)]
+    {
+        use std::os::unix::fs::PermissionsExt;
+        std::fs::set_permissions(&script, std::fs::Permissions::from_mode(0o755)).unwrap();
+    }
+    let connected = tokio::time::timeout(
+        Duration::from_secs(15),
+        SftpFs::connect_with_env(script, Vec::new(), &[]),
+    )
+    .await;
+    match connected {
+        Ok(Ok(_session)) => {}
+        Ok(Err(error)) => panic!(
+            "a peer that speaks SFTP after 3s (under the 30s connect budget) was rejected: {error}"
+        ),
+        Err(_) => panic!("slow SFTP handshake still pending after 15s"),
+    }
+}
+
+#[tokio::test]
+async fn qa_retest_declared_u64_max_does_not_copy_forever() {
+    let src = LabFs::new();
+    src.insert_file("/in", b"");
+    *src.force_size.lock().unwrap() = Some(u64::MAX);
+    *src.read_mode.lock().unwrap() = ReadMode::PrefixThenEof;
+    *src.payload.lock().unwrap() = Vec::new();
+    let dst = LabFs::new();
+    let started = Instant::now();
+    let result = tokio::time::timeout(
+        Duration::from_secs(2),
+        copy_file(
+            &src,
+            &dst,
+            "/in",
+            "/out",
+            &CancellationToken::new(),
+            |_, _| {},
+        ),
+    )
+    .await;
+    assert!(
+        result.is_ok(),
+        "u64::MAX size hung the copy ({:?})",
+        started.elapsed()
+    );
+    assert!(
+        result.unwrap().is_err(),
+        "u64::MAX size with an immediate EOF was reported as success"
+    );
 }

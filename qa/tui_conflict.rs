@@ -87,3 +87,69 @@ fn qa_tui_conflict_choice_is_not_discarded() {
         app.files.conflict
     );
 }
+
+fn marked_pair() -> App {
+    let mut app = app();
+    app.files.local.entries = vec![entry("a.txt"), entry("b.txt")];
+    app.files.local.marks.insert("a.txt".to_string());
+    app.files.local.marks.insert("b.txt".to_string());
+    app.files.remote.entries = vec![entry("a.txt"), entry("b.txt")];
+    app
+}
+
+fn copy_sources(commands: &[UiCommand]) -> Vec<String> {
+    commands
+        .iter()
+        .find_map(|command| match command {
+            UiCommand::Files(FilesCommand::Copy { sources, .. }) => Some(sources.clone()),
+            _ => None,
+        })
+        .unwrap_or_default()
+}
+
+#[test]
+fn qa_retest_overwrite_one_does_not_replace_every_marked_name() {
+    let mut app = marked_pair();
+    let commands = app.on_key(KeyCode::Char('c'), KeyModifiers::NONE);
+    assert!(
+        commands.is_empty() && app.files.conflict.is_some(),
+        "expected a conflict prompt before copying two existing names, commands={commands:?}"
+    );
+    let commands = app.on_key(KeyCode::Char('o'), KeyModifiers::NONE);
+    let sources = copy_sources(&commands);
+    assert!(
+        app.files.conflict.is_some() || sources.len() == 1,
+        "overwrite-one copied every conflicting name: sources={sources:?} conflict={:?}",
+        app.files.conflict
+    );
+}
+
+#[test]
+fn qa_retest_skip_leaves_the_other_conflict_and_cancel_copies_nothing() {
+    let mut app = marked_pair();
+    app.on_key(KeyCode::Char('c'), KeyModifiers::NONE);
+    let commands = app.on_key(KeyCode::Char('s'), KeyModifiers::NONE);
+    let sources = copy_sources(&commands);
+    assert!(
+        sources.iter().all(|source| !source.ends_with("a.txt")),
+        "skip still queued the prompted file: {sources:?}"
+    );
+    assert!(
+        app.files
+            .conflict
+            .as_ref()
+            .is_some_and(|dialog| dialog.path.ends_with("b.txt"))
+            || sources == vec!["/tmp/local/b.txt".to_string()],
+        "skip did not keep b.txt for a later decision: sources={sources:?} conflict={:?}",
+        app.files.conflict
+    );
+
+    let mut app = marked_pair();
+    app.on_key(KeyCode::Char('c'), KeyModifiers::NONE);
+    let commands = app.on_key(KeyCode::Esc, KeyModifiers::NONE);
+    assert!(
+        commands.is_empty() && app.files.conflict.is_none(),
+        "cancel should copy nothing, commands={commands:?} conflict={:?}",
+        app.files.conflict
+    );
+}
