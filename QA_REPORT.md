@@ -1,5 +1,111 @@
 # vcon QA report — file transfer
 
+## Retest 2 of PR #19 at `ba2e7be`
+
+Verdict: **NO-GO**.
+
+Bugs A, B, C, and E from the first retest are fixed on the paths that were re-run. Bug D is only partly fixed: overwrite-one and skip-one with three conflicting names never prompt the third name. Password `push` / `pull` was still not executed. That is an unverified critical path.
+
+### Commands on `ba2e7be`
+
+| Command | Result |
+|---|---|
+| `cargo test -- --test-threads=8` | 253 + 6 + 2 passed, 3 Docker tests ignored. `qa_cli_transfer` 6 passed |
+| `VCON_QA_LARGE=1 cargo test --bin vcon -- --nocapture qa_large_file_streams` | pass. 2147483648 bytes in 5.06 s (404 MiB/s), RSS 9076 KiB → 16288 KiB (+7212 KiB), HWM 16288 KiB |
+| `cargo fmt --all -- --check` | pass |
+| `cargo clippy --all-targets -- -D warnings` | pass |
+| `cargo audit` 0.23.0 | exit 0, 5 warnings, `rustix` not listed |
+| `cargo build --release` | pass |
+| `qa_retest_*` carried on this commit, plus a local 30 s greeting probe and a symlink-root probe | all of those passed except the new three-name conflict test |
+
+GitHub Actions run [44461281493](https://github.com/arafat2020/v-con/actions/runs/44461281493), head `ba2e7be`, conclusion success. Every job ran tests:
+
+| Job | What actually ran |
+|---|---|
+| test (ubuntu-latest) | success. 253 + 6 + 2 passed, 3 ignored, then `qa_cli_transfer` 6 passed |
+| test (macos-latest) | success. 252 + 6 + 2 passed, 3 ignored, then 6 passed |
+| integration (docker) | success. 3 passed in 257 s: `password_reuse_reprompt_tunnel_and_single_failure`, `exec_true_on_fixture_host`, `status_against_fixture_host`. Not `push` or `pull` |
+
+CI does not set `VCON_QA_LARGE`, so the 2 GiB test returns immediately there. The timed run above is local. This VM has no Docker.
+
+### Test-edit audit against `cursor/qa-file-transfer-134b` (`6a664ec`)
+
+`git diff 6a664ec..ba2e7be -- tests qa` touches only `qa/file_transfer_tests.rs`. `qa/tui_conflict.rs` and `tests/qa_cli_transfer.rs` are unchanged. The four edits are:
+
+1. `qa_metadata_failure_is_currently_ignored` → `qa_metadata_failure_is_surfaced`. Stricter: the copy must return an error containing `metadata`, and the destination must not be published. Legitimate.
+2. `qa_sftp_handshake_times_out_on_a_stalled_peer` calls `connect_with_env_timeout(..., 1s)` and still wraps that in a 3 s deadline. The silent peer must still fail. It does not weaken the check, and it no longer depends on the 30 s default. Legitimate.
+3. `qa_sftp_connection_drop_does_not_commit_a_partial_file` now has four checks: the copy fails with an error that mentions the dropped connection, the finished path is absent, an unrelated local file is untouched, and a retry replaces a stale `.part` with the full payload. It no longer requires `.part` to disappear before the retry. That matches the removal of the local `remove_file` fallback. It is not weaker about publishing a partial as the finished file.
+4. `qa_fifo_copy_must_not_block` holds a nonblocking read end so the test's own write-open in `Drop` can finish. The assertions are unchanged: the copy must finish inside 500 ms and must be an error. A product path that blocked in `read` would still fail that timeout, because `Drop` runs only after the timed future ends. The product rejects a non-regular file from `lstat` before `open` (`src/services/files.rs:485-492`). The helper does not mask that.
+
+No other QA assertion changed.
+
+Grep of `src/` found no transfer behavior keyed on an executable name, a `cfg(test)` branch inside the copy or connect path, or an environment variable that relaxes checks under test. `cfg(test)` in product files only selects test modules or the in-memory keychain. `VCON_*` variables are the real config directory and askpass channel, not a test switch.
+
+### Claims
+
+| Claim | Result |
+|---|---|
+| C. `connect_with_env_timeout` is public. Default greeting wait is `SFTP_CONNECT_TIMEOUT_SECS` (30). Push, pull, and the TUI pass that same value as ssh `ConnectTimeout`. No product caller passes a shorter greeting wait | **holds.** `src/infra/remote_fs/sftp.rs:24-30` and `:98-103`. Call sites use `connect_with_env`, which uses the 30 s default. `qa_retest_default_greeting_timeout_fails_a_stalled_cli_peer` failed a `sleep 120` peer in about 30 s and under 45 s. A peer that speaks after 3 s succeeds (`qa_retest_sftp_slow_handshake_is_not_killed`). Child exit and stdout EOF are selected ahead of the sleep (`src/infra/remote_fs/sftp.rs:166-218`) |
+| C. TUI connect is off the UI task, covered by `ui_loop_ticks_while_sftp_connect_is_pending` | **holds.** `spawn_sftp_connect` (`src/tui/mod.rs:364`) and that test are in the 253 passing tests. Disconnect and a newer connect abort the task (`src/tui/mod.rs:741-743`, `:846-848`). `CancelTransfers` cancels copies, not the greeting |
+| E. Local `remove_file` fallback is gone. Only the destination backend removes `.part`, and a failure is logged. `create` truncates under the destination lock | **holds.** `src/services/files.rs:460-468` and `:500-502`. `qa_retest_failed_cleanup_does_not_unlink_a_local_part_file` passed. The drop test's retry compared the full payload |
+| FIFO rejected from `lstat` before open | **holds**, as in the FIFO edit above |
+| A. Symlink component escape | **fixed.** `qa_retest_symlink_component_in_listing_name_cannot_escape` passed. A symlink directory root that points outside its parent is also refused (`qa_retest_symlink_destination_root_is_not_followed`) |
+| B. Equivalent-path lock | **fixed** for `./`. `qa_retest_equivalent_destination_paths_do_not_interleave` passed. The lock key is `normalize`d first (`src/services/files.rs:446-447`) |
+| D. Overwrite-one | **not fixed for three names.** Two names work (`qa_retest_overwrite_one_does_not_replace_every_marked_name` passed). Three names drop the third |
+
+### Original bugs 1–13 and A–E
+
+| ID | Status on `ba2e7be` | Evidence |
+|---|---|---|
+| 1 path `..` | fixed | original hostile test passed |
+| 2 size 0 / `/dev/zero` | fixed | both original tests passed |
+| 3 early EOF | fixed | short-read test passed |
+| 4 symlink copied as bytes | fixed | both symlink tests passed |
+| 5 `../secret` | fixed | normalize test and CLI test passed |
+| 6 rename deletes the old file | fixed | rename-failure test passed |
+| 7 identical-path interleave | fixed | original concurrent test passed |
+| 8 FIFO blocks | fixed | FIFO test passed |
+| 9 silent handshake hangs | fixed | 1 s injected timeout still fails inside 3 s; default stalls at ~30 s |
+| 10 CLI hides the I/O error | fixed | both CLI tests passed |
+| 11 dialog never opens | fixed | both original TUI tests passed. Skip and Esc for two names passed |
+| 12 drop publishes a partial | fixed | finished path stays absent; retry replaces a stale `.part` |
+| 13 `set_meta` ignored | fixed | renamed test passed |
+| A symlink-directory escape | fixed | retest passed |
+| B `./` lock | fixed | retest passed |
+| C 2 s handshake | fixed | 3 s startup succeeds; silent peer still fails |
+| D overwrite-one | not fixed for a third name | `qa_retest_three_conflicts_do_not_drop_the_third_name` |
+| E local unlink | fixed | retest passed |
+
+### New bug
+
+**Three conflicting names never reach the third prompt**
+
+- Area: frontend
+- Severity: **medium**
+- Test: `qa_retest_three_conflicts_do_not_drop_the_third_name` (failed on `ba2e7be`)
+- Steps: mark `a.txt`, `b.txt`, and `c.txt`, all already present on the other pane. Press `c`, then `o`, then `o` again. Separately, press `c`, `s`, `s`.
+- Expected: the second overwrite prompts `c.txt`. After skipping `a` and `b`, the prompt is `c.txt`.
+- Actual: the second overwrite prompts `/tmp/remote/a.txt` again. After two skips the prompt is `/tmp/remote/a.txt` again. `c.txt` is not queued and not prompted. Overwrite-all (`O`) did queue all three names.
+- Evidence: `queue_files_copy_overwrite_one` keeps only one deferred conflict (`src/tui/app.rs:2270-2283`). `queue_files_copy_skipping` filters only the current path and then `conflicting_destination` walks the still-marked set from the start (`src/tui/app.rs:2210-2248`), so `a` is chosen again.
+
+### Checked and not filed
+
+- A hard-linked pair of destination paths was copied concurrently once and did not interleave. Not repeated enough to call it safe.
+- Case-insensitive filesystems cannot be executed on this Linux VM.
+- A TOCTOU swap of a directory for a symlink between `lstat` and a later `write_at` was not won. `LocalFs::write_at` reopens the path (`src/infra/remote_fs/local.rs:184-188`), so the window exists. Not demonstrated.
+- `ensure_dir` refuses every symlink directory, including a root symlink such as macOS `/tmp` → `/private/tmp`, even though `symlink_leaves_parent` allows a link whose parent is `/` (`src/services/files.rs:551-556` and `:412-417`). macOS CI used canonical temp paths, so this was not executed. It is a suspected macOS regression, not an escape.
+- Transfer errors that were inspected name paths and ssh exit text. They do not include a keychain password. The stalled-greeting error was checked for `s3cret` and `password=`.
+- The destination lock is a local guard. It is dropped when `copy_file` returns or unwinds. Cancel still returns, so the lock is released. Not a separate stress test.
+
+### Still untested
+
+- Password-authenticated `push` and `pull`. The Docker password test is exec and tunnels.
+- Multi-GB over SFTP.
+- Release-build throughput. The 404 MiB/s figure is the debug test binary.
+- A case-insensitive volume, and a won TOCTOU between `lstat` and `open`.
+
+---
+
 ## Retest of PR #19 (`9affe2a`, `cursor/fix-file-transfer-83c7`)
 
 Verdict for PR #19: **NO-GO**.

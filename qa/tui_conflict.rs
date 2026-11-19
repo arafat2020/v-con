@@ -88,6 +88,16 @@ fn qa_tui_conflict_choice_is_not_discarded() {
     );
 }
 
+fn marked(names: &[&str]) -> App {
+    let mut app = app();
+    app.files.local.entries = names.iter().map(|name| entry(name)).collect();
+    app.files.remote.entries = names.iter().map(|name| entry(name)).collect();
+    for name in names {
+        app.files.local.marks.insert((*name).to_string());
+    }
+    app
+}
+
 fn marked_pair() -> App {
     let mut app = app();
     app.files.local.entries = vec![entry("a.txt"), entry("b.txt")];
@@ -150,6 +160,53 @@ fn qa_retest_skip_leaves_the_other_conflict_and_cancel_copies_nothing() {
     assert!(
         commands.is_empty() && app.files.conflict.is_none(),
         "cancel should copy nothing, commands={commands:?} conflict={:?}",
+        app.files.conflict
+    );
+}
+
+#[test]
+fn qa_retest_three_conflicts_do_not_drop_the_third_name() {
+    let mut app = marked(&["a.txt", "b.txt", "c.txt"]);
+    assert!(
+        app.on_key(KeyCode::Char('c'), KeyModifiers::NONE)
+            .is_empty()
+    );
+    assert!(
+        app.files
+            .conflict
+            .as_ref()
+            .is_some_and(|dialog| dialog.path.ends_with("a.txt"))
+    );
+    assert_eq!(
+        copy_sources(&app.on_key(KeyCode::Char('o'), KeyModifiers::NONE)),
+        vec!["/tmp/local/a.txt".to_string()]
+    );
+    let commands = app.on_key(KeyCode::Char('o'), KeyModifiers::NONE);
+    assert!(
+        copy_sources(&commands)
+            .iter()
+            .any(|source| source.ends_with("b.txt")),
+        "{commands:?}"
+    );
+    assert!(
+        app.files
+            .conflict
+            .as_ref()
+            .is_some_and(|dialog| dialog.path.ends_with("c.txt")),
+        "third overwrite should prompt c.txt, got {:?}",
+        app.files.conflict
+    );
+
+    let mut app = marked(&["a.txt", "b.txt", "c.txt"]);
+    app.on_key(KeyCode::Char('c'), KeyModifiers::NONE);
+    app.on_key(KeyCode::Char('s'), KeyModifiers::NONE);
+    let commands = app.on_key(KeyCode::Char('s'), KeyModifiers::NONE);
+    assert!(
+        app.files
+            .conflict
+            .as_ref()
+            .is_some_and(|dialog| dialog.path.ends_with("c.txt")),
+        "after skipping a and b, c should be prompted, got {:?} commands={commands:?}",
         app.files.conflict
     );
 }
