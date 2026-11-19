@@ -125,7 +125,7 @@ pub fn run(
             let planned = plan_push(&LocalFs, remote.as_ref(), &source, request.remote).await?;
             let cancel = CancellationToken::new();
             for (src_path, destination, _size) in planned.files {
-                if copy_file(
+                if let Err(error) = copy_file(
                     &LocalFs,
                     remote.as_ref(),
                     &src_path,
@@ -134,9 +134,10 @@ pub fn run(
                     |_, _| {},
                 )
                 .await
-                .is_err()
                 {
-                    return Err(Error::Message(format!("copy failed for {destination}")));
+                    return Err(Error::Message(format!(
+                        "copy failed for {destination}: {error}"
+                    )));
                 }
             }
             if let Ok(sftp) = Arc::try_unwrap(remote) {

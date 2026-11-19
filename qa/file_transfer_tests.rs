@@ -1041,7 +1041,7 @@ async fn qa_rename_failure_must_not_delete_the_existing_destination() {
 }
 
 #[tokio::test]
-async fn qa_metadata_failure_is_currently_ignored() {
+async fn qa_metadata_failure_is_surfaced() {
     let src = LabFs::new();
     src.insert_file("/in", b"body");
     if let Some(node) = src.nodes.lock().unwrap().get_mut("/in") {
@@ -1058,14 +1058,14 @@ async fn qa_metadata_failure_is_currently_ignored() {
         |_, _| {},
     )
     .await;
+    let err = result.expect_err("set_meta failure must fail the copy");
     assert!(
-        result.is_ok(),
-        "documenting current behavior: set_meta errors are ignored, got {result:?}"
+        err.to_string().contains("metadata"),
+        "metadata error was dropped: {err}"
     );
-    assert_ne!(
-        dst.mode_of("/out"),
-        Some(0o600),
-        "metadata failure was not ignored"
+    assert!(
+        dst.mode_of("/out").is_none(),
+        "metadata failure still published the destination"
     );
 }
 

@@ -25,7 +25,8 @@ use crate::paths::Paths;
 use crate::services::connect::{self};
 use crate::services::exec::{self as job, ExecLaunch};
 use crate::services::files::{
-    TransferDirection, TransferEvent, TransferJob, TransferState, plan_copies, run_queue,
+    ConflictAction, TransferDirection, TransferEvent, TransferJob, TransferState, plan_copies,
+    run_queue, unique_name,
 };
 use crate::services::health::{self as health_svc, HealthControl, HealthEvent};
 use crate::services::inventory::InventoryBundle;
@@ -688,8 +689,9 @@ async fn handle_files_command(
             sources,
             dest_dir,
             host,
+            conflict,
         } => {
-            start_files_copy(app, live, direction, sources, dest_dir, host).await?;
+            start_files_copy(app, live, direction, sources, dest_dir, host, conflict).await?;
         }
         FilesCommand::CancelTransfers => {
             live.cancel.cancel();
@@ -1009,6 +1011,7 @@ async fn start_files_copy(
     sources: Vec<String>,
     dest_dir: String,
     host: String,
+    conflict: ConflictAction,
 ) -> Result<(), crate::error::Error> {
     let remote = live.remote.clone().ok_or_else(|| {
         crate::error::Error::Message("not connected to a remote host".to_string())
@@ -1028,6 +1031,14 @@ async fn start_files_copy(
         };
         made_directory |= planned.made_directory;
         for (src_path, destination, size) in planned.files {
+            let destination = if conflict == ConflictAction::Rename {
+                match direction {
+                    TransferDirection::Upload => unique_name(remote.as_ref(), &destination).await?,
+                    TransferDirection::Download => unique_name(&LocalFs, &destination).await?,
+                }
+            } else {
+                destination
+            };
             let id = app.files.queue.ids.next();
             let job = TransferJob {
                 id,

@@ -82,7 +82,7 @@ pub fn run(
         let cancel = CancellationToken::new();
         let mut any_failed = false;
         for (src_path, destination, _size) in planned.files {
-            if copy_file(
+            if let Err(error) = copy_file(
                 remote.as_ref(),
                 &LocalFs,
                 &src_path,
@@ -91,10 +91,9 @@ pub fn run(
                 |_, _| {},
             )
             .await
-            .is_err()
             {
                 any_failed = true;
-                eprintln!("failed: {src_path} → {destination}");
+                eprintln!("failed: {src_path} → {destination}: {error}");
             }
         }
         if let Ok(sftp) = Arc::try_unwrap(remote) {

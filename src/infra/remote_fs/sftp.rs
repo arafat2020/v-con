@@ -14,6 +14,13 @@ use std::path::{Path, PathBuf};
 use std::pin::pin;
 use std::sync::Arc;
 use std::time::{Duration, SystemTime};
+
+/// Bound on the SFTP greeting. A peer that accepts and then says nothing
+/// must not stall the caller. SSH `ConnectTimeout` does not cover this.
+const SFTP_HANDSHAKE_TIMEOUT: Duration = Duration::from_secs(2);
+
+/// Bound on one SFTP request (read, write, stat, rename, …).
+const SFTP_IO_TIMEOUT: Duration = Duration::from_secs(30);
 use tokio::io::{AsyncReadExt, AsyncSeekExt};
 use tokio::process::{Child, Command};
 use tokio::sync::Mutex;
@@ -132,9 +139,21 @@ impl SftpFs {
                 }
             }
         });
-        let sftp = match Sftp::new(stdin, stdout, SftpOptions::new()).await {
-            Ok(sftp) => sftp,
-            Err(error) => {
+        let sftp = match tokio::time::timeout(
+            SFTP_HANDSHAKE_TIMEOUT,
+            Sftp::new(stdin, stdout, SftpOptions::new()),
+        )
+        .await
+        {
+            Ok(Ok(sftp)) => sftp,
+            Err(_elapsed) => {
+                let _ = child.kill().await;
+                let _ = child.wait().await;
+                return Err(Error::Message(
+                    "sftp handshake timed out waiting for the server".to_string(),
+                ));
+            }
+            Ok(Err(error)) => {
                 let code = ssh_exit_code(&mut child).await;
                 tokio::time::sleep(Duration::from_millis(50)).await;
                 let detail = notes
@@ -191,9 +210,21 @@ impl SftpFs {
             let _ = file.close().await;
         }
         let sftp = sftp.into_inner();
-        sftp.close()
-            .await
-            .map_err(|error| Error::Message(format!("sftp close failed: {error}")))?;
+        match tokio::time::timeout(SFTP_IO_TIMEOUT, sftp.close()).await {
+            Ok(Ok(())) => {}
+            Ok(Err(error)) => {
+                let mut child = child.into_inner();
+                let _ = child.kill().await;
+                return Err(Error::Message(format!("sftp close failed: {error}")));
+            }
+            Err(_elapsed) => {
+                let mut child = child.into_inner();
+                let _ = child.kill().await;
+                return Err(Error::Message(
+                    "sftp close timed out waiting for the server".to_string(),
+                ));
+            }
+        }
         let mut child = child.into_inner();
         let _ = child.kill().await;
         Ok(())
@@ -219,165 +250,209 @@ async fn ssh_exit_code(child: &mut Child) -> Option<i32> {
 
 impl RemoteFs for SftpFs {
     async fn list(&self, dir: &str) -> Result<Vec<DirEntry>, Error> {
-        let sftp = self.sftp.lock().await;
-        let mut fs = sftp.fs();
-        let dir_handle = fs
-            .open_dir(Path::new(dir))
-            .await
-            .map_err(|error| sftp_err("list", dir, error))?;
-        let mut read_dir = pin!(dir_handle.read_dir());
-        let mut entries = Vec::new();
-        while let Some(entry) = read_dir.next().await {
-            let entry = entry.map_err(|error| sftp_err("list", dir, error))?;
-            let name = entry.filename().to_string_lossy().into_owned();
-            if name == "." || name == ".." {
-                continue;
+        timed("list", dir, async {
+            let sftp = self.sftp.lock().await;
+            let mut fs = sftp.fs();
+            let dir_handle = fs
+                .open_dir(Path::new(dir))
+                .await
+                .map_err(|error| sftp_err("list", dir, error))?;
+            let mut read_dir = pin!(dir_handle.read_dir());
+            let mut entries = Vec::new();
+            while let Some(entry) = read_dir.next().await {
+                let entry = entry.map_err(|error| sftp_err("list", dir, error))?;
+                let name = entry.filename().to_string_lossy().into_owned();
+                if name == "." || name == ".." {
+                    continue;
+                }
+                entries.push(from_meta(name, entry.metadata(), None));
             }
-            entries.push(from_meta(name, entry.metadata(), None));
-        }
-        Ok(entries)
+            Ok(entries)
+        })
+        .await
     }
 
     async fn stat(&self, path: &str) -> Result<DirEntry, Error> {
-        let sftp = self.sftp.lock().await;
-        let mut fs = sftp.fs();
-        let meta = fs
-            .symlink_metadata(Path::new(path))
-            .await
-            .map_err(|error| sftp_err("stat", path, error))?;
-        let target = if meta.file_type().is_some_and(|ft| ft.is_symlink()) {
-            fs.read_link(Path::new(path))
+        timed("stat", path, async {
+            let sftp = self.sftp.lock().await;
+            let mut fs = sftp.fs();
+            let meta = fs
+                .symlink_metadata(Path::new(path))
                 .await
-                .ok()
-                .map(|p| p.to_string_lossy().into_owned())
-        } else {
-            None
-        };
-        Ok(from_meta(file_name(path).to_string(), meta, target))
+                .map_err(|error| sftp_err("stat", path, error))?;
+            let target = if meta.file_type().is_some_and(|ft| ft.is_symlink()) {
+                fs.read_link(Path::new(path))
+                    .await
+                    .ok()
+                    .map(|p| p.to_string_lossy().into_owned())
+            } else {
+                None
+            };
+            Ok(from_meta(file_name(path).to_string(), meta, target))
+        })
+        .await
     }
 
     async fn mkdir(&self, path: &str) -> Result<(), Error> {
-        let sftp = self.sftp.lock().await;
-        sftp.fs()
-            .create_dir(Path::new(path))
-            .await
-            .map_err(|error| sftp_err("mkdir", path, error))
+        timed("mkdir", path, async {
+            let sftp = self.sftp.lock().await;
+            sftp.fs()
+                .create_dir(Path::new(path))
+                .await
+                .map_err(|error| sftp_err("mkdir", path, error))
+        })
+        .await
     }
 
     async fn rename(&self, from: &str, to: &str) -> Result<(), Error> {
-        let sftp = self.sftp.lock().await;
-        sftp.fs()
-            .rename(Path::new(from), Path::new(to))
-            .await
-            .map_err(|error| sftp_err("rename", from, error))
+        timed("rename", from, async {
+            let sftp = self.sftp.lock().await;
+            sftp.fs()
+                .rename(Path::new(from), Path::new(to))
+                .await
+                .map_err(|error| sftp_err("rename", from, error))
+        })
+        .await
     }
 
     async fn remove_file(&self, path: &str) -> Result<(), Error> {
-        let sftp = self.sftp.lock().await;
-        sftp.fs()
-            .remove_file(Path::new(path))
-            .await
-            .map_err(|error| sftp_err("remove", path, error))
+        timed("remove", path, async {
+            let sftp = self.sftp.lock().await;
+            sftp.fs()
+                .remove_file(Path::new(path))
+                .await
+                .map_err(|error| sftp_err("remove", path, error))
+        })
+        .await
     }
 
     async fn remove_dir(&self, path: &str) -> Result<(), Error> {
-        let sftp = self.sftp.lock().await;
-        sftp.fs()
-            .remove_dir(Path::new(path))
-            .await
-            .map_err(|error| sftp_err("rmdir", path, error))
+        timed("rmdir", path, async {
+            let sftp = self.sftp.lock().await;
+            sftp.fs()
+                .remove_dir(Path::new(path))
+                .await
+                .map_err(|error| sftp_err("rmdir", path, error))
+        })
+        .await
     }
 
     async fn realpath(&self, path: &str) -> Result<String, Error> {
-        let sftp = self.sftp.lock().await;
-        let resolved = sftp
-            .fs()
-            .canonicalize(Path::new(path))
-            .await
-            .map_err(|error| sftp_err("realpath", path, error))?;
-        Ok(resolved.to_string_lossy().into_owned())
+        timed("realpath", path, async {
+            let sftp = self.sftp.lock().await;
+            let resolved = sftp
+                .fs()
+                .canonicalize(Path::new(path))
+                .await
+                .map_err(|error| sftp_err("realpath", path, error))?;
+            Ok(resolved.to_string_lossy().into_owned())
+        })
+        .await
     }
 
     async fn read_at(&self, path: &str, offset: u64, len: usize) -> Result<Vec<u8>, Error> {
-        let missing = !self.reads.lock().await.contains_key(path);
-        if missing {
-            let sftp = self.sftp.lock().await;
-            let file = sftp
-                .open(Path::new(path))
+        timed("read", path, async {
+            let missing = !self.reads.lock().await.contains_key(path);
+            if missing {
+                let sftp = self.sftp.lock().await;
+                let meta = sftp
+                    .fs()
+                    .symlink_metadata(Path::new(path))
+                    .await
+                    .map_err(|error| sftp_err("stat", path, error))?;
+                let entry = from_meta(String::new(), meta, None);
+                if entry.kind == EntryKind::Symlink || !entry.is_file() {
+                    return Err(Error::Message(format!(
+                        "refusing to read non-regular file {path}"
+                    )));
+                }
+                let file = sftp
+                    .open(Path::new(path))
+                    .await
+                    .map_err(|error| sftp_err("open", path, error))?;
+                drop(sftp);
+                self.reads.lock().await.insert(path.to_string(), file);
+            }
+            let mut reads = self.reads.lock().await;
+            let file = reads
+                .get_mut(path)
+                .ok_or_else(|| Error::Message(format!("sftp read {path}: handle missing")))?;
+            // Seek every chunk. The client's sequential read cursor advances by the
+            // requested length, which is larger than a short read.
+            file.seek(std::io::SeekFrom::Start(offset))
                 .await
-                .map_err(|error| sftp_err("open", path, error))?;
-            drop(sftp);
-            self.reads.lock().await.insert(path.to_string(), file);
-        }
-        let mut reads = self.reads.lock().await;
-        let file = reads
-            .get_mut(path)
-            .ok_or_else(|| Error::Message(format!("sftp read {path}: handle missing")))?;
-        // Seek every chunk. The client's sequential read cursor advances by the
-        // requested length, which is larger than a short read.
-        file.seek(std::io::SeekFrom::Start(offset))
-            .await
-            .map_err(|source| Error::Message(format!("sftp seek {path}: {source}")))?;
-        let n = u32::try_from(len).unwrap_or(u32::MAX);
-        let buf = BytesMut::with_capacity(len.min(n as usize));
-        match file
-            .read(n, buf)
-            .await
-            .map_err(|error| sftp_err("read", path, error))?
-        {
-            Some(bytes) => Ok(bytes.to_vec()),
-            None => Ok(Vec::new()),
-        }
+                .map_err(|source| Error::Message(format!("sftp seek {path}: {source}")))?;
+            let n = u32::try_from(len).unwrap_or(u32::MAX);
+            let buf = BytesMut::with_capacity(len.min(n as usize));
+            match file
+                .read(n, buf)
+                .await
+                .map_err(|error| sftp_err("read", path, error))?
+            {
+                Some(bytes) => Ok(bytes.to_vec()),
+                None => Ok(Vec::new()),
+            }
+        })
+        .await
     }
 
     async fn create(&self, path: &str) -> Result<(), Error> {
-        let sftp = self.sftp.lock().await;
-        let file = sftp
-            .create(Path::new(path))
-            .await
-            .map_err(|error| sftp_err("create", path, error))?;
-        drop(file);
-        Ok(())
+        timed("create", path, async {
+            let sftp = self.sftp.lock().await;
+            let file = sftp
+                .create(Path::new(path))
+                .await
+                .map_err(|error| sftp_err("create", path, error))?;
+            drop(file);
+            Ok(())
+        })
+        .await
     }
 
     async fn write_at(&self, path: &str, offset: u64, data: &[u8]) -> Result<(), Error> {
-        let missing = !self.writes.lock().await.contains_key(path);
-        if missing {
-            let sftp = self.sftp.lock().await;
-            let file = sftp
-                .options()
-                .write(true)
-                .open(Path::new(path))
+        timed("write", path, async {
+            let missing = !self.writes.lock().await.contains_key(path);
+            if missing {
+                let sftp = self.sftp.lock().await;
+                let file = sftp
+                    .options()
+                    .write(true)
+                    .open(Path::new(path))
+                    .await
+                    .map_err(|error| sftp_err("open", path, error))?;
+                drop(sftp);
+                self.writes.lock().await.insert(path.to_string(), file);
+            }
+            let mut writes = self.writes.lock().await;
+            let file = writes
+                .get_mut(path)
+                .ok_or_else(|| Error::Message(format!("sftp write {path}: handle missing")))?;
+            file.seek(std::io::SeekFrom::Start(offset))
                 .await
-                .map_err(|error| sftp_err("open", path, error))?;
-            drop(sftp);
-            self.writes.lock().await.insert(path.to_string(), file);
-        }
-        let mut writes = self.writes.lock().await;
-        let file = writes
-            .get_mut(path)
-            .ok_or_else(|| Error::Message(format!("sftp write {path}: handle missing")))?;
-        file.seek(std::io::SeekFrom::Start(offset))
-            .await
-            .map_err(|source| Error::Message(format!("sftp seek {path}: {source}")))?;
-        file.write_all(data)
-            .await
-            .map_err(|error| sftp_err("write", path, error))?;
-        Ok(())
+                .map_err(|source| Error::Message(format!("sftp seek {path}: {source}")))?;
+            file.write_all(data)
+                .await
+                .map_err(|error| sftp_err("write", path, error))?;
+            Ok(())
+        })
+        .await
     }
 
     async fn release(&self, path: &str) -> Result<(), Error> {
-        let write = self.writes.lock().await.remove(path);
-        if let Some(file) = write {
-            file.close()
-                .await
-                .map_err(|error| sftp_err("close", path, error))?;
-        }
-        let read = self.reads.lock().await.remove(path);
-        if let Some(file) = read {
-            let _ = file.close().await;
-        }
-        Ok(())
+        timed("close", path, async {
+            let write = self.writes.lock().await.remove(path);
+            if let Some(file) = write {
+                file.close()
+                    .await
+                    .map_err(|error| sftp_err("close", path, error))?;
+            }
+            let read = self.reads.lock().await.remove(path);
+            if let Some(file) = read {
+                let _ = file.close().await;
+            }
+            Ok(())
+        })
+        .await
     }
 
     async fn set_meta(
@@ -386,23 +461,41 @@ impl RemoteFs for SftpFs {
         mode: Option<u32>,
         mtime: Option<SystemTime>,
     ) -> Result<(), Error> {
-        let sftp = self.sftp.lock().await;
-        let mut fs = sftp.fs();
-        if let Some(mode) = mode {
-            let perms = Permissions::from(mode as u16);
-            fs.set_permissions(Path::new(path), perms)
-                .await
-                .map_err(|error| sftp_err("chmod", path, error))?;
-        }
-        if let Some(mtime) = mtime {
-            let stamp = UnixTimeStamp::new(mtime).unwrap_or_else(|_| UnixTimeStamp::unix_epoch());
-            let mut builder = MetaDataBuilder::new();
-            builder.time(stamp, stamp);
-            fs.set_metadata(Path::new(path), builder.create())
-                .await
-                .map_err(|error| sftp_err("utime", path, error))?;
-        }
-        Ok(())
+        timed("meta", path, async {
+            let sftp = self.sftp.lock().await;
+            let mut fs = sftp.fs();
+            if let Some(mode) = mode {
+                let perms = Permissions::from(mode as u16);
+                fs.set_permissions(Path::new(path), perms)
+                    .await
+                    .map_err(|error| sftp_err("chmod", path, error))?;
+            }
+            if let Some(mtime) = mtime {
+                let stamp =
+                    UnixTimeStamp::new(mtime).unwrap_or_else(|_| UnixTimeStamp::unix_epoch());
+                let mut builder = MetaDataBuilder::new();
+                builder.time(stamp, stamp);
+                fs.set_metadata(Path::new(path), builder.create())
+                    .await
+                    .map_err(|error| sftp_err("utime", path, error))?;
+            }
+            Ok(())
+        })
+        .await
+    }
+}
+
+async fn timed<T>(
+    op: &str,
+    path: &str,
+    fut: impl std::future::Future<Output = Result<T, Error>>,
+) -> Result<T, Error> {
+    match tokio::time::timeout(SFTP_IO_TIMEOUT, fut).await {
+        Ok(result) => result,
+        Err(_elapsed) => Err(Error::Message(format!(
+            "sftp {op} {path}: timed out after {}s",
+            SFTP_IO_TIMEOUT.as_secs()
+        ))),
     }
 }
 

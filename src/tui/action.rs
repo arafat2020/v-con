@@ -216,6 +216,8 @@ pub enum FilesCommand {
         dest_dir: String,
         /// Remote host name for labels.
         host: String,
+        /// What to do when a destination name already exists.
+        conflict: crate::services::files::ConflictAction,
     },
     /// Cancel active transfers.
     CancelTransfers,

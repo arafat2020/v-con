@@ -34,10 +34,14 @@ impl RemoteFs for LocalFs {
             if name == "." || name == ".." {
                 continue;
             }
-            let meta = entry.metadata().await.map_err(|source| Error::Read {
-                path: entry.path(),
-                source,
-            })?;
+            // Do not follow symlinks. `metadata` would turn a link to a
+            // directory into a directory and a link to a file into its target.
+            let meta = fs::symlink_metadata(entry.path())
+                .await
+                .map_err(|source| Error::Read {
+                    path: entry.path(),
+                    source,
+                })?;
             entries.push(from_meta(name, &meta, None));
         }
         Ok(entries)
@@ -123,6 +127,18 @@ impl RemoteFs for LocalFs {
 
     async fn read_at(&self, path: &str, offset: u64, len: usize) -> Result<Vec<u8>, Error> {
         let path = Self::expand(path);
+        let meta = fs::symlink_metadata(&path)
+            .await
+            .map_err(|source| Error::Read {
+                path: path.clone(),
+                source,
+            })?;
+        if !meta.file_type().is_file() {
+            return Err(Error::Message(format!(
+                "not a regular file: {}",
+                path.display()
+            )));
+        }
         let mut file = File::open(&path).await.map_err(|source| Error::Read {
             path: path.clone(),
             source,

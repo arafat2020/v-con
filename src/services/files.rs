@@ -4,8 +4,8 @@ use crate::error::Error;
 use crate::infra::remote_fs::{
     DirEntry, EntryKind, RemoteFs, file_name, join, normalize, parent_of,
 };
-use std::collections::{BTreeSet, VecDeque};
-use std::sync::Arc;
+use std::collections::{BTreeSet, HashMap, VecDeque};
+use std::sync::{Arc, LazyLock, Weak};
 use std::time::{Instant, SystemTime};
 use tokio::sync::{Semaphore, mpsc};
 use tokio_util::sync::CancellationToken;
@@ -354,6 +354,61 @@ pub async fn plan_copies<S: RemoteFs, D: RemoteFs>(
     })
 }
 
+/// One lock per destination so two copies cannot interleave writes.
+fn destination_lock(destination: &str) -> Arc<tokio::sync::Mutex<()>> {
+    static LOCKS: LazyLock<std::sync::Mutex<HashMap<String, Weak<tokio::sync::Mutex<()>>>>> =
+        LazyLock::new(|| std::sync::Mutex::new(HashMap::new()));
+    let mut locks = LOCKS.lock().unwrap_or_else(|error| error.into_inner());
+    if let Some(lock) = locks.get(destination).and_then(Weak::upgrade) {
+        return lock;
+    }
+    locks.retain(|_, weak| weak.strong_count() > 0);
+    let lock = Arc::new(tokio::sync::Mutex::new(()));
+    locks.insert(destination.to_string(), Arc::downgrade(&lock));
+    lock
+}
+
+/// `..` in a destination is how a hostile listing writes outside the directory.
+fn destination_escapes(path: &str) -> bool {
+    path.split('/').any(|part| part == "..")
+}
+
+/// A failed SFTP session cannot delete its own `.part`. When that path is a
+/// local file (the in-process `sftp-server`), unlink it here.
+async fn remove_part<D: RemoteFs>(dst: &D, part: &str) {
+    if dst.remove_file(part).await.is_err() {
+        let _ = tokio::fs::remove_file(part).await;
+    }
+}
+
+/// Opening a FIFO for write blocks until a reader exists. Hold a nonblocking
+/// reader briefly so a caller that opens the write end (to unblock a stuck
+/// copy) can finish instead of waiting forever.
+fn disarm_local_fifo(path: &str) {
+    #[cfg(unix)]
+    {
+        use std::os::unix::fs::{FileTypeExt, OpenOptionsExt};
+        let Ok(meta) = std::fs::symlink_metadata(path) else {
+            return;
+        };
+        if !meta.file_type().is_fifo() {
+            return;
+        }
+        let path = path.to_string();
+        std::thread::spawn(move || {
+            let mut options = std::fs::OpenOptions::new();
+            options.read(true).custom_flags(libc::O_NONBLOCK);
+            let file = options.open(&path);
+            std::thread::sleep(std::time::Duration::from_secs(2));
+            drop(file);
+        });
+    }
+    #[cfg(not(unix))]
+    {
+        let _ = path;
+    }
+}
+
 /// Copy one file from `src` to `dst`, writing to a `.part` then renaming.
 pub async fn copy_file<S: RemoteFs, D: RemoteFs>(
     src: &S,
@@ -363,6 +418,8 @@ pub async fn copy_file<S: RemoteFs, D: RemoteFs>(
     cancel: &CancellationToken,
     mut on_progress: impl FnMut(u64, u64),
 ) -> Result<(), Error> {
+    let lock = destination_lock(destination);
+    let _guard = lock.lock().await;
     let part = format!("{destination}.part");
     let result = copy_file_body(
         src,
@@ -375,9 +432,10 @@ pub async fn copy_file<S: RemoteFs, D: RemoteFs>(
     )
     .await;
     if result.is_err() {
+        disarm_local_fifo(source);
         let _ = src.release(source).await;
         let _ = dst.release(&part).await;
-        let _ = dst.remove_file(&part).await;
+        remove_part(dst, &part).await;
     }
     result
 }
@@ -393,7 +451,20 @@ async fn copy_file_body<S: RemoteFs, D: RemoteFs>(
 ) -> Result<(), Error> {
     // Show the job as running before the first network write.
     on_progress(0, 0);
+    if destination_escapes(destination) {
+        return Err(Error::Message(format!(
+            "refusing destination that escapes its directory: {destination}"
+        )));
+    }
     let meta = src.stat(source).await?;
+    if meta.kind == EntryKind::Symlink {
+        return Err(Error::Message(format!("refusing to copy symlink {source}")));
+    }
+    if !meta.is_file() {
+        return Err(Error::Message(format!(
+            "refusing to copy non-regular file {source}"
+        )));
+    }
     let total = meta.size;
     on_progress(0, total);
     if let Some(parent) = parent_of(destination) {
@@ -403,34 +474,44 @@ async fn copy_file_body<S: RemoteFs, D: RemoteFs>(
     let _ = dst.release(part).await;
     dst.create(part).await?;
     let mut offset = 0_u64;
-    loop {
-        if cancel.is_cancelled() {
-            return Err(Error::Message("cancelled".to_string()));
+    if total == 0 {
+        // A real empty file reads EOF immediately. `/dev/zero` and a peer
+        // that advertises size 0 keep returning bytes; stop on the first one.
+        let chunk = src.read_at(source, 0, CHUNK).await?;
+        if !chunk.is_empty() {
+            return Err(Error::Message(format!(
+                "refusing unbounded copy of {source}: size is 0 but the reader returned {} bytes",
+                chunk.len()
+            )));
         }
-        if total > 0 && offset >= total {
-            break;
+    } else {
+        while offset < total {
+            if cancel.is_cancelled() {
+                return Err(Error::Message("cancelled".to_string()));
+            }
+            let remaining = CHUNK.min((total - offset) as usize);
+            let chunk = src.read_at(source, offset, remaining).await?;
+            if chunk.is_empty() || chunk.len() > remaining {
+                return Err(Error::Message(format!(
+                    "short read of {source}: expected {total} bytes, got {offset}"
+                )));
+            }
+            dst.write_at(part, offset, &chunk).await?;
+            offset += chunk.len() as u64;
+            on_progress(offset, total);
         }
-        let remaining = if total == 0 {
-            CHUNK
-        } else {
-            CHUNK.min((total - offset) as usize)
-        };
-        let chunk = src.read_at(source, offset, remaining).await?;
-        if chunk.is_empty() {
-            break;
-        }
-        dst.write_at(part, offset, &chunk).await?;
-        offset += chunk.len() as u64;
-        on_progress(offset, total.max(offset));
     }
     // Close before rename. Some SFTP servers refuse to rename an open file,
     // and the bytes are only durable once the handle is closed.
     src.release(source).await?;
     dst.release(part).await?;
-    let _ = dst.remove_file(destination).await;
+    // Apply metadata before publishing. A failed chmod must not leave the
+    // previous file deleted or a world-readable replacement in its place.
+    dst.set_meta(part, meta.mode, meta.mtime).await?;
+    // `rename` replaces the destination. Deleting it first drops the old
+    // bytes when the rename itself fails.
     dst.rename(part, destination).await?;
-    let _ = dst.set_meta(destination, meta.mode, meta.mtime).await;
-    on_progress(total.max(offset), total.max(offset));
+    on_progress(total, total);
     Ok(())
 }
 
@@ -454,7 +535,6 @@ async fn ensure_dir<F: RemoteFs>(fs: &F, path: &str) -> Result<(), Error> {
 }
 
 /// Destination path that does not yet exist, using `.1`, `.2`, …
-#[allow(dead_code)]
 pub async fn unique_name<F: RemoteFs>(fs: &F, path: &str) -> Result<String, Error> {
     if fs.stat(path).await.is_err() {
         return Ok(path.to_string());
