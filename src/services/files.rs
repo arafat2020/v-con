@@ -4,8 +4,8 @@ use crate::error::Error;
 use crate::infra::remote_fs::{
     DirEntry, EntryKind, RemoteFs, file_name, join, normalize, parent_of,
 };
-use std::collections::{BTreeSet, VecDeque};
-use std::sync::Arc;
+use std::collections::{BTreeSet, HashMap, VecDeque};
+use std::sync::{Arc, LazyLock, Weak};
 use std::time::{Instant, SystemTime};
 use tokio::sync::{Semaphore, mpsc};
 use tokio_util::sync::CancellationToken;
@@ -354,6 +354,80 @@ pub async fn plan_copies<S: RemoteFs, D: RemoteFs>(
     })
 }
 
+/// One lock per normalized destination so `/out/./same.bin` and
+/// `/out/same.bin` cannot interleave.
+fn destination_lock(destination: &str) -> Arc<tokio::sync::Mutex<()>> {
+    static LOCKS: LazyLock<std::sync::Mutex<HashMap<String, Weak<tokio::sync::Mutex<()>>>>> =
+        LazyLock::new(|| std::sync::Mutex::new(HashMap::new()));
+    let mut locks = LOCKS.lock().unwrap_or_else(|error| error.into_inner());
+    if let Some(lock) = locks.get(destination).and_then(Weak::upgrade) {
+        return lock;
+    }
+    locks.retain(|_, weak| weak.strong_count() > 0);
+    let lock = Arc::new(tokio::sync::Mutex::new(()));
+    locks.insert(destination.to_string(), Arc::downgrade(&lock));
+    lock
+}
+
+/// `..` in a destination is how a hostile listing writes outside the directory.
+fn destination_escapes(path: &str) -> bool {
+    path.split('/').any(|part| part == "..")
+}
+
+/// Refuse a symlink component whose target leaves its parent directory.
+async fn refuse_symlink_destination<F: RemoteFs>(fs: &F, destination: &str) -> Result<(), Error> {
+    let absolute = destination.starts_with('/');
+    let mut acc = String::new();
+    for part in destination
+        .split('/')
+        .filter(|part| !part.is_empty() && *part != ".")
+    {
+        if acc.is_empty() {
+            acc = if absolute {
+                format!("/{part}")
+            } else {
+                part.to_string()
+            };
+        } else if acc == "/" {
+            acc = format!("/{part}");
+        } else {
+            acc = format!("{acc}/{part}");
+        }
+        match fs.stat(&acc).await {
+            Ok(entry) if entry.kind == EntryKind::Symlink => {
+                if symlink_leaves_parent(&acc, entry.target.as_deref()) {
+                    return Err(Error::Message(format!("refusing to follow symlink {acc}")));
+                }
+            }
+            Err(_) => break,
+            Ok(_) => {}
+        }
+    }
+    Ok(())
+}
+
+/// True when `link`'s target is outside the directory that contains the link.
+///
+/// A root symlink such as macOS `/var` → `/private/var` stays inside `/`.
+fn symlink_leaves_parent(link: &str, target: Option<&str>) -> bool {
+    let Some(parent) = parent_of(link) else {
+        return false;
+    };
+    if parent == "/" {
+        return false;
+    }
+    let Some(target) = target.filter(|target| !target.is_empty()) else {
+        return true;
+    };
+    let resolved = normalize(&if target.starts_with('/') {
+        target.to_string()
+    } else {
+        join(&parent, target)
+    });
+    let parent = normalize(&parent);
+    resolved != parent && !resolved.starts_with(&format!("{parent}/"))
+}
+
 /// Copy one file from `src` to `dst`, writing to a `.part` then renaming.
 pub async fn copy_file<S: RemoteFs, D: RemoteFs>(
     src: &S,
@@ -363,12 +437,21 @@ pub async fn copy_file<S: RemoteFs, D: RemoteFs>(
     cancel: &CancellationToken,
     mut on_progress: impl FnMut(u64, u64),
 ) -> Result<(), Error> {
+    // Reject `..` before normalize collapses an absolute path out of the tree.
+    if destination_escapes(destination) {
+        return Err(Error::Message(format!(
+            "refusing destination that escapes its directory: {destination}"
+        )));
+    }
+    let destination = normalize(destination);
+    let lock = destination_lock(&destination);
+    let _guard = lock.lock().await;
     let part = format!("{destination}.part");
     let result = copy_file_body(
         src,
         dst,
         source,
-        destination,
+        &destination,
         &part,
         cancel,
         &mut on_progress,
@@ -377,7 +460,12 @@ pub async fn copy_file<S: RemoteFs, D: RemoteFs>(
     if result.is_err() {
         let _ = src.release(source).await;
         let _ = dst.release(&part).await;
-        let _ = dst.remove_file(&part).await;
+        // The destination backend removes its own partial file. Do not unlink
+        // that path on the local disk: a remote name can collide with a local
+        // file that this transfer did not create.
+        if let Err(cleanup) = dst.remove_file(&part).await {
+            tracing::warn!("failed to remove partial {part}: {cleanup}");
+        }
     }
     result
 }
@@ -393,44 +481,64 @@ async fn copy_file_body<S: RemoteFs, D: RemoteFs>(
 ) -> Result<(), Error> {
     // Show the job as running before the first network write.
     on_progress(0, 0);
+    refuse_symlink_destination(dst, destination).await?;
     let meta = src.stat(source).await?;
+    if meta.kind == EntryKind::Symlink {
+        return Err(Error::Message(format!("refusing to copy symlink {source}")));
+    }
+    if !meta.is_file() {
+        return Err(Error::Message(format!(
+            "refusing to copy non-regular file {source}"
+        )));
+    }
     let total = meta.size;
     on_progress(0, total);
     if let Some(parent) = parent_of(destination) {
         ensure_dir(dst, &parent).await?;
     }
     // A leftover handle would keep writing the pre-truncate inode.
+    // `create` truncates, so a stale `.part` from a dropped session is replaced.
     let _ = dst.release(part).await;
     dst.create(part).await?;
     let mut offset = 0_u64;
-    loop {
-        if cancel.is_cancelled() {
-            return Err(Error::Message("cancelled".to_string()));
+    if total == 0 {
+        // A real empty file reads EOF immediately. `/dev/zero` and a peer
+        // that advertises size 0 keep returning bytes; stop on the first one.
+        let chunk = src.read_at(source, 0, CHUNK).await?;
+        if !chunk.is_empty() {
+            return Err(Error::Message(format!(
+                "refusing unbounded copy of {source}: size is 0 but the reader returned {} bytes",
+                chunk.len()
+            )));
         }
-        if total > 0 && offset >= total {
-            break;
+    } else {
+        while offset < total {
+            if cancel.is_cancelled() {
+                return Err(Error::Message("cancelled".to_string()));
+            }
+            let remaining = CHUNK.min((total - offset) as usize);
+            let chunk = src.read_at(source, offset, remaining).await?;
+            if chunk.is_empty() || chunk.len() > remaining {
+                return Err(Error::Message(format!(
+                    "short read of {source}: expected {total} bytes, got {offset}"
+                )));
+            }
+            dst.write_at(part, offset, &chunk).await?;
+            offset += chunk.len() as u64;
+            on_progress(offset, total);
         }
-        let remaining = if total == 0 {
-            CHUNK
-        } else {
-            CHUNK.min((total - offset) as usize)
-        };
-        let chunk = src.read_at(source, offset, remaining).await?;
-        if chunk.is_empty() {
-            break;
-        }
-        dst.write_at(part, offset, &chunk).await?;
-        offset += chunk.len() as u64;
-        on_progress(offset, total.max(offset));
     }
     // Close before rename. Some SFTP servers refuse to rename an open file,
     // and the bytes are only durable once the handle is closed.
     src.release(source).await?;
     dst.release(part).await?;
-    let _ = dst.remove_file(destination).await;
+    // Apply metadata before publishing. A failed chmod must not leave the
+    // previous file deleted or a world-readable replacement in its place.
+    dst.set_meta(part, meta.mode, meta.mtime).await?;
+    // `rename` replaces the destination. Deleting it first drops the old
+    // bytes when the rename itself fails.
     dst.rename(part, destination).await?;
-    let _ = dst.set_meta(destination, meta.mode, meta.mtime).await;
-    on_progress(total.max(offset), total.max(offset));
+    on_progress(total, total);
     Ok(())
 }
 
@@ -440,8 +548,19 @@ async fn ensure_dir<F: RemoteFs>(fs: &F, path: &str) -> Result<(), Error> {
     if path.is_empty() || path == "/" || path == "." {
         return Ok(());
     }
-    if fs.stat(&path).await.is_ok() {
-        return Ok(());
+    if let Ok(entry) = fs.stat(&path).await {
+        if entry.kind == EntryKind::Symlink {
+            if symlink_leaves_parent(&path, entry.target.as_deref()) {
+                return Err(Error::Message(format!("refusing to follow symlink {path}")));
+            }
+            // The chosen destination root may itself be a symlink, such as
+            // macOS `/tmp` → `/private/tmp`. Use that directory.
+            return Ok(());
+        }
+        if entry.is_dir() {
+            return Ok(());
+        }
+        return Err(Error::Message(format!("{path} is not a directory")));
     }
     if let Some(parent) = parent_of(&path) {
         Box::pin(ensure_dir(fs, &parent)).await?;
@@ -454,7 +573,6 @@ async fn ensure_dir<F: RemoteFs>(fs: &F, path: &str) -> Result<(), Error> {
 }
 
 /// Destination path that does not yet exist, using `.1`, `.2`, …
-#[allow(dead_code)]
 pub async fn unique_name<F: RemoteFs>(fs: &F, path: &str) -> Result<String, Error> {
     if fs.stat(path).await.is_err() {
         return Ok(path.to_string());
@@ -622,7 +740,49 @@ impl TransferQueue {
 #[cfg(test)]
 mod tests {
     use super::*;
-    use crate::infra::remote_fs::FakeFs;
+    use crate::infra::remote_fs::{FakeFs, LocalFs};
+
+    #[cfg(unix)]
+    #[tokio::test]
+    async fn symlink_destination_root_is_usable_and_children_cannot_escape() {
+        let dir = tempfile::tempdir().unwrap();
+        let real = dir.path().join("real");
+        std::fs::create_dir(&real).unwrap();
+        let link = dir.path().join("link");
+        std::os::unix::fs::symlink(&real, &link).unwrap();
+        let src = dir.path().join("in.bin");
+        std::fs::write(&src, b"hello").unwrap();
+        let nested = link.join("nested/out.bin");
+        copy_file(
+            &LocalFs,
+            &LocalFs,
+            &src.to_string_lossy(),
+            &nested.to_string_lossy(),
+            &CancellationToken::new(),
+            |_, _| {},
+        )
+        .await
+        .expect("a symlinked destination root should be usable");
+        assert_eq!(
+            std::fs::read(real.join("nested/out.bin")).unwrap(),
+            b"hello"
+        );
+
+        let outside = dir.path().join("outside");
+        std::fs::create_dir(&outside).unwrap();
+        std::os::unix::fs::symlink(&outside, real.join("sub")).unwrap();
+        let err = copy_file(
+            &LocalFs,
+            &LocalFs,
+            &src.to_string_lossy(),
+            &real.join("sub/pwned.txt").to_string_lossy(),
+            &CancellationToken::new(),
+            |_, _| {},
+        )
+        .await
+        .expect_err("a symlink below the destination must not be followed");
+        assert!(!outside.join("pwned.txt").exists(), "{err}");
+    }
 
     #[test]
     fn prepare_listing_sorts_dirs_first() {

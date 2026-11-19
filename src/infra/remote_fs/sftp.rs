@@ -18,6 +18,17 @@ use tokio::io::{AsyncReadExt, AsyncSeekExt};
 use tokio::process::{Child, Command};
 use tokio::sync::Mutex;
 
+/// Seconds passed to ssh as `ConnectTimeout`, and the default wait for the
+/// SFTP greeting after the child has been spawned. One constant so the two
+/// budgets cannot drift apart.
+pub const SFTP_CONNECT_TIMEOUT_SECS: u64 = 30;
+
+/// Default greeting budget. [`SftpFs::connect_with_env`] uses this.
+pub const SFTP_GREETING_TIMEOUT: Duration = Duration::from_secs(SFTP_CONNECT_TIMEOUT_SECS);
+
+/// Bound on one SFTP request (read, write, stat, rename, …).
+const SFTP_IO_TIMEOUT: Duration = SFTP_GREETING_TIMEOUT;
+
 /// Build ssh argv (without the binary) that starts the SFTP subsystem.
 pub fn sftp_arguments(
     host: &EffectiveHost,
@@ -81,10 +92,29 @@ impl SftpFs {
     ///
     /// `env` must not contain the password. The askpass helper reads that
     /// from the OS keychain. Pass an empty slice when no password is saved.
+    ///
+    /// The greeting wait is [`SFTP_GREETING_TIMEOUT`], the same length as the
+    /// ssh `ConnectTimeout` push and pull pass.
     pub async fn connect_with_env(
         program: PathBuf,
         args: Vec<String>,
         env: &[(String, String)],
+    ) -> Result<Self, Error> {
+        Self::connect_with_env_timeout(program, args, env, SFTP_GREETING_TIMEOUT).await
+    }
+
+    /// [`connect_with_env`] with an explicit wait for the first SFTP greeting.
+    ///
+    /// SSH connect and auth are bounded by the `ConnectTimeout` option in
+    /// `args` when the program is ssh. This timeout bounds the separate wait
+    /// for the subsystem to speak, and also covers a direct server process
+    /// that has no ssh stage. A child that exits or closes its output fails
+    /// immediately.
+    pub async fn connect_with_env_timeout(
+        program: PathBuf,
+        args: Vec<String>,
+        env: &[(String, String)],
+        greeting_timeout: Duration,
     ) -> Result<Self, Error> {
         crate::infra::ssh::system::release_dead_master(&program, &args);
         let mut command = Command::new(&program);
@@ -132,27 +162,60 @@ impl SftpFs {
                 }
             }
         });
-        let sftp = match Sftp::new(stdin, stdout, SftpOptions::new()).await {
-            Ok(sftp) => sftp,
-            Err(error) => {
-                let code = ssh_exit_code(&mut child).await;
-                tokio::time::sleep(Duration::from_millis(50)).await;
-                let detail = notes
-                    .lock()
-                    .unwrap_or_else(|error| error.into_inner())
-                    .trim()
-                    .to_string();
-                let mut message = if detail.is_empty() {
-                    format!("sftp handshake failed: {error}")
-                } else {
-                    format!("sftp handshake failed: {error} ({detail})")
-                };
-                if let Some(code) = code {
-                    message = format!("{message} (ssh exit {code})");
-                    return Err(Error::RemoteExit { message, code });
+        let mut handshake = std::pin::pin!(Sftp::new(stdin, stdout, SftpOptions::new()));
+        let sftp = tokio::select! {
+                biased;
+                status = child.wait() => {
+                    let code = status.ok().and_then(|status| status.code());
+                    let detail = notes
+                        .lock()
+                        .unwrap_or_else(|error| error.into_inner())
+                        .trim()
+                        .to_string();
+                    let mut message = match code {
+                        Some(code) => format!("sftp connection dropped (ssh exit {code})"),
+                        None => "sftp connection dropped (process exited)".to_string(),
+                    };
+                    if !detail.is_empty() {
+                        message = format!("{message}: {detail}");
+                    }
+                    return Err(match code {
+                        Some(code) => Error::RemoteExit { message, code },
+                        None => Error::Message(message),
+                    });
                 }
-                return Err(Error::Message(message));
-            }
+                result = &mut handshake => {
+                    match result {
+                        Ok(sftp) => sftp,
+                        Err(error) => {
+                            let code = ssh_exit_code(&mut child).await;
+                            tokio::time::sleep(Duration::from_millis(50)).await;
+                            let detail = notes
+                                .lock()
+                                .unwrap_or_else(|error| error.into_inner())
+                                .trim()
+                                .to_string();
+                            let mut message = if detail.is_empty() {
+                                format!("sftp handshake failed: {error}")
+                            } else {
+                                format!("sftp handshake failed: {error} ({detail})")
+                            };
+                            if let Some(code) = code {
+                                message = format!("{message} (ssh exit {code})");
+                                return Err(Error::RemoteExit { message, code });
+                            }
+                            return Err(Error::Message(message));
+                        }
+                    }
+                }
+                _elapsed = tokio::time::sleep(greeting_timeout) => {
+                    let _ = child.kill().await;
+                    let _ = child.wait().await;
+                    return Err(Error::Message(
+                        "sftp connection dropped: timed out waiting for the server greeting"
+                            .to_string(),
+                    ));
+                }
         };
         Ok(Self {
             sftp: Mutex::new(sftp),
@@ -191,9 +254,21 @@ impl SftpFs {
             let _ = file.close().await;
         }
         let sftp = sftp.into_inner();
-        sftp.close()
-            .await
-            .map_err(|error| Error::Message(format!("sftp close failed: {error}")))?;
+        match tokio::time::timeout(SFTP_IO_TIMEOUT, sftp.close()).await {
+            Ok(Ok(())) => {}
+            Ok(Err(error)) => {
+                let mut child = child.into_inner();
+                let _ = child.kill().await;
+                return Err(Error::Message(format!("sftp close failed: {error}")));
+            }
+            Err(_elapsed) => {
+                let mut child = child.into_inner();
+                let _ = child.kill().await;
+                return Err(Error::Message(
+                    "sftp close timed out waiting for the server".to_string(),
+                ));
+            }
+        }
         let mut child = child.into_inner();
         let _ = child.kill().await;
         Ok(())
@@ -219,165 +294,209 @@ async fn ssh_exit_code(child: &mut Child) -> Option<i32> {
 
 impl RemoteFs for SftpFs {
     async fn list(&self, dir: &str) -> Result<Vec<DirEntry>, Error> {
-        let sftp = self.sftp.lock().await;
-        let mut fs = sftp.fs();
-        let dir_handle = fs
-            .open_dir(Path::new(dir))
-            .await
-            .map_err(|error| sftp_err("list", dir, error))?;
-        let mut read_dir = pin!(dir_handle.read_dir());
-        let mut entries = Vec::new();
-        while let Some(entry) = read_dir.next().await {
-            let entry = entry.map_err(|error| sftp_err("list", dir, error))?;
-            let name = entry.filename().to_string_lossy().into_owned();
-            if name == "." || name == ".." {
-                continue;
+        timed("list", dir, async {
+            let sftp = self.sftp.lock().await;
+            let mut fs = sftp.fs();
+            let dir_handle = fs
+                .open_dir(Path::new(dir))
+                .await
+                .map_err(|error| sftp_err("list", dir, error))?;
+            let mut read_dir = pin!(dir_handle.read_dir());
+            let mut entries = Vec::new();
+            while let Some(entry) = read_dir.next().await {
+                let entry = entry.map_err(|error| sftp_err("list", dir, error))?;
+                let name = entry.filename().to_string_lossy().into_owned();
+                if name == "." || name == ".." {
+                    continue;
+                }
+                entries.push(from_meta(name, entry.metadata(), None));
             }
-            entries.push(from_meta(name, entry.metadata(), None));
-        }
-        Ok(entries)
+            Ok(entries)
+        })
+        .await
     }
 
     async fn stat(&self, path: &str) -> Result<DirEntry, Error> {
-        let sftp = self.sftp.lock().await;
-        let mut fs = sftp.fs();
-        let meta = fs
-            .symlink_metadata(Path::new(path))
-            .await
-            .map_err(|error| sftp_err("stat", path, error))?;
-        let target = if meta.file_type().is_some_and(|ft| ft.is_symlink()) {
-            fs.read_link(Path::new(path))
+        timed("stat", path, async {
+            let sftp = self.sftp.lock().await;
+            let mut fs = sftp.fs();
+            let meta = fs
+                .symlink_metadata(Path::new(path))
                 .await
-                .ok()
-                .map(|p| p.to_string_lossy().into_owned())
-        } else {
-            None
-        };
-        Ok(from_meta(file_name(path).to_string(), meta, target))
+                .map_err(|error| sftp_err("stat", path, error))?;
+            let target = if meta.file_type().is_some_and(|ft| ft.is_symlink()) {
+                fs.read_link(Path::new(path))
+                    .await
+                    .ok()
+                    .map(|p| p.to_string_lossy().into_owned())
+            } else {
+                None
+            };
+            Ok(from_meta(file_name(path).to_string(), meta, target))
+        })
+        .await
     }
 
     async fn mkdir(&self, path: &str) -> Result<(), Error> {
-        let sftp = self.sftp.lock().await;
-        sftp.fs()
-            .create_dir(Path::new(path))
-            .await
-            .map_err(|error| sftp_err("mkdir", path, error))
+        timed("mkdir", path, async {
+            let sftp = self.sftp.lock().await;
+            sftp.fs()
+                .create_dir(Path::new(path))
+                .await
+                .map_err(|error| sftp_err("mkdir", path, error))
+        })
+        .await
     }
 
     async fn rename(&self, from: &str, to: &str) -> Result<(), Error> {
-        let sftp = self.sftp.lock().await;
-        sftp.fs()
-            .rename(Path::new(from), Path::new(to))
-            .await
-            .map_err(|error| sftp_err("rename", from, error))
+        timed("rename", from, async {
+            let sftp = self.sftp.lock().await;
+            sftp.fs()
+                .rename(Path::new(from), Path::new(to))
+                .await
+                .map_err(|error| sftp_err("rename", from, error))
+        })
+        .await
     }
 
     async fn remove_file(&self, path: &str) -> Result<(), Error> {
-        let sftp = self.sftp.lock().await;
-        sftp.fs()
-            .remove_file(Path::new(path))
-            .await
-            .map_err(|error| sftp_err("remove", path, error))
+        timed("remove", path, async {
+            let sftp = self.sftp.lock().await;
+            sftp.fs()
+                .remove_file(Path::new(path))
+                .await
+                .map_err(|error| sftp_err("remove", path, error))
+        })
+        .await
     }
 
     async fn remove_dir(&self, path: &str) -> Result<(), Error> {
-        let sftp = self.sftp.lock().await;
-        sftp.fs()
-            .remove_dir(Path::new(path))
-            .await
-            .map_err(|error| sftp_err("rmdir", path, error))
+        timed("rmdir", path, async {
+            let sftp = self.sftp.lock().await;
+            sftp.fs()
+                .remove_dir(Path::new(path))
+                .await
+                .map_err(|error| sftp_err("rmdir", path, error))
+        })
+        .await
     }
 
     async fn realpath(&self, path: &str) -> Result<String, Error> {
-        let sftp = self.sftp.lock().await;
-        let resolved = sftp
-            .fs()
-            .canonicalize(Path::new(path))
-            .await
-            .map_err(|error| sftp_err("realpath", path, error))?;
-        Ok(resolved.to_string_lossy().into_owned())
+        timed("realpath", path, async {
+            let sftp = self.sftp.lock().await;
+            let resolved = sftp
+                .fs()
+                .canonicalize(Path::new(path))
+                .await
+                .map_err(|error| sftp_err("realpath", path, error))?;
+            Ok(resolved.to_string_lossy().into_owned())
+        })
+        .await
     }
 
     async fn read_at(&self, path: &str, offset: u64, len: usize) -> Result<Vec<u8>, Error> {
-        let missing = !self.reads.lock().await.contains_key(path);
-        if missing {
-            let sftp = self.sftp.lock().await;
-            let file = sftp
-                .open(Path::new(path))
+        timed("read", path, async {
+            let missing = !self.reads.lock().await.contains_key(path);
+            if missing {
+                let sftp = self.sftp.lock().await;
+                let meta = sftp
+                    .fs()
+                    .symlink_metadata(Path::new(path))
+                    .await
+                    .map_err(|error| sftp_err("stat", path, error))?;
+                let entry = from_meta(String::new(), meta, None);
+                if entry.kind == EntryKind::Symlink || !entry.is_file() {
+                    return Err(Error::Message(format!(
+                        "refusing to read non-regular file {path}"
+                    )));
+                }
+                let file = sftp
+                    .open(Path::new(path))
+                    .await
+                    .map_err(|error| sftp_err("open", path, error))?;
+                drop(sftp);
+                self.reads.lock().await.insert(path.to_string(), file);
+            }
+            let mut reads = self.reads.lock().await;
+            let file = reads
+                .get_mut(path)
+                .ok_or_else(|| Error::Message(format!("sftp read {path}: handle missing")))?;
+            // Seek every chunk. The client's sequential read cursor advances by the
+            // requested length, which is larger than a short read.
+            file.seek(std::io::SeekFrom::Start(offset))
                 .await
-                .map_err(|error| sftp_err("open", path, error))?;
-            drop(sftp);
-            self.reads.lock().await.insert(path.to_string(), file);
-        }
-        let mut reads = self.reads.lock().await;
-        let file = reads
-            .get_mut(path)
-            .ok_or_else(|| Error::Message(format!("sftp read {path}: handle missing")))?;
-        // Seek every chunk. The client's sequential read cursor advances by the
-        // requested length, which is larger than a short read.
-        file.seek(std::io::SeekFrom::Start(offset))
-            .await
-            .map_err(|source| Error::Message(format!("sftp seek {path}: {source}")))?;
-        let n = u32::try_from(len).unwrap_or(u32::MAX);
-        let buf = BytesMut::with_capacity(len.min(n as usize));
-        match file
-            .read(n, buf)
-            .await
-            .map_err(|error| sftp_err("read", path, error))?
-        {
-            Some(bytes) => Ok(bytes.to_vec()),
-            None => Ok(Vec::new()),
-        }
+                .map_err(|source| Error::Message(format!("sftp seek {path}: {source}")))?;
+            let n = u32::try_from(len).unwrap_or(u32::MAX);
+            let buf = BytesMut::with_capacity(len.min(n as usize));
+            match file
+                .read(n, buf)
+                .await
+                .map_err(|error| sftp_err("read", path, error))?
+            {
+                Some(bytes) => Ok(bytes.to_vec()),
+                None => Ok(Vec::new()),
+            }
+        })
+        .await
     }
 
     async fn create(&self, path: &str) -> Result<(), Error> {
-        let sftp = self.sftp.lock().await;
-        let file = sftp
-            .create(Path::new(path))
-            .await
-            .map_err(|error| sftp_err("create", path, error))?;
-        drop(file);
-        Ok(())
+        timed("create", path, async {
+            let sftp = self.sftp.lock().await;
+            let file = sftp
+                .create(Path::new(path))
+                .await
+                .map_err(|error| sftp_err("create", path, error))?;
+            drop(file);
+            Ok(())
+        })
+        .await
     }
 
     async fn write_at(&self, path: &str, offset: u64, data: &[u8]) -> Result<(), Error> {
-        let missing = !self.writes.lock().await.contains_key(path);
-        if missing {
-            let sftp = self.sftp.lock().await;
-            let file = sftp
-                .options()
-                .write(true)
-                .open(Path::new(path))
+        timed("write", path, async {
+            let missing = !self.writes.lock().await.contains_key(path);
+            if missing {
+                let sftp = self.sftp.lock().await;
+                let file = sftp
+                    .options()
+                    .write(true)
+                    .open(Path::new(path))
+                    .await
+                    .map_err(|error| sftp_err("open", path, error))?;
+                drop(sftp);
+                self.writes.lock().await.insert(path.to_string(), file);
+            }
+            let mut writes = self.writes.lock().await;
+            let file = writes
+                .get_mut(path)
+                .ok_or_else(|| Error::Message(format!("sftp write {path}: handle missing")))?;
+            file.seek(std::io::SeekFrom::Start(offset))
                 .await
-                .map_err(|error| sftp_err("open", path, error))?;
-            drop(sftp);
-            self.writes.lock().await.insert(path.to_string(), file);
-        }
-        let mut writes = self.writes.lock().await;
-        let file = writes
-            .get_mut(path)
-            .ok_or_else(|| Error::Message(format!("sftp write {path}: handle missing")))?;
-        file.seek(std::io::SeekFrom::Start(offset))
-            .await
-            .map_err(|source| Error::Message(format!("sftp seek {path}: {source}")))?;
-        file.write_all(data)
-            .await
-            .map_err(|error| sftp_err("write", path, error))?;
-        Ok(())
+                .map_err(|source| Error::Message(format!("sftp seek {path}: {source}")))?;
+            file.write_all(data)
+                .await
+                .map_err(|error| sftp_err("write", path, error))?;
+            Ok(())
+        })
+        .await
     }
 
     async fn release(&self, path: &str) -> Result<(), Error> {
-        let write = self.writes.lock().await.remove(path);
-        if let Some(file) = write {
-            file.close()
-                .await
-                .map_err(|error| sftp_err("close", path, error))?;
-        }
-        let read = self.reads.lock().await.remove(path);
-        if let Some(file) = read {
-            let _ = file.close().await;
-        }
-        Ok(())
+        timed("close", path, async {
+            let write = self.writes.lock().await.remove(path);
+            if let Some(file) = write {
+                file.close()
+                    .await
+                    .map_err(|error| sftp_err("close", path, error))?;
+            }
+            let read = self.reads.lock().await.remove(path);
+            if let Some(file) = read {
+                let _ = file.close().await;
+            }
+            Ok(())
+        })
+        .await
     }
 
     async fn set_meta(
@@ -386,28 +505,56 @@ impl RemoteFs for SftpFs {
         mode: Option<u32>,
         mtime: Option<SystemTime>,
     ) -> Result<(), Error> {
-        let sftp = self.sftp.lock().await;
-        let mut fs = sftp.fs();
-        if let Some(mode) = mode {
-            let perms = Permissions::from(mode as u16);
-            fs.set_permissions(Path::new(path), perms)
-                .await
-                .map_err(|error| sftp_err("chmod", path, error))?;
-        }
-        if let Some(mtime) = mtime {
-            let stamp = UnixTimeStamp::new(mtime).unwrap_or_else(|_| UnixTimeStamp::unix_epoch());
-            let mut builder = MetaDataBuilder::new();
-            builder.time(stamp, stamp);
-            fs.set_metadata(Path::new(path), builder.create())
-                .await
-                .map_err(|error| sftp_err("utime", path, error))?;
-        }
-        Ok(())
+        timed("meta", path, async {
+            let sftp = self.sftp.lock().await;
+            let mut fs = sftp.fs();
+            if let Some(mode) = mode {
+                let perms = Permissions::from(mode as u16);
+                fs.set_permissions(Path::new(path), perms)
+                    .await
+                    .map_err(|error| sftp_err("chmod", path, error))?;
+            }
+            if let Some(mtime) = mtime {
+                let stamp =
+                    UnixTimeStamp::new(mtime).unwrap_or_else(|_| UnixTimeStamp::unix_epoch());
+                let mut builder = MetaDataBuilder::new();
+                builder.time(stamp, stamp);
+                fs.set_metadata(Path::new(path), builder.create())
+                    .await
+                    .map_err(|error| sftp_err("utime", path, error))?;
+            }
+            Ok(())
+        })
+        .await
+    }
+}
+
+async fn timed<T>(
+    op: &str,
+    path: &str,
+    fut: impl std::future::Future<Output = Result<T, Error>>,
+) -> Result<T, Error> {
+    match tokio::time::timeout(SFTP_IO_TIMEOUT, fut).await {
+        Ok(result) => result,
+        Err(_elapsed) => Err(Error::Message(format!(
+            "sftp {op} {path}: timed out after {}s",
+            SFTP_IO_TIMEOUT.as_secs()
+        ))),
     }
 }
 
 fn sftp_err(op: &str, path: &str, error: openssh_sftp_client::Error) -> Error {
-    Error::Message(format!("sftp {op} {path}: {error}"))
+    let detail = error.to_string();
+    let lower = detail.to_ascii_lowercase();
+    if lower.contains("background task")
+        || lower.contains("broken pipe")
+        || lower.contains("connection reset")
+        || lower.contains("unexpected eof")
+    {
+        Error::Message(format!("sftp {op} {path}: connection dropped: {detail}"))
+    } else {
+        Error::Message(format!("sftp {op} {path}: {detail}"))
+    }
 }
 
 fn from_meta(name: String, meta: MetaData, target: Option<String>) -> DirEntry {

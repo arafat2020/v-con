@@ -22,6 +22,8 @@ openssh-sftp-client = "0.15"
 portable-pty = "0.9"
 ratatui = "0.30.2"
 regex = "1.13.1"
+# Floor for RUSTSEC-2026-0486. Also pulled in transitively.
+rustix = "1.1.6"
 serde = { version = "1.0.229", features = ["derive"] }
 serde_json = "1.0.154"
 shellexpand = "3.1.2"

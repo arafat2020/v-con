@@ -17,7 +17,8 @@ mod widgets;
 use crate::config::Config;
 use crate::error::Error;
 use crate::infra::remote_fs::{
-    LocalFs, RemoteFs, SftpFs, normalize, parent_of, sftp_arguments, sftp_arguments_auth,
+    LocalFs, RemoteFs, SFTP_CONNECT_TIMEOUT_SECS, SftpFs, normalize, parent_of, sftp_arguments,
+    sftp_arguments_auth,
 };
 use crate::infra::ssh::system::{self, SystemSsh};
 use crate::infra::state_store;
@@ -25,7 +26,8 @@ use crate::paths::Paths;
 use crate::services::connect::{self};
 use crate::services::exec::{self as job, ExecLaunch};
 use crate::services::files::{
-    TransferDirection, TransferEvent, TransferJob, TransferState, plan_copies, run_queue,
+    ConflictAction, TransferDirection, TransferEvent, TransferJob, TransferState, plan_copies,
+    run_queue, unique_name,
 };
 use crate::services::health::{self as health_svc, HealthControl, HealthEvent};
 use crate::services::inventory::InventoryBundle;
@@ -80,7 +82,7 @@ async fn event_loop(
     let mut render = tokio::time::interval(frame);
     let mut job: Option<LiveExec> = None;
     let mut health = spawn_health(app);
-    let mut live_files = LiveFiles::new();
+    let (mut live_files, mut connect_rx) = LiveFiles::new();
     let mut live_sessions = LiveSessions::new(app.session_scrollback);
     let mut live_tunnels = LiveTunnels::new(app.ssh_program().cloned());
     tick.set_missed_tick_behavior(MissedTickBehavior::Skip);
@@ -178,6 +180,11 @@ async fn event_loop(
                             let _ = live.task.await;
                         }
                     }
+                }
+            }
+            connect_done = connect_rx.recv() => {
+                if let Some(done) = connect_done {
+                    apply_files_connect(app, &mut live_files, done);
                 }
             }
             transfer_event = recv_transfer(&mut live_files) => {
@@ -301,34 +308,86 @@ impl LiveTunnels {
 }
 
 const VIEW_CAP: usize = 1024 * 1024;
-const SFTP_CONNECT_TIMEOUT: u64 = 30;
+
+struct FilesConnectDone {
+    generation: u64,
+    host: String,
+    outcome: Result<(SftpFs, Option<String>), crate::error::Error>,
+}
 
 struct LiveFiles {
     remote: Option<Arc<SftpFs>>,
     cancel: CancellationToken,
     events: mpsc::Receiver<TransferEvent>,
     events_tx: mpsc::Sender<TransferEvent>,
+    connect_tx: mpsc::UnboundedSender<FilesConnectDone>,
+    connect_task: Option<tokio::task::JoinHandle<()>>,
+    connect_generation: u64,
 }
 
 impl LiveFiles {
-    fn new() -> Self {
+    fn new() -> (Self, mpsc::UnboundedReceiver<FilesConnectDone>) {
         let (events_tx, events) = mpsc::channel(256);
-        Self {
-            remote: None,
-            cancel: CancellationToken::new(),
-            events,
-            events_tx,
-        }
+        let (connect_tx, connect_rx) = mpsc::unbounded_channel();
+        (
+            Self {
+                remote: None,
+                cancel: CancellationToken::new(),
+                events,
+                events_tx,
+                connect_tx,
+                connect_task: None,
+                connect_generation: 0,
+            },
+            connect_rx,
+        )
     }
 
     async fn shutdown(&mut self) {
         self.cancel.cancel();
+        self.connect_generation = self.connect_generation.saturating_add(1);
+        if let Some(task) = self.connect_task.take() {
+            task.abort();
+        }
         if let Some(remote) = self.remote.take()
             && let Ok(sftp) = Arc::try_unwrap(remote)
         {
             let _ = sftp.close().await;
         }
     }
+}
+
+/// Start an SFTP handshake on a background task and report it on `tx`.
+///
+/// The UI loop selects on that channel, so key and redraw events keep running
+/// while ssh connects and the server sends its greeting.
+fn spawn_sftp_connect(
+    tx: mpsc::UnboundedSender<FilesConnectDone>,
+    generation: u64,
+    host: String,
+    program: std::path::PathBuf,
+    args: Vec<String>,
+    env: Vec<(String, String)>,
+    previous: Option<Arc<SftpFs>>,
+) -> tokio::task::JoinHandle<()> {
+    tokio::spawn(async move {
+        if let Some(previous) = previous
+            && let Ok(sftp) = Arc::try_unwrap(previous)
+        {
+            let _ = sftp.close().await;
+        }
+        let outcome = async {
+            let session = SftpFs::connect_with_env(program, args, &env).await?;
+            let home = session.home_dir().await.ok();
+            Ok((session, home))
+        }
+        .await;
+        let _ = tx.send(FilesConnectDone {
+            generation,
+            host,
+            outcome,
+        });
+    })
 }
 
 async fn recv_transfer(live: &mut LiveFiles) -> Option<TransferEvent> {
@@ -676,9 +735,13 @@ async fn handle_files_command(
             refresh_files_listings(app, live, local, remote).await?;
         }
         FilesCommand::Connect(host) => {
-            connect_files_host(app, live, &host).await?;
+            start_files_connect(app, live, &host)?;
         }
         FilesCommand::Disconnect => {
+            live.connect_generation = live.connect_generation.saturating_add(1);
+            if let Some(task) = live.connect_task.take() {
+                task.abort();
+            }
             disconnect_files(live).await;
             app.files.host = None;
             app.dirty = true;
@@ -688,8 +751,9 @@ async fn handle_files_command(
             sources,
             dest_dir,
             host,
+            conflict,
         } => {
-            start_files_copy(app, live, direction, sources, dest_dir, host).await?;
+            start_files_copy(app, live, direction, sources, dest_dir, host, conflict).await?;
         }
         FilesCommand::CancelTransfers => {
             live.cancel.cancel();
@@ -759,7 +823,7 @@ async fn refresh_files_listings(
     Ok(())
 }
 
-async fn connect_files_host(
+fn start_files_connect(
     app: &mut App,
     live: &mut LiveFiles,
     host_name: &str,
@@ -779,7 +843,11 @@ async fn connect_files_host(
             "unknown host `{host_name}`"
         )));
     };
-    disconnect_files(live).await;
+    live.connect_generation = live.connect_generation.saturating_add(1);
+    if let Some(task) = live.connect_task.take() {
+        task.abort();
+    }
+    let generation = live.connect_generation;
     let control = app
         .multiplexing_enabled()
         .then(|| app.control_dir_path().display().to_string());
@@ -793,7 +861,7 @@ async fn connect_files_host(
         sftp_arguments_auth(
             &host,
             app.effective_hosts(),
-            Some(SFTP_CONNECT_TIMEOUT),
+            Some(SFTP_CONNECT_TIMEOUT_SECS),
             app.multiplexing_enabled(),
             control.as_deref(),
             true,
@@ -802,34 +870,52 @@ async fn connect_files_host(
         sftp_arguments(
             &host,
             app.effective_hosts(),
-            Some(SFTP_CONNECT_TIMEOUT),
+            Some(SFTP_CONNECT_TIMEOUT_SECS),
             app.multiplexing_enabled(),
             control.as_deref(),
         )
     };
-    match SftpFs::connect_with_env(program, args, &auth.env).await {
-        Ok(session) => {
+    let host_label = host_name.to_string();
+    let env = auth.env.clone();
+    let previous = live.remote.take();
+    live.connect_task = Some(spawn_sftp_connect(
+        live.connect_tx.clone(),
+        generation,
+        host_label.clone(),
+        program,
+        args,
+        env,
+        previous,
+    ));
+    app.toast(format!("connecting to {host_label}"));
+    app.dirty = true;
+    Ok(())
+}
+
+fn apply_files_connect(app: &mut App, live: &mut LiveFiles, done: FilesConnectDone) {
+    live.connect_task = None;
+    if done.generation != live.connect_generation {
+        return;
+    }
+    match done.outcome {
+        Ok((session, home)) => {
             live.remote = Some(Arc::new(session));
-            if let Some(sftp) = live.remote.as_ref() {
-                match sftp.home_dir().await {
-                    Ok(home) => {
-                        app.files.remote.path = home;
-                        app.toast(format!("connected to {host_name}"));
-                    }
-                    Err(error) => {
-                        app.toast(format!(
-                            "connected to {host_name}, but home is unknown ({error}) — press g and open a writable directory before copying"
-                        ));
-                    }
-                }
+            if let Some(home) = home {
+                app.files.remote.path = home;
+                app.toast(format!("connected to {}", done.host));
+            } else {
+                app.toast(format!(
+                    "connected to {}, but home is unknown — press g and open a writable directory before copying",
+                    done.host
+                ));
             }
         }
         Err(error) => {
             app.toast(error.to_string());
-            return Err(error);
+            app.show_error(error.to_string());
         }
     }
-    Ok(())
+    app.dirty = true;
 }
 
 async fn disconnect_files(live: &mut LiveFiles) {
@@ -1009,6 +1095,7 @@ async fn start_files_copy(
     sources: Vec<String>,
     dest_dir: String,
     host: String,
+    conflict: ConflictAction,
 ) -> Result<(), crate::error::Error> {
     let remote = live.remote.clone().ok_or_else(|| {
         crate::error::Error::Message("not connected to a remote host".to_string())
@@ -1028,6 +1115,14 @@ async fn start_files_copy(
         };
         made_directory |= planned.made_directory;
         for (src_path, destination, size) in planned.files {
+            let destination = if conflict == ConflictAction::Rename {
+                match direction {
+                    TransferDirection::Upload => unique_name(remote.as_ref(), &destination).await?,
+                    TransferDirection::Download => unique_name(&LocalFs, &destination).await?,
+                }
+            } else {
+                destination
+            };
             let id = app.files.queue.ids.next();
             let job = TransferJob {
                 id,
@@ -1203,4 +1298,61 @@ fn copy_to_clipboard(text: &str) -> Result<(), String> {
     arboard::Clipboard::new()
         .and_then(|mut clipboard| clipboard.set_text(text))
         .map_err(|error| error.to_string())
+}
+
+#[cfg(test)]
+#[path = "../../qa/tui_conflict.rs"]
+mod qa_tui_conflict;
+
+#[cfg(test)]
+mod connect_loop_tests {
+    use super::{FilesConnectDone, spawn_sftp_connect};
+    use std::path::PathBuf;
+    use std::time::{Duration, Instant};
+    use tokio::sync::mpsc;
+    use tokio::time::MissedTickBehavior;
+
+    /// The files event loop selects on the connect channel beside its tick.
+    /// A slow greeting must not stop those ticks.
+    #[tokio::test]
+    async fn ui_loop_ticks_while_sftp_connect_is_pending() {
+        let (tx, mut connect_rx) = mpsc::unbounded_channel::<FilesConnectDone>();
+        let task = spawn_sftp_connect(
+            tx,
+            1,
+            "slow".to_string(),
+            PathBuf::from("/bin/sleep"),
+            vec!["30".to_string()],
+            Vec::new(),
+            None,
+        );
+        let mut ticks = 0u32;
+        let mut tick = tokio::time::interval(Duration::from_millis(40));
+        tick.set_missed_tick_behavior(MissedTickBehavior::Skip);
+        let started = Instant::now();
+        loop {
+            tokio::select! {
+                biased;
+                _ = tick.tick() => {
+                    ticks += 1;
+                    if ticks >= 4 {
+                        break;
+                    }
+                }
+                done = connect_rx.recv() => {
+                    let _ = done;
+                    panic!("connect finished while the ui loop was ticking");
+                }
+            }
+            if started.elapsed() > Duration::from_secs(2) {
+                break;
+            }
+        }
+        task.abort();
+        assert!(
+            ticks >= 4 && started.elapsed() < Duration::from_secs(2),
+            "ui loop recorded {ticks} ticks in {:?}",
+            started.elapsed()
+        );
+    }
 }

@@ -2,7 +2,9 @@
 
 use crate::config::Config;
 use crate::error::Error;
-use crate::infra::remote_fs::{LocalFs, SftpFs, normalize, sftp_arguments_auth};
+use crate::infra::remote_fs::{
+    LocalFs, SFTP_CONNECT_TIMEOUT_SECS, SftpFs, normalize, sftp_arguments_auth,
+};
 use crate::infra::secrets::{self, AskpassMode};
 use crate::paths::Paths;
 use crate::services::files::{copy_file, plan_copies};
@@ -15,8 +17,6 @@ use tokio_util::sync::CancellationToken;
 
 /// Exit when any file fails.
 pub const EXIT_SOME_FAILED: u8 = 3;
-
-const SFTP_CONNECT_TIMEOUT: u64 = 30;
 
 /// One `vcon pull` invocation.
 pub struct PullRequest<'a> {
@@ -66,7 +66,7 @@ pub fn run(
     let args = sftp_arguments_auth(
         host,
         &bundle.hosts,
-        Some(SFTP_CONNECT_TIMEOUT),
+        Some(SFTP_CONNECT_TIMEOUT_SECS),
         config.multiplexing,
         control.as_deref(),
         auth.password_auth,
@@ -82,7 +82,7 @@ pub fn run(
         let cancel = CancellationToken::new();
         let mut any_failed = false;
         for (src_path, destination, _size) in planned.files {
-            if copy_file(
+            if let Err(error) = copy_file(
                 remote.as_ref(),
                 &LocalFs,
                 &src_path,
@@ -91,10 +91,9 @@ pub fn run(
                 |_, _| {},
             )
             .await
-            .is_err()
             {
                 any_failed = true;
-                eprintln!("failed: {src_path} → {destination}");
+                eprintln!("failed: {src_path} → {destination}: {error}");
             }
         }
         if let Ok(sftp) = Arc::try_unwrap(remote) {

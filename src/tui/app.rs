@@ -21,7 +21,7 @@ use crate::paths::Paths;
 use crate::services::audit;
 use crate::services::connect::{self, ConnectPlan};
 use crate::services::exec::{self as job, ExecSettings};
-use crate::services::files::TransferEvent;
+use crate::services::files::{ConflictAction, TransferEvent};
 use crate::services::health::{
     self as health_svc, HealthControl, HealthEvent, HealthSettings, HostHealth,
 };
@@ -37,7 +37,9 @@ use crate::tui::keymap::{self, Keymap};
 use crate::tui::screens::exec as exec_ui;
 use crate::tui::screens::exec::{Confirm, Prompt, PromptEvent, Results, ResultsEvent};
 use crate::tui::screens::files as files_ui;
-use crate::tui::screens::files::{FilesEvent, NameKind, PaneFocus, Viewer};
+use crate::tui::screens::files::{
+    ConflictDialog, FilesEvent, NameKind, PaneFocus, PendingConflicts, Viewer,
+};
 use crate::tui::screens::health as health_ui;
 use crate::tui::screens::health::{HealthEvent as HealthKey, HealthView};
 use crate::tui::screens::host_form::{self, HostFormEvent};
@@ -2095,6 +2097,7 @@ impl App {
             FilesEvent::SubmitName => self.files_submit_name(),
             FilesEvent::CancelOverlay => {
                 self.files.conflict = None;
+                self.files.pending = None;
                 self.files.delete = None;
                 self.files.prompt = None;
                 self.files.picker = None;
@@ -2102,12 +2105,7 @@ impl App {
                 Vec::new()
             }
             FilesEvent::PickHost => self.files_pick_host(),
-            FilesEvent::Conflict(action) => {
-                self.files.conflict = None;
-                self.dirty = true;
-                let _ = action;
-                Vec::new()
-            }
+            FilesEvent::Conflict(action) => self.answer_conflict(action),
             FilesEvent::CancelTransfers => vec![UiCommand::Files(FilesCommand::CancelTransfers)],
             FilesEvent::ToggleQueue => {
                 self.files.queue_collapsed = !self.files.queue_collapsed;
@@ -2159,6 +2157,10 @@ impl App {
     }
 
     fn files_copy(&mut self) -> Vec<UiCommand> {
+        self.queue_files_copy(true, ConflictAction::Overwrite)
+    }
+
+    fn queue_files_copy(&mut self, ask: bool, action: ConflictAction) -> Vec<UiCommand> {
         let Some(host) = self.files.host.clone() else {
             self.toast("Choose a remote host (H)");
             return Vec::new();
@@ -2169,6 +2171,148 @@ impl App {
             return Vec::new();
         }
         let dest_dir = self.files.other().path.clone();
+        if !ask {
+            self.files.pending = None;
+            self.files.conflict = None;
+            return self.files_copy_command(host, sources, dest_dir, action);
+        }
+        let mut ready = Vec::new();
+        let mut conflicts = std::collections::VecDeque::new();
+        for source in sources {
+            if self.name_exists_in_other(crate::infra::remote_fs::file_name(&source)) {
+                conflicts.push_back(source);
+            } else {
+                ready.push(source);
+            }
+        }
+        if conflicts.is_empty() {
+            self.files.pending = None;
+            self.files.conflict = None;
+            return self.files_copy_command(host, ready, dest_dir, action);
+        }
+        let first = conflicts.front().expect("conflicts is non-empty");
+        let path = join(&dest_dir, crate::infra::remote_fs::file_name(first));
+        self.files.pending = Some(PendingConflicts {
+            host: host.clone(),
+            dest_dir: dest_dir.clone(),
+            rest: conflicts,
+        });
+        self.files.conflict = Some(ConflictDialog { id: 0, path });
+        self.dirty = true;
+        if ready.is_empty() {
+            Vec::new()
+        } else {
+            self.files_copy_command(host, ready, dest_dir, ConflictAction::Overwrite)
+        }
+    }
+
+    fn name_exists_in_other(&self, name: &str) -> bool {
+        self.files
+            .other()
+            .entries
+            .iter()
+            .any(|entry| entry.name == name)
+    }
+
+    /// Apply one conflict answer and advance to the next name, once each.
+    fn answer_conflict(&mut self, action: ConflictAction) -> Vec<UiCommand> {
+        if self.files.pending.is_none() {
+            self.files.conflict = None;
+            self.dirty = true;
+            return match action {
+                ConflictAction::Skip | ConflictAction::SkipAll => {
+                    self.toast("skipped");
+                    Vec::new()
+                }
+                ConflictAction::Rename => self.queue_files_copy(false, ConflictAction::Rename),
+                ConflictAction::Overwrite | ConflictAction::OverwriteAll => {
+                    self.queue_files_copy(false, ConflictAction::Overwrite)
+                }
+            };
+        }
+        match action {
+            ConflictAction::OverwriteAll => {
+                let Some(pending) = self.files.pending.take() else {
+                    return Vec::new();
+                };
+                self.files.conflict = None;
+                self.dirty = true;
+                let sources: Vec<String> = pending.rest.into();
+                self.files_copy_command(
+                    pending.host,
+                    sources,
+                    pending.dest_dir,
+                    ConflictAction::Overwrite,
+                )
+            }
+            ConflictAction::SkipAll => {
+                self.files.pending = None;
+                self.files.conflict = None;
+                self.dirty = true;
+                self.toast("skipped");
+                Vec::new()
+            }
+            ConflictAction::Skip => {
+                let Some(pending) = self.files.pending.as_mut() else {
+                    return Vec::new();
+                };
+                pending.rest.pop_front();
+                self.show_next_conflict();
+                Vec::new()
+            }
+            ConflictAction::Overwrite | ConflictAction::Rename => {
+                let Some(pending) = self.files.pending.as_mut() else {
+                    return Vec::new();
+                };
+                let Some(source) = pending.rest.pop_front() else {
+                    self.files.pending = None;
+                    self.files.conflict = None;
+                    return Vec::new();
+                };
+                let host = pending.host.clone();
+                let dest_dir = pending.dest_dir.clone();
+                let copy_action = if action == ConflictAction::Rename {
+                    ConflictAction::Rename
+                } else {
+                    ConflictAction::Overwrite
+                };
+                self.show_next_conflict();
+                self.files_copy_command(host, vec![source], dest_dir, copy_action)
+            }
+        }
+    }
+
+    fn show_next_conflict(&mut self) {
+        let next = self
+            .files
+            .pending
+            .as_ref()
+            .and_then(|pending| pending.rest.front().cloned());
+        if let Some(source) = next {
+            let dest_dir = self
+                .files
+                .pending
+                .as_ref()
+                .map(|pending| pending.dest_dir.clone())
+                .unwrap_or_default();
+            self.files.conflict = Some(ConflictDialog {
+                id: 0,
+                path: join(&dest_dir, crate::infra::remote_fs::file_name(&source)),
+            });
+        } else {
+            self.files.pending = None;
+            self.files.conflict = None;
+        }
+        self.dirty = true;
+    }
+
+    fn files_copy_command(
+        &mut self,
+        host: String,
+        sources: Vec<String>,
+        dest_dir: String,
+        action: ConflictAction,
+    ) -> Vec<UiCommand> {
         let direction = match self.files.focus {
             PaneFocus::Local => crate::services::files::TransferDirection::Upload,
             PaneFocus::Remote => crate::services::files::TransferDirection::Download,
@@ -2178,6 +2322,7 @@ impl App {
             sources,
             dest_dir,
             host,
+            conflict: action,
         })]
     }
 

@@ -40,8 +40,10 @@ pub fn file_name(path: &str) -> &str {
     path.rsplit('/').next().unwrap_or(path)
 }
 
-/// Collapse repeated slashes and resolve `.` segments. Does not resolve `..`
-/// beyond the string (use [`join`] for that).
+/// Collapse repeated slashes and `.` segments.
+///
+/// Absolute paths drop `..` that would climb above `/`. Relative paths keep
+/// a leading `..`, so `../secret` is not rewritten to `secret`.
 pub fn normalize(path: &str) -> String {
     if path.is_empty() {
         return "/".to_string();
@@ -52,7 +54,11 @@ pub fn normalize(path: &str) -> String {
         match part {
             "" | "." => {}
             ".." => {
-                parts.pop();
+                if parts.last().is_some_and(|part| *part != "..") {
+                    parts.pop();
+                } else if !absolute {
+                    parts.push("..");
+                }
             }
             other => parts.push(other),
         }
@@ -81,5 +87,8 @@ mod tests {
         assert_eq!(parent_of("/").as_deref(), None);
         assert_eq!(file_name("/etc/nginx.conf"), "nginx.conf");
         assert_eq!(normalize("/a//b/./c/../d"), "/a/b/d");
+        assert_eq!(normalize("../secret"), "../secret");
+        assert_eq!(normalize("a/../../secret"), "../secret");
+        assert_eq!(normalize("/a/../../secret"), "/secret");
     }
 }
