@@ -550,9 +550,12 @@ async fn ensure_dir<F: RemoteFs>(fs: &F, path: &str) -> Result<(), Error> {
     }
     if let Ok(entry) = fs.stat(&path).await {
         if entry.kind == EntryKind::Symlink {
-            return Err(Error::Message(format!(
-                "refusing to use symlink as a directory: {path}"
-            )));
+            if symlink_leaves_parent(&path, entry.target.as_deref()) {
+                return Err(Error::Message(format!("refusing to follow symlink {path}")));
+            }
+            // The chosen destination root may itself be a symlink, such as
+            // macOS `/tmp` → `/private/tmp`. Use that directory.
+            return Ok(());
         }
         if entry.is_dir() {
             return Ok(());
@@ -737,7 +740,49 @@ impl TransferQueue {
 #[cfg(test)]
 mod tests {
     use super::*;
-    use crate::infra::remote_fs::FakeFs;
+    use crate::infra::remote_fs::{FakeFs, LocalFs};
+
+    #[cfg(unix)]
+    #[tokio::test]
+    async fn symlink_destination_root_is_usable_and_children_cannot_escape() {
+        let dir = tempfile::tempdir().unwrap();
+        let real = dir.path().join("real");
+        std::fs::create_dir(&real).unwrap();
+        let link = dir.path().join("link");
+        std::os::unix::fs::symlink(&real, &link).unwrap();
+        let src = dir.path().join("in.bin");
+        std::fs::write(&src, b"hello").unwrap();
+        let nested = link.join("nested/out.bin");
+        copy_file(
+            &LocalFs,
+            &LocalFs,
+            &src.to_string_lossy(),
+            &nested.to_string_lossy(),
+            &CancellationToken::new(),
+            |_, _| {},
+        )
+        .await
+        .expect("a symlinked destination root should be usable");
+        assert_eq!(
+            std::fs::read(real.join("nested/out.bin")).unwrap(),
+            b"hello"
+        );
+
+        let outside = dir.path().join("outside");
+        std::fs::create_dir(&outside).unwrap();
+        std::os::unix::fs::symlink(&outside, real.join("sub")).unwrap();
+        let err = copy_file(
+            &LocalFs,
+            &LocalFs,
+            &src.to_string_lossy(),
+            &real.join("sub/pwned.txt").to_string_lossy(),
+            &CancellationToken::new(),
+            |_, _| {},
+        )
+        .await
+        .expect_err("a symlink below the destination must not be followed");
+        assert!(!outside.join("pwned.txt").exists(), "{err}");
+    }
 
     #[test]
     fn prepare_listing_sorts_dirs_first() {

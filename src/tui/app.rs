@@ -37,7 +37,9 @@ use crate::tui::keymap::{self, Keymap};
 use crate::tui::screens::exec as exec_ui;
 use crate::tui::screens::exec::{Confirm, Prompt, PromptEvent, Results, ResultsEvent};
 use crate::tui::screens::files as files_ui;
-use crate::tui::screens::files::{ConflictDialog, FilesEvent, NameKind, PaneFocus, Viewer};
+use crate::tui::screens::files::{
+    ConflictDialog, FilesEvent, NameKind, PaneFocus, PendingConflicts, Viewer,
+};
 use crate::tui::screens::health as health_ui;
 use crate::tui::screens::health::{HealthEvent as HealthKey, HealthView};
 use crate::tui::screens::host_form::{self, HostFormEvent};
@@ -2095,6 +2097,7 @@ impl App {
             FilesEvent::SubmitName => self.files_submit_name(),
             FilesEvent::CancelOverlay => {
                 self.files.conflict = None;
+                self.files.pending = None;
                 self.files.delete = None;
                 self.files.prompt = None;
                 self.files.picker = None;
@@ -2102,23 +2105,7 @@ impl App {
                 Vec::new()
             }
             FilesEvent::PickHost => self.files_pick_host(),
-            FilesEvent::Conflict(action) => {
-                let skipped = self.files.conflict.take().map(|dialog| dialog.path);
-                self.dirty = true;
-                match action {
-                    ConflictAction::Overwrite => {
-                        self.queue_files_copy_overwrite_one(skipped.as_deref())
-                    }
-                    ConflictAction::OverwriteAll => {
-                        self.queue_files_copy(false, ConflictAction::Overwrite)
-                    }
-                    ConflictAction::Skip => {
-                        self.queue_files_copy_skipping(skipped.as_deref(), false)
-                    }
-                    ConflictAction::SkipAll => self.queue_files_copy_skipping(None, true),
-                    ConflictAction::Rename => self.queue_files_copy(false, ConflictAction::Rename),
-                }
-            }
+            FilesEvent::Conflict(action) => self.answer_conflict(action),
             FilesEvent::CancelTransfers => vec![UiCommand::Files(FilesCommand::CancelTransfers)],
             FilesEvent::ToggleQueue => {
                 self.files.queue_collapsed = !self.files.queue_collapsed;
@@ -2173,18 +2160,6 @@ impl App {
         self.queue_files_copy(true, ConflictAction::Overwrite)
     }
 
-    /// Name in the other pane that a selected source would replace.
-    fn conflicting_destination(&self, sources: &[String], dest_dir: &str) -> Option<String> {
-        let entries = &self.files.other().entries;
-        for source in sources {
-            let name = crate::infra::remote_fs::file_name(source);
-            if entries.iter().any(|entry| entry.name == name) {
-                return Some(join(dest_dir, name));
-            }
-        }
-        None
-    }
-
     fn queue_files_copy(&mut self, ask: bool, action: ConflictAction) -> Vec<UiCommand> {
         let Some(host) = self.files.host.clone() else {
             self.toast("Choose a remote host (H)");
@@ -2196,96 +2171,139 @@ impl App {
             return Vec::new();
         }
         let dest_dir = self.files.other().path.clone();
-        if ask && let Some(path) = self.conflicting_destination(&sources, &dest_dir) {
-            self.files.conflict = Some(ConflictDialog { id: 0, path });
-            self.dirty = true;
-            return Vec::new();
+        if !ask {
+            self.files.pending = None;
+            self.files.conflict = None;
+            return self.files_copy_command(host, sources, dest_dir, action);
         }
-        self.files_copy_command(host, sources, dest_dir, action)
-    }
-
-    /// Skip conflicting names. `skip_all` drops every name that already exists;
-    /// otherwise only `skipped` (the dialog path) is left out, and the next
-    /// conflict is asked about.
-    fn queue_files_copy_skipping(
-        &mut self,
-        skipped: Option<&str>,
-        skip_all: bool,
-    ) -> Vec<UiCommand> {
-        let Some(host) = self.files.host.clone() else {
-            self.toast("Choose a remote host (H)");
-            return Vec::new();
-        };
-        let dest_dir = self.files.other().path.clone();
-        let existing: Vec<String> = self
-            .files
-            .other()
-            .entries
-            .iter()
-            .map(|entry| entry.name.clone())
-            .collect();
-        let sources: Vec<String> = self
-            .files
-            .selected_paths()
-            .into_iter()
-            .filter(|source| {
-                let name = crate::infra::remote_fs::file_name(source);
-                let dest = join(&dest_dir, name);
-                if skip_all {
-                    !existing.iter().any(|entry| entry == name)
-                } else {
-                    Some(dest.as_str()) != skipped
-                }
-            })
-            .collect();
-        if sources.is_empty() {
-            self.toast("skipped");
-            return Vec::new();
-        }
-        if !skip_all && let Some(path) = self.conflicting_destination(&sources, &dest_dir) {
-            self.files.conflict = Some(ConflictDialog { id: 0, path });
-            self.dirty = true;
-            return Vec::new();
-        }
-        self.files_copy_command(host, sources, dest_dir, ConflictAction::Overwrite)
-    }
-
-    /// Overwrite the file named by the dialog. Other conflicting names stay
-    /// for another prompt. Names that do not conflict are copied with it.
-    fn queue_files_copy_overwrite_one(&mut self, prompted: Option<&str>) -> Vec<UiCommand> {
-        let Some(host) = self.files.host.clone() else {
-            self.toast("Choose a remote host (H)");
-            return Vec::new();
-        };
-        let dest_dir = self.files.other().path.clone();
-        let existing: Vec<String> = self
-            .files
-            .other()
-            .entries
-            .iter()
-            .map(|entry| entry.name.clone())
-            .collect();
-        let selected = self.files.selected_paths();
-        let mut sources = Vec::new();
-        let mut deferred: Option<String> = None;
-        for source in selected {
-            let name = crate::infra::remote_fs::file_name(&source);
-            let dest = join(&dest_dir, name);
-            let conflicts = existing.iter().any(|entry| entry == name);
-            if Some(dest.as_str()) == prompted || !conflicts {
-                sources.push(source);
-            } else if deferred.is_none() {
-                deferred = Some(dest);
+        let mut ready = Vec::new();
+        let mut conflicts = std::collections::VecDeque::new();
+        for source in sources {
+            if self.name_exists_in_other(crate::infra::remote_fs::file_name(&source)) {
+                conflicts.push_back(source);
+            } else {
+                ready.push(source);
             }
         }
-        if let Some(path) = deferred {
-            self.files.conflict = Some(ConflictDialog { id: 0, path });
+        if conflicts.is_empty() {
+            self.files.pending = None;
+            self.files.conflict = None;
+            return self.files_copy_command(host, ready, dest_dir, action);
+        }
+        let first = conflicts.front().expect("conflicts is non-empty");
+        let path = join(&dest_dir, crate::infra::remote_fs::file_name(first));
+        self.files.pending = Some(PendingConflicts {
+            host: host.clone(),
+            dest_dir: dest_dir.clone(),
+            rest: conflicts,
+        });
+        self.files.conflict = Some(ConflictDialog { id: 0, path });
+        self.dirty = true;
+        if ready.is_empty() {
+            Vec::new()
+        } else {
+            self.files_copy_command(host, ready, dest_dir, ConflictAction::Overwrite)
+        }
+    }
+
+    fn name_exists_in_other(&self, name: &str) -> bool {
+        self.files
+            .other()
+            .entries
+            .iter()
+            .any(|entry| entry.name == name)
+    }
+
+    /// Apply one conflict answer and advance to the next name, once each.
+    fn answer_conflict(&mut self, action: ConflictAction) -> Vec<UiCommand> {
+        if self.files.pending.is_none() {
+            self.files.conflict = None;
             self.dirty = true;
+            return match action {
+                ConflictAction::Skip | ConflictAction::SkipAll => {
+                    self.toast("skipped");
+                    Vec::new()
+                }
+                ConflictAction::Rename => self.queue_files_copy(false, ConflictAction::Rename),
+                ConflictAction::Overwrite | ConflictAction::OverwriteAll => {
+                    self.queue_files_copy(false, ConflictAction::Overwrite)
+                }
+            };
         }
-        if sources.is_empty() {
-            return Vec::new();
+        match action {
+            ConflictAction::OverwriteAll => {
+                let Some(pending) = self.files.pending.take() else {
+                    return Vec::new();
+                };
+                self.files.conflict = None;
+                self.dirty = true;
+                let sources: Vec<String> = pending.rest.into();
+                self.files_copy_command(
+                    pending.host,
+                    sources,
+                    pending.dest_dir,
+                    ConflictAction::Overwrite,
+                )
+            }
+            ConflictAction::SkipAll => {
+                self.files.pending = None;
+                self.files.conflict = None;
+                self.dirty = true;
+                self.toast("skipped");
+                Vec::new()
+            }
+            ConflictAction::Skip => {
+                let Some(pending) = self.files.pending.as_mut() else {
+                    return Vec::new();
+                };
+                pending.rest.pop_front();
+                self.show_next_conflict();
+                Vec::new()
+            }
+            ConflictAction::Overwrite | ConflictAction::Rename => {
+                let Some(pending) = self.files.pending.as_mut() else {
+                    return Vec::new();
+                };
+                let Some(source) = pending.rest.pop_front() else {
+                    self.files.pending = None;
+                    self.files.conflict = None;
+                    return Vec::new();
+                };
+                let host = pending.host.clone();
+                let dest_dir = pending.dest_dir.clone();
+                let copy_action = if action == ConflictAction::Rename {
+                    ConflictAction::Rename
+                } else {
+                    ConflictAction::Overwrite
+                };
+                self.show_next_conflict();
+                self.files_copy_command(host, vec![source], dest_dir, copy_action)
+            }
         }
-        self.files_copy_command(host, sources, dest_dir, ConflictAction::Overwrite)
+    }
+
+    fn show_next_conflict(&mut self) {
+        let next = self
+            .files
+            .pending
+            .as_ref()
+            .and_then(|pending| pending.rest.front().cloned());
+        if let Some(source) = next {
+            let dest_dir = self
+                .files
+                .pending
+                .as_ref()
+                .map(|pending| pending.dest_dir.clone())
+                .unwrap_or_default();
+            self.files.conflict = Some(ConflictDialog {
+                id: 0,
+                path: join(&dest_dir, crate::infra::remote_fs::file_name(&source)),
+            });
+        } else {
+            self.files.pending = None;
+            self.files.conflict = None;
+        }
+        self.dirty = true;
     }
 
     fn files_copy_command(

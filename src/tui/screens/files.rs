@@ -15,7 +15,7 @@ use ratatui::text::{Line, Span};
 use ratatui::widgets::{
     Cell, Clear, Gauge, HighlightSpacing, Paragraph, Row, Table, TableState, Wrap,
 };
-use std::collections::BTreeSet;
+use std::collections::{BTreeSet, VecDeque};
 use std::path::PathBuf;
 use std::time::SystemTime;
 
@@ -99,6 +99,19 @@ impl Pane {
             self.cursor = (self.cursor + delta as usize).min(len - 1);
         }
     }
+}
+
+/// Files still waiting for a one-at-a-time conflict choice.
+///
+/// `rest` is in selection order. The front item is the dialog on screen.
+#[derive(Debug, Clone)]
+pub struct PendingConflicts {
+    /// Remote host label.
+    pub host: String,
+    /// Directory the copies land in.
+    pub dest_dir: String,
+    /// Sources not yet decided.
+    pub rest: VecDeque<String>,
 }
 
 /// Pending conflict decision.
@@ -205,6 +218,8 @@ pub struct FilesView {
     pub queue_collapsed: bool,
     /// Conflict dialog.
     pub conflict: Option<ConflictDialog>,
+    /// Remaining per-file conflict decisions for the copy in progress.
+    pub pending: Option<PendingConflicts>,
     /// Delete confirm.
     pub delete: Option<DeleteConfirm>,
     /// Name prompt.
@@ -241,6 +256,7 @@ impl FilesView {
             queue: TransferQueue::default(),
             queue_collapsed: false,
             conflict: None,
+            pending: None,
             delete: None,
             prompt: None,
             picker: None,
