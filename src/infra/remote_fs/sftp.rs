@@ -18,16 +18,16 @@ use tokio::io::{AsyncReadExt, AsyncSeekExt};
 use tokio::process::{Child, Command};
 use tokio::sync::Mutex;
 
-/// How long to wait for ssh to connect and the subsystem to send its greeting.
-///
-/// This matches the 30s `ConnectTimeout` used by `vcon push` / `vcon pull`.
-/// A peer that never speaks is still bounded by this budget. `sleep` is
-/// rejected immediately: it will never send a greeting, and the regression
-/// test requires that error inside a few seconds.
-const SFTP_HANDSHAKE_TIMEOUT: Duration = Duration::from_secs(30);
+/// Seconds passed to ssh as `ConnectTimeout`, and the default wait for the
+/// SFTP greeting after the child has been spawned. One constant so the two
+/// budgets cannot drift apart.
+pub const SFTP_CONNECT_TIMEOUT_SECS: u64 = 30;
+
+/// Default greeting budget. [`SftpFs::connect_with_env`] uses this.
+pub const SFTP_GREETING_TIMEOUT: Duration = Duration::from_secs(SFTP_CONNECT_TIMEOUT_SECS);
 
 /// Bound on one SFTP request (read, write, stat, rename, …).
-const SFTP_IO_TIMEOUT: Duration = Duration::from_secs(30);
+const SFTP_IO_TIMEOUT: Duration = SFTP_GREETING_TIMEOUT;
 
 /// Build ssh argv (without the binary) that starts the SFTP subsystem.
 pub fn sftp_arguments(
@@ -85,9 +85,6 @@ pub struct SftpFs {
     reads: Mutex<HashMap<String, File>>,
     /// Open write handles, keyed by path.
     writes: Mutex<HashMap<String, File>>,
-    /// The child is an in-process server, not `ssh`. Its paths are on this
-    /// machine, so a dead session may unlink a partial file it created.
-    local_server: bool,
 }
 
 impl SftpFs {
@@ -95,23 +92,30 @@ impl SftpFs {
     ///
     /// `env` must not contain the password. The askpass helper reads that
     /// from the OS keychain. Pass an empty slice when no password is saved.
+    ///
+    /// The greeting wait is [`SFTP_GREETING_TIMEOUT`], the same length as the
+    /// ssh `ConnectTimeout` push and pull pass.
     pub async fn connect_with_env(
         program: PathBuf,
         args: Vec<String>,
         env: &[(String, String)],
     ) -> Result<Self, Error> {
-        if program
-            .file_name()
-            .is_some_and(|name| name.eq_ignore_ascii_case("sleep"))
-        {
-            return Err(Error::Message(
-                "sftp handshake failed: sleep does not speak SFTP".to_string(),
-            ));
-        }
-        let local_server = program
-            .file_name()
-            .and_then(|name| name.to_str())
-            .is_some_and(|name| name != "ssh");
+        Self::connect_with_env_timeout(program, args, env, SFTP_GREETING_TIMEOUT).await
+    }
+
+    /// [`connect_with_env`] with an explicit wait for the first SFTP greeting.
+    ///
+    /// SSH connect and auth are bounded by the `ConnectTimeout` option in
+    /// `args` when the program is ssh. This timeout bounds the separate wait
+    /// for the subsystem to speak, and also covers a direct server process
+    /// that has no ssh stage. A child that exits or closes its output fails
+    /// immediately.
+    pub async fn connect_with_env_timeout(
+        program: PathBuf,
+        args: Vec<String>,
+        env: &[(String, String)],
+        greeting_timeout: Duration,
+    ) -> Result<Self, Error> {
         crate::infra::ssh::system::release_dead_master(&program, &args);
         let mut command = Command::new(&program);
         command
@@ -158,46 +162,66 @@ impl SftpFs {
                 }
             }
         });
-        let sftp = match tokio::time::timeout(
-            SFTP_HANDSHAKE_TIMEOUT,
-            Sftp::new(stdin, stdout, SftpOptions::new()),
-        )
-        .await
-        {
-            Ok(Ok(sftp)) => sftp,
-            Err(_elapsed) => {
-                let _ = child.kill().await;
-                let _ = child.wait().await;
-                return Err(Error::Message(
-                    "sftp handshake timed out waiting for the server".to_string(),
-                ));
-            }
-            Ok(Err(error)) => {
-                let code = ssh_exit_code(&mut child).await;
-                tokio::time::sleep(Duration::from_millis(50)).await;
-                let detail = notes
-                    .lock()
-                    .unwrap_or_else(|error| error.into_inner())
-                    .trim()
-                    .to_string();
-                let mut message = if detail.is_empty() {
-                    format!("sftp handshake failed: {error}")
-                } else {
-                    format!("sftp handshake failed: {error} ({detail})")
-                };
-                if let Some(code) = code {
-                    message = format!("{message} (ssh exit {code})");
-                    return Err(Error::RemoteExit { message, code });
+        let mut handshake = std::pin::pin!(Sftp::new(stdin, stdout, SftpOptions::new()));
+        let sftp = tokio::select! {
+                biased;
+                status = child.wait() => {
+                    let code = status.ok().and_then(|status| status.code());
+                    let detail = notes
+                        .lock()
+                        .unwrap_or_else(|error| error.into_inner())
+                        .trim()
+                        .to_string();
+                    let mut message = match code {
+                        Some(code) => format!("sftp connection dropped (ssh exit {code})"),
+                        None => "sftp connection dropped (process exited)".to_string(),
+                    };
+                    if !detail.is_empty() {
+                        message = format!("{message}: {detail}");
+                    }
+                    return Err(match code {
+                        Some(code) => Error::RemoteExit { message, code },
+                        None => Error::Message(message),
+                    });
                 }
-                return Err(Error::Message(message));
-            }
+                result = &mut handshake => {
+                    match result {
+                        Ok(sftp) => sftp,
+                        Err(error) => {
+                            let code = ssh_exit_code(&mut child).await;
+                            tokio::time::sleep(Duration::from_millis(50)).await;
+                            let detail = notes
+                                .lock()
+                                .unwrap_or_else(|error| error.into_inner())
+                                .trim()
+                                .to_string();
+                            let mut message = if detail.is_empty() {
+                                format!("sftp handshake failed: {error}")
+                            } else {
+                                format!("sftp handshake failed: {error} ({detail})")
+                            };
+                            if let Some(code) = code {
+                                message = format!("{message} (ssh exit {code})");
+                                return Err(Error::RemoteExit { message, code });
+                            }
+                            return Err(Error::Message(message));
+                        }
+                    }
+                }
+                _elapsed = tokio::time::sleep(greeting_timeout) => {
+                    let _ = child.kill().await;
+                    let _ = child.wait().await;
+                    return Err(Error::Message(
+                        "sftp connection dropped: timed out waiting for the server greeting"
+                            .to_string(),
+                    ));
+                }
         };
         Ok(Self {
             sftp: Mutex::new(sftp),
             child: Mutex::new(child),
             reads: Mutex::new(HashMap::new()),
             writes: Mutex::new(HashMap::new()),
-            local_server,
         })
     }
 
@@ -222,7 +246,6 @@ impl SftpFs {
             child,
             reads,
             writes,
-            local_server: _,
         } = self;
         for (_, file) in writes.into_inner() {
             let _ = file.close().await;
@@ -337,25 +360,14 @@ impl RemoteFs for SftpFs {
     }
 
     async fn remove_file(&self, path: &str) -> Result<(), Error> {
-        let removed = timed("remove", path, async {
+        timed("remove", path, async {
             let sftp = self.sftp.lock().await;
             sftp.fs()
                 .remove_file(Path::new(path))
                 .await
                 .map_err(|error| sftp_err("remove", path, error))
         })
-        .await;
-        if removed.is_ok() {
-            return Ok(());
-        }
-        // An `ssh` path is remote. Never unlink that name on the local disk.
-        // An in-process sftp-server writes the same path here; once the
-        // session is dead, the partial file can only be removed locally.
-        let lost = removed.as_ref().err().is_some_and(session_lost);
-        if self.local_server && lost && tokio::fs::remove_file(path).await.is_ok() {
-            return Ok(());
-        }
-        removed
+        .await
     }
 
     async fn remove_dir(&self, path: &str) -> Result<(), Error> {
@@ -531,16 +543,18 @@ async fn timed<T>(
     }
 }
 
-fn session_lost(error: &Error) -> bool {
-    let text = error.to_string().to_ascii_lowercase();
-    text.contains("background task")
-        || text.contains("broken pipe")
-        || text.contains("connection reset")
-        || text.contains("timed out")
-}
-
 fn sftp_err(op: &str, path: &str, error: openssh_sftp_client::Error) -> Error {
-    Error::Message(format!("sftp {op} {path}: {error}"))
+    let detail = error.to_string();
+    let lower = detail.to_ascii_lowercase();
+    if lower.contains("background task")
+        || lower.contains("broken pipe")
+        || lower.contains("connection reset")
+        || lower.contains("unexpected eof")
+    {
+        Error::Message(format!("sftp {op} {path}: connection dropped: {detail}"))
+    } else {
+        Error::Message(format!("sftp {op} {path}: {detail}"))
+    }
 }
 
 fn from_meta(name: String, meta: MetaData, target: Option<String>) -> DirEntry {

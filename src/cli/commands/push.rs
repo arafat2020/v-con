@@ -3,7 +3,9 @@
 use crate::config::Config;
 use crate::domain::selector::{evaluate_selector, parse_selector};
 use crate::error::Error;
-use crate::infra::remote_fs::{LocalFs, SftpFs, normalize, sftp_arguments_auth};
+use crate::infra::remote_fs::{
+    LocalFs, SFTP_CONNECT_TIMEOUT_SECS, SftpFs, normalize, sftp_arguments_auth,
+};
 use crate::infra::secrets::{self, AskpassMode};
 use crate::paths::Paths;
 use crate::services::exec::{ConfirmGate, ExecSettings, confirmation_gate, needs_confirmation};
@@ -17,8 +19,6 @@ use tokio_util::sync::CancellationToken;
 
 /// Exit when any host or file fails.
 pub const EXIT_SOME_FAILED: u8 = 3;
-
-const SFTP_CONNECT_TIMEOUT: u64 = 30;
 
 /// One `vcon push` invocation.
 pub struct PushRequest<'a> {
@@ -113,7 +113,7 @@ pub fn run(
         let args = sftp_arguments_auth(
             host,
             &bundle.hosts,
-            Some(SFTP_CONNECT_TIMEOUT),
+            Some(SFTP_CONNECT_TIMEOUT_SECS),
             config.multiplexing,
             control.as_deref(),
             auth.password_auth,

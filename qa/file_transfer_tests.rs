@@ -880,6 +880,16 @@ async fn qa_fifo_copy_must_not_block() {
     let fifo = dir.path().join("pipe");
     let c_path = std::ffi::CString::new(path_str(&fifo)).unwrap();
     assert_eq!(unsafe { libc::mkfifo(c_path.as_ptr(), 0o644) }, 0);
+    // Held only so the write-open in Drop can finish. The copy itself must
+    // fail from lstat, before any read.
+    let _reader = {
+        use std::os::unix::fs::OpenOptionsExt;
+        std::fs::OpenOptions::new()
+            .read(true)
+            .custom_flags(libc::O_NONBLOCK)
+            .open(&fifo)
+            .expect("nonblocking fifo reader")
+    };
     let unblock = fifo.clone();
     struct OpenWrite(PathBuf);
     impl Drop for OpenWrite {
@@ -1613,7 +1623,12 @@ async fn qa_sftp_handshake_rejects_garbage_and_does_not_hang() {
 async fn qa_sftp_handshake_times_out_on_a_stalled_peer() {
     let result = tokio::time::timeout(
         Duration::from_secs(3),
-        SftpFs::connect_with_env(PathBuf::from("/bin/sleep"), vec!["30".into()], &[]),
+        SftpFs::connect_with_env_timeout(
+            PathBuf::from("/bin/sleep"),
+            vec!["30".into()],
+            &[],
+            Duration::from_secs(1),
+        ),
     )
     .await;
     assert!(
@@ -1676,8 +1691,12 @@ while True:
     .await
     .expect("proxy handshake");
     let src = dir.path().join("big.bin");
-    std::fs::write(&src, pattern(2 * 1024 * 1024)).unwrap();
+    let payload = pattern(2 * 1024 * 1024);
+    std::fs::write(&src, &payload).unwrap();
+    let sentinel = dir.path().join("keep-local.txt");
+    std::fs::write(&sentinel, b"UNTOUCHED").unwrap();
     let dst = dir.path().join("remote.bin");
+    let part = PathBuf::from(format!("{}.part", path_str(&dst)));
     let result = copy_file(
         &LocalFs,
         &session,
@@ -1687,27 +1706,43 @@ while True:
         |_, _| {},
     )
     .await;
-    match &result {
-        Ok(()) => {
-            let n = std::fs::metadata(&dst).map(|meta| meta.len()).unwrap_or(0);
-            assert_eq!(
-                n,
-                2 * 1024 * 1024,
-                "connection drop committed a {n}-byte file as success"
-            );
-        }
-        Err(error) => {
-            assert!(
-                !dst.exists(),
-                "partial destination left after drop ({error})"
-            );
-            assert!(
-                !Path::new(&format!("{}.part", path_str(&dst))).exists(),
-                "partial .part left after drop ({error})"
-            );
-        }
-    }
+    let error = result.expect_err("a dropped connection must fail the copy");
+    let message = error.to_string().to_ascii_lowercase();
+    assert!(
+        message.contains("connection"),
+        "error should mention the dropped connection: {error}"
+    );
+    assert!(!dst.exists(), "partial destination was committed ({error})");
+    assert_eq!(
+        std::fs::read(&sentinel).unwrap(),
+        b"UNTOUCHED",
+        "cleanup touched an unrelated local file"
+    );
     session.close().await.ok();
+    // The dead server can leave its `.part`. The next transfer must replace it.
+    if !part.exists() {
+        std::fs::write(&part, b"STALE").unwrap();
+    }
+    let retry = SftpFs::connect_with_env(server, Vec::new(), &[])
+        .await
+        .expect("retry handshake");
+    copy_file(
+        &LocalFs,
+        &retry,
+        &path_str(&src),
+        &path_str(&dst),
+        &CancellationToken::new(),
+        |_, _| {},
+    )
+    .await
+    .expect("retry after a stale .part");
+    assert_eq!(std::fs::read(&dst).unwrap(), payload);
+    assert!(
+        !part.exists(),
+        "successful retry left the stale .part in place"
+    );
+    assert_eq!(std::fs::read(&sentinel).unwrap(), b"UNTOUCHED");
+    retry.close().await.ok();
 }
 
 #[tokio::test]

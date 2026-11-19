@@ -428,34 +428,6 @@ fn symlink_leaves_parent(link: &str, target: Option<&str>) -> bool {
     resolved != parent && !resolved.starts_with(&format!("{parent}/"))
 }
 
-/// Opening a FIFO for write blocks until a reader exists. Hold a nonblocking
-/// reader briefly so a caller that opens the write end (to unblock a stuck
-/// copy) can finish instead of waiting forever.
-fn disarm_local_fifo(path: &str) {
-    #[cfg(unix)]
-    {
-        use std::os::unix::fs::{FileTypeExt, OpenOptionsExt};
-        let Ok(meta) = std::fs::symlink_metadata(path) else {
-            return;
-        };
-        if !meta.file_type().is_fifo() {
-            return;
-        }
-        let path = path.to_string();
-        std::thread::spawn(move || {
-            let mut options = std::fs::OpenOptions::new();
-            options.read(true).custom_flags(libc::O_NONBLOCK);
-            let file = options.open(&path);
-            std::thread::sleep(std::time::Duration::from_secs(2));
-            drop(file);
-        });
-    }
-    #[cfg(not(unix))]
-    {
-        let _ = path;
-    }
-}
-
 /// Copy one file from `src` to `dst`, writing to a `.part` then renaming.
 pub async fn copy_file<S: RemoteFs, D: RemoteFs>(
     src: &S,
@@ -486,7 +458,6 @@ pub async fn copy_file<S: RemoteFs, D: RemoteFs>(
     )
     .await;
     if result.is_err() {
-        disarm_local_fifo(source);
         let _ = src.release(source).await;
         let _ = dst.release(&part).await;
         // The destination backend removes its own partial file. Do not unlink
@@ -526,6 +497,7 @@ async fn copy_file_body<S: RemoteFs, D: RemoteFs>(
         ensure_dir(dst, &parent).await?;
     }
     // A leftover handle would keep writing the pre-truncate inode.
+    // `create` truncates, so a stale `.part` from a dropped session is replaced.
     let _ = dst.release(part).await;
     dst.create(part).await?;
     let mut offset = 0_u64;
