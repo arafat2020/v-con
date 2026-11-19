@@ -12,6 +12,10 @@ mod paths;
 mod services;
 mod tui;
 
+#[cfg(test)]
+#[path = "../qa/file_transfer_tests.rs"]
+mod qa_file_transfer_tests;
+
 use std::process::ExitCode;
 
 fn main() -> ExitCode {
