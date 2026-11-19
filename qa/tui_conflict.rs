@@ -8,6 +8,7 @@ use crate::config::Config;
 use crate::domain::host::Inventory;
 use crate::infra::remote_fs::{DirEntry, EntryKind};
 use crate::paths::Paths;
+use crate::services::files::ConflictAction;
 use crate::services::inventory::InventoryBundle;
 use crossterm::event::{KeyCode, KeyModifiers};
 use toml_edit::DocumentMut;
@@ -208,5 +209,100 @@ fn qa_retest_three_conflicts_do_not_drop_the_third_name() {
             .is_some_and(|dialog| dialog.path.ends_with("c.txt")),
         "after skipping a and b, c should be prompted, got {:?} commands={commands:?}",
         app.files.conflict
+    );
+}
+
+fn prompt_ends_with(app: &App, name: &str) -> bool {
+    app.files
+        .conflict
+        .as_ref()
+        .is_some_and(|dialog| dialog.path.ends_with(name))
+}
+
+fn queued(commands: &[UiCommand]) -> Vec<(Vec<String>, ConflictAction)> {
+    commands
+        .iter()
+        .filter_map(|command| match command {
+            UiCommand::Files(FilesCommand::Copy {
+                sources, conflict, ..
+            }) => Some((sources.clone(), *conflict)),
+            _ => None,
+        })
+        .collect()
+}
+
+#[test]
+fn qa_retest3_three_overwrites_then_escape_stops() {
+    let mut app = marked(&["a.txt", "b.txt", "c.txt"]);
+    assert!(
+        app.on_key(KeyCode::Char('c'), KeyModifiers::NONE)
+            .is_empty()
+    );
+    assert!(prompt_ends_with(&app, "a.txt"));
+    assert_eq!(
+        queued(&app.on_key(KeyCode::Char('o'), KeyModifiers::NONE)),
+        vec![(vec!["/tmp/local/a.txt".into()], ConflictAction::Overwrite)]
+    );
+    assert!(prompt_ends_with(&app, "b.txt"));
+    assert_eq!(
+        queued(&app.on_key(KeyCode::Char('o'), KeyModifiers::NONE)),
+        vec![(vec!["/tmp/local/b.txt".into()], ConflictAction::Overwrite)]
+    );
+    assert!(prompt_ends_with(&app, "c.txt"));
+    let cancel = app.on_key(KeyCode::Esc, KeyModifiers::NONE);
+    assert!(
+        cancel.is_empty() && app.files.conflict.is_none() && app.files.pending.is_none(),
+        "Esc must copy nothing further, commands={cancel:?} pending={:?}",
+        app.files.pending
+    );
+}
+
+#[test]
+fn qa_retest3_four_files_overwrite_skip_then_overwrite_all() {
+    let mut app = marked(&["a.txt", "b.txt", "c.txt", "d.txt"]);
+    assert!(
+        app.on_key(KeyCode::Char('c'), KeyModifiers::NONE)
+            .is_empty()
+    );
+    assert_eq!(
+        queued(&app.on_key(KeyCode::Char('o'), KeyModifiers::NONE)),
+        vec![(vec!["/tmp/local/a.txt".into()], ConflictAction::Overwrite)]
+    );
+    assert!(prompt_ends_with(&app, "b.txt"));
+    assert!(
+        queued(&app.on_key(KeyCode::Char('s'), KeyModifiers::NONE)).is_empty(),
+        "skip must not queue the prompted file"
+    );
+    assert!(prompt_ends_with(&app, "c.txt"));
+    assert_eq!(
+        queued(&app.on_key(KeyCode::Char('O'), KeyModifiers::NONE)),
+        vec![(
+            vec!["/tmp/local/c.txt".into(), "/tmp/local/d.txt".into()],
+            ConflictAction::Overwrite
+        )]
+    );
+    assert!(app.files.conflict.is_none() && app.files.pending.is_none());
+}
+
+#[test]
+fn qa_retest3_three_renames_advance_and_skip_all_queues_nothing() {
+    let mut app = marked(&["a.txt", "b.txt", "c.txt"]);
+    app.on_key(KeyCode::Char('c'), KeyModifiers::NONE);
+    for name in ["a.txt", "b.txt", "c.txt"] {
+        assert!(prompt_ends_with(&app, name), "expected prompt {name}");
+        assert_eq!(
+            queued(&app.on_key(KeyCode::Char('r'), KeyModifiers::NONE)),
+            vec![(vec![format!("/tmp/local/{name}")], ConflictAction::Rename)]
+        );
+    }
+    assert!(app.files.conflict.is_none());
+
+    let mut app = marked(&["a.txt", "b.txt", "c.txt", "d.txt"]);
+    app.on_key(KeyCode::Char('c'), KeyModifiers::NONE);
+    assert!(prompt_ends_with(&app, "a.txt"));
+    let commands = app.on_key(KeyCode::Char('S'), KeyModifiers::NONE);
+    assert!(
+        queued(&commands).is_empty() && app.files.conflict.is_none() && app.files.pending.is_none(),
+        "skip-all must drop every remaining name, commands={commands:?}"
     );
 }
