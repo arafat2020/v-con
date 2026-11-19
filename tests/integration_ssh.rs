@@ -15,7 +15,15 @@ use predicates::prelude::*;
 use std::fs;
 use std::path::{Path, PathBuf};
 use std::process::{Command, Stdio};
+use std::sync::Arc;
+use std::sync::atomic::{AtomicBool, Ordering};
 use std::time::{Duration, Instant};
+
+/// `services::files::CHUNK`. One sample is this long and one is one byte longer.
+const TRANSFER_CHUNK: usize = 256 * 1024;
+const CORRECT_PASSWORD: &str = "Correct-Horse-1";
+/// Distinctive on purpose so a leak into argv, a log, or an error is obvious.
+const WRONG_PASSWORD: &str = "QaWrong-7f3a-NotInArgv";
 
 const COMPOSE_FILE: &str = "tests/fixtures/sshd/docker-compose.yml";
 const PROJECT: &str = "vcon-sshd-test";
@@ -355,6 +363,227 @@ fn password_reuse_reprompt_tunnel_and_single_failure() {
             1,
             "a stale password must not be tried by every parallel probe"
         );
+    });
+}
+
+/// Password-authenticated `vcon push` and `vcon pull` must match byte for byte.
+///
+/// Samples: a small file, a file that ends on a transfer-chunk boundary, a
+/// file one byte past that boundary, and a few-megabyte file.
+#[test]
+#[ignore = "requires Docker sshd fixture"]
+fn password_push_and_pull_round_trip_matches_bytes() {
+    with_password_fixture(|fix| {
+        password_only_host(fix);
+        set_secret(&fix.env, "alicepw", CORRECT_PASSWORD);
+        let home = container_home(&fix.container, "alice");
+        let samples = [
+            ("small.bin", 64_usize),
+            ("chunk.bin", TRANSFER_CHUNK),
+            ("chunk-plus.bin", TRANSFER_CHUNK + 1),
+            ("few-mb.bin", 3 * 1024 * 1024),
+        ];
+        let mut transcripts = String::new();
+        for (name, len) in samples {
+            transcripts.push_str(&round_trip(fix, &home, name, len));
+        }
+        assert_secret_absent("round-trip output", &transcripts, CORRECT_PASSWORD);
+        assert_secret_absent("round-trip logs", &read_logs(fix), CORRECT_PASSWORD);
+    });
+}
+
+/// A wrong saved password fails the transfer, writes nothing, and stays out of
+/// argv, the log, and the error text.
+#[test]
+#[ignore = "requires Docker sshd fixture"]
+fn wrong_password_push_and_pull_fail_without_leaking() {
+    with_password_fixture(|fix| {
+        password_only_host(fix);
+        set_secret(&fix.env, "alicepw", WRONG_PASSWORD);
+        let home = container_home(&fix.container, "alice");
+        let remote = format!("{home}/vcon-qa/must-not-appear.bin");
+        let local_src = fix.root.join("wrong-src.bin");
+        fs::write(&local_src, b"should-not-upload").unwrap();
+        let local_dir = fix.root.join("wrong-pull-dest");
+        fs::create_dir_all(&local_dir).unwrap();
+
+        let watch = ArgvWatch::start(WRONG_PASSWORD);
+        let pushed = fix.vcon(&[
+            "-y",
+            "-vv",
+            "push",
+            "alicepw",
+            &local_src.display().to_string(),
+            &remote,
+        ]);
+        let pulled = fix.vcon(&[
+            "-y",
+            "-vv",
+            "pull",
+            "alicepw",
+            &remote,
+            &local_dir.display().to_string(),
+        ]);
+        let saw_ssh = watch.finish();
+
+        assert!(
+            !pushed.status.success(),
+            "wrong-password push must exit non-zero: {}",
+            pushed.stdout
+        );
+        assert!(
+            !pulled.status.success(),
+            "wrong-password pull must exit non-zero: {}",
+            pulled.stdout
+        );
+        let errors = format!("{}\n{}", pushed.stderr, pulled.stderr);
+        assert!(
+            errors.contains("saved password was rejected"),
+            "expected a clean rejection, got {errors}"
+        );
+        assert!(
+            !remote_exists(&fix.container, &remote),
+            "wrong-password push created {remote}"
+        );
+        assert!(
+            !local_dir.join("must-not-appear.bin").exists(),
+            "wrong-password pull created a local file"
+        );
+        assert!(
+            !local_dir.join("must-not-appear.bin.part").exists(),
+            "wrong-password pull left a local partial"
+        );
+        assert_secret_absent(
+            "wrong-password output",
+            &format!("{errors}\n{}", pushed.stdout),
+            WRONG_PASSWORD,
+        );
+        assert_secret_absent("wrong-password logs", &read_logs(fix), WRONG_PASSWORD);
+        assert!(
+            saw_ssh,
+            "the ssh child was never visible in /proc, so argv was not checked"
+        );
+    });
+}
+
+/// Pull onto a file that is already there. The published bytes must be the
+/// remote file, and the `.part` sibling must be gone.
+#[test]
+#[ignore = "requires Docker sshd fixture"]
+fn password_pull_replaces_existing_file() {
+    with_password_fixture(|fix| {
+        password_only_host(fix);
+        set_secret(&fix.env, "alicepw", CORRECT_PASSWORD);
+        let home = container_home(&fix.container, "alice");
+        let name = "replace-me.bin";
+        let remote = format!("{home}/vcon-qa/{name}");
+        let local_src = fix.root.join(name);
+        let bytes = patterned(8 * 1024);
+        fs::write(&local_src, &bytes).unwrap();
+        let pushed = fix.vcon(&[
+            "-y",
+            "push",
+            "alicepw",
+            &local_src.display().to_string(),
+            &remote,
+        ]);
+        assert!(pushed.status.success(), "setup push: {}", pushed.stderr);
+
+        let dest_dir = fix.root.join("replace-dest");
+        fs::create_dir_all(&dest_dir).unwrap();
+        let dest_file = dest_dir.join(name);
+        let old = b"old-local-bytes-must-be-replaced";
+        fs::write(&dest_file, old).unwrap();
+        let pulled = fix.vcon(&[
+            "-y",
+            "-vv",
+            "pull",
+            "alicepw",
+            &remote,
+            &dest_dir.display().to_string(),
+        ]);
+        assert!(
+            pulled.status.success(),
+            "pull onto an existing file: {}",
+            pulled.stderr
+        );
+        let got = fs::read(&dest_file).unwrap();
+        assert_eq!(
+            got, bytes,
+            "existing file was not replaced with the remote bytes"
+        );
+        assert_ne!(got, old);
+        assert!(
+            !dest_dir.join(format!("{name}.part")).exists(),
+            "partial file left beside the replaced file"
+        );
+        assert!(dest_file.is_file(), "replaced path is not a regular file");
+    });
+}
+
+/// Usability check. This is not the hostile-listing escape test.
+///
+/// macOS `/tmp` is a symlink to `/private/tmp`. A destination the user chose
+/// under a link of that shape must succeed. `ensure_dir` refusing every
+/// symlink directory would break that ordinary path. On Linux the same shape
+/// is a directory we create and a symlink whose parent is that tree's root.
+#[test]
+#[ignore = "requires Docker sshd fixture"]
+fn user_chosen_symlink_parent_destination_succeeds() {
+    with_fixture(|fixture| {
+        let container = container_named("vcon-sshd-test-sshd");
+        let home = container_home(&container, "test");
+        let name = "symlink-usability.bin";
+        let bytes = b"user-picked-destination-under-symlink\n".to_vec();
+        let local_src = fixture.config.parent().unwrap().join(name);
+        fs::write(&local_src, &bytes).unwrap();
+        let remote = format!("{home}/vcon-qa/{name}");
+        fixture
+            .vcon()
+            .args([
+                "-y",
+                "push",
+                "fixture",
+                &local_src.display().to_string(),
+                &remote,
+            ])
+            .assert()
+            .success();
+
+        // `tmp` stands in for macOS `/tmp` → `/private/tmp`.
+        let base = fixture.config.parent().unwrap().join("symlink-root");
+        let real = base.join("private/tmp");
+        fs::create_dir_all(&real).unwrap();
+        let link = base.join("tmp");
+        std::os::unix::fs::symlink(&real, &link).unwrap();
+        let chosen = link.join("inbox");
+        let mut pull = fixture.vcon();
+        let output = pull
+            .args([
+                "-y",
+                "pull",
+                "fixture",
+                &remote,
+                &chosen.display().to_string(),
+            ])
+            .output()
+            .expect("pull");
+        let stderr = String::from_utf8_lossy(&output.stderr);
+        assert!(
+            output.status.success(),
+            "user-chosen destination under a symlink parent must succeed: {stderr}"
+        );
+        assert!(
+            !stderr.contains("refusing to use symlink"),
+            "ensure_dir refused a symlink the user picked: {stderr}"
+        );
+        let landed = real.join("inbox").join(name);
+        assert_eq!(
+            fs::read(&landed).expect("bytes through the real directory"),
+            bytes,
+            "file did not land through the symlink"
+        );
+        assert_eq!(fs::read(chosen.join(name)).unwrap(), bytes);
     });
 }
 
@@ -898,6 +1127,220 @@ fn descendant_states(pid: u32) -> Vec<String> {
         }
     }
     states
+}
+
+fn password_only_host(fix: &PasswordFix) {
+    fs::write(
+        fix.root.join("config/hosts.toml"),
+        format!(
+            r#"[[hosts]]
+name = "alicepw"
+address = "127.0.0.1"
+port = {port}
+user = "alice"
+ssh_options = {{ StrictHostKeyChecking = "no", UserKnownHostsFile = "/dev/null", PubkeyAuthentication = "no", PreferredAuthentications = "password", IdentitiesOnly = "yes" }}
+"#,
+            port = fix.port,
+        ),
+    )
+    .unwrap();
+}
+
+fn container_named(prefix: &str) -> String {
+    let out = Command::new("docker")
+        .args([
+            "ps",
+            "--format",
+            "{{.Names}}",
+            "--filter",
+            &format!("name={prefix}"),
+        ])
+        .output()
+        .expect("docker ps");
+    assert!(
+        out.status.success(),
+        "{}",
+        String::from_utf8_lossy(&out.stderr)
+    );
+    let names: Vec<String> = String::from_utf8_lossy(&out.stdout)
+        .lines()
+        .filter(|line| !line.is_empty())
+        .map(str::to_string)
+        .collect();
+    assert_eq!(names.len(), 1, "containers matching {prefix}: {names:?}");
+    names[0].clone()
+}
+
+fn container_home(container: &str, user: &str) -> String {
+    let out = Command::new("docker")
+        .args(["exec", container, "getent", "passwd", user])
+        .output()
+        .expect("getent");
+    assert!(
+        out.status.success(),
+        "getent {user}: {}",
+        String::from_utf8_lossy(&out.stderr)
+    );
+    let line = String::from_utf8_lossy(&out.stdout);
+    let home = line.trim().split(':').nth(5).unwrap_or("").to_string();
+    assert!(home.starts_with('/'), "home for {user}: {line}");
+    home
+}
+
+fn remote_exists(container: &str, path: &str) -> bool {
+    Command::new("docker")
+        .args(["exec", container, "test", "-e", path])
+        .status()
+        .map(|status| status.success())
+        .unwrap_or(false)
+}
+
+fn remote_bytes(container: &str, path: &str) -> Vec<u8> {
+    let out = Command::new("docker")
+        .args(["exec", container, "cat", path])
+        .output()
+        .expect("docker exec cat");
+    assert!(
+        out.status.success(),
+        "cat {path}: {}",
+        String::from_utf8_lossy(&out.stderr)
+    );
+    out.stdout
+}
+
+fn patterned(len: usize) -> Vec<u8> {
+    (0..len).map(|index| (index % 251) as u8).collect()
+}
+
+fn round_trip(fix: &PasswordFix, home: &str, name: &str, len: usize) -> String {
+    let local = fix.root.join("src").join(name);
+    fs::create_dir_all(local.parent().unwrap()).unwrap();
+    let bytes = patterned(len);
+    fs::write(&local, &bytes).unwrap();
+    let remote = format!("{home}/vcon-qa/{name}");
+    let pushed = fix.vcon(&[
+        "-y",
+        "-vv",
+        "push",
+        "alicepw",
+        &local.display().to_string(),
+        &remote,
+    ]);
+    assert!(
+        pushed.status.success(),
+        "push {name} ({len} bytes): {}",
+        pushed.stderr
+    );
+    assert_eq!(
+        remote_bytes(&fix.container, &remote),
+        bytes,
+        "remote bytes differ after push of {name}"
+    );
+    let dest = fix.root.join("pulled").join(name);
+    fs::create_dir_all(&dest).unwrap();
+    let pulled = fix.vcon(&[
+        "-y",
+        "-vv",
+        "pull",
+        "alicepw",
+        &remote,
+        &dest.display().to_string(),
+    ]);
+    assert!(
+        pulled.status.success(),
+        "pull {name} ({len} bytes): {}",
+        pulled.stderr
+    );
+    assert_eq!(
+        fs::read(dest.join(name)).unwrap(),
+        bytes,
+        "local bytes differ after pull of {name}"
+    );
+    assert!(!dest.join(format!("{name}.part")).exists());
+    format!("{}\n{}", pushed.stderr, pulled.stderr)
+}
+
+fn read_logs(fix: &PasswordFix) -> String {
+    let mut text = String::new();
+    for path in [
+        fix.root.join("state/vcon/vcon.log"),
+        fix.root.join("state/vcon/audit.jsonl"),
+        fix.root.join("cache/vcon/askpass"),
+    ] {
+        if let Ok(body) = fs::read_to_string(&path) {
+            text.push_str(&body);
+            text.push('\n');
+        }
+    }
+    text
+}
+
+fn assert_secret_absent(label: &str, text: &str, secret: &str) {
+    assert!(!text.contains(secret), "{label} contains the password");
+}
+
+/// Watches `/proc` while a transfer runs. The password must not appear in any
+/// process argv. `finish` is true when an `ssh` child was actually observed.
+struct ArgvWatch {
+    stop: Arc<AtomicBool>,
+    saw_secret: Arc<AtomicBool>,
+    saw_ssh: Arc<AtomicBool>,
+    handle: Option<std::thread::JoinHandle<()>>,
+}
+
+impl ArgvWatch {
+    fn start(secret: &str) -> Self {
+        let stop = Arc::new(AtomicBool::new(false));
+        let saw_secret = Arc::new(AtomicBool::new(false));
+        let saw_ssh = Arc::new(AtomicBool::new(false));
+        let secret = secret.as_bytes().to_vec();
+        let stop_flag = Arc::clone(&stop);
+        let secret_flag = Arc::clone(&saw_secret);
+        let ssh_flag = Arc::clone(&saw_ssh);
+        let handle = std::thread::spawn(move || {
+            while !stop_flag.load(Ordering::Relaxed) {
+                scan_argv(&secret, &secret_flag, &ssh_flag);
+                std::thread::sleep(Duration::from_millis(1));
+            }
+            scan_argv(&secret, &secret_flag, &ssh_flag);
+        });
+        Self {
+            stop,
+            saw_secret,
+            saw_ssh,
+            handle: Some(handle),
+        }
+    }
+
+    fn finish(mut self) -> bool {
+        self.stop.store(true, Ordering::Relaxed);
+        if let Some(handle) = self.handle.take() {
+            let _ = handle.join();
+        }
+        assert!(
+            !self.saw_secret.load(Ordering::Relaxed),
+            "password appeared in a process argv"
+        );
+        self.saw_ssh.load(Ordering::Relaxed)
+    }
+}
+
+fn scan_argv(secret: &[u8], saw_secret: &AtomicBool, saw_ssh: &AtomicBool) {
+    let Ok(proc) = fs::read_dir("/proc") else {
+        return;
+    };
+    for entry in proc.flatten() {
+        let cmdline = fs::read(entry.path().join("cmdline")).unwrap_or_default();
+        if !secret.is_empty() && cmdline.windows(secret.len()).any(|window| window == secret) {
+            saw_secret.store(true, Ordering::Relaxed);
+        }
+        if cmdline
+            .split(|byte| *byte == 0)
+            .any(|arg| arg == b"ssh" || arg.ends_with(b"/ssh"))
+        {
+            saw_ssh.store(true, Ordering::Relaxed);
+        }
+    }
 }
 
 #[cfg(test)]

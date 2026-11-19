@@ -1199,6 +1199,10 @@ fn drain_keys() {
     }
 }
 
+#[cfg(test)]
+#[path = "../../qa/tui_conflict.rs"]
+mod qa_tui_conflict;
+
 fn copy_to_clipboard(text: &str) -> Result<(), String> {
     arboard::Clipboard::new()
         .and_then(|mut clipboard| clipboard.set_text(text))
