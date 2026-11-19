@@ -15,7 +15,7 @@ use crossterm::terminal::{
     Clear, ClearType, EnterAlternateScreen, LeaveAlternateScreen, disable_raw_mode, enable_raw_mode,
 };
 use ratatui::Terminal;
-use ratatui::backend::CrosstermBackend;
+use ratatui::backend::{Backend, CrosstermBackend};
 use std::io::{self, Stdout, Write};
 use std::sync::atomic::{AtomicBool, Ordering};
 
@@ -46,7 +46,9 @@ pub fn setup(mouse: bool) -> io::Result<Tui> {
     RESTORED.store(false, Ordering::SeqCst);
     install_panic_hook();
     let mut terminal = Terminal::new(CrosstermBackend::new(stdout))?;
-    terminal.clear()?;
+    // Same clear as resume: do not query the cursor. A fullscreen alternate
+    // screen has nothing to restore, and ESC[6n fails when its reply is late.
+    clear_screen(&mut terminal)?;
     Ok(terminal)
 }
 
@@ -84,6 +86,12 @@ pub fn suspend(terminal: &mut Tui) -> io::Result<()> {
 }
 
 /// Return to the TUI after a child process exits and force a full redraw.
+///
+/// The screen is cleared without asking where the cursor is. Ratatui's
+/// [`Terminal::clear`] writes `ESC[6n` and waits on stdin for the report.
+/// After an ssh handoff that report is not read in time, resume fails with
+/// "The cursor position could not be read within a normal duration", and the
+/// unread `ESC[row;colR` is left on the tty.
 pub fn resume(terminal: &mut Tui, mouse: bool) -> io::Result<()> {
     enable_raw_mode()?;
     execute!(
@@ -96,7 +104,23 @@ pub fn resume(terminal: &mut Tui, mouse: bool) -> io::Result<()> {
         execute!(terminal.backend_mut(), EnableMouseCapture)?;
     }
     RESTORED.store(false, Ordering::SeqCst);
-    terminal.clear()
+    clear_screen(terminal)
+}
+
+/// Clear the visible screen and both render buffers.
+///
+/// Unlike [`Terminal::clear`], this does not query the cursor. Both buffers
+/// are reset so the next draw repaints every cell onto the blank screen
+/// instead of diffing against the frame from before the handoff.
+fn clear_screen<B: Backend>(terminal: &mut Terminal<B>) -> Result<(), B::Error> {
+    terminal
+        .backend_mut()
+        .clear_region(ratatui::backend::ClearType::All)?;
+    // `swap_buffers` blanks the inactive buffer and makes it current.
+    // A second swap blanks the other one too.
+    terminal.swap_buffers();
+    terminal.swap_buffers();
+    Ok(())
 }
 
 fn install_panic_hook() {
@@ -108,4 +132,98 @@ fn install_panic_hook() {
         let _ = restore();
         previous(info);
     }));
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use ratatui::backend::{TestBackend, WindowSize};
+    use ratatui::buffer::Cell;
+    use ratatui::layout::{Position, Size};
+
+    /// Backend that fails the cursor-position query `Terminal::clear` sends.
+    struct CursorProbe {
+        inner: TestBackend,
+        queries: u32,
+    }
+
+    impl Backend for CursorProbe {
+        type Error = io::Error;
+
+        fn draw<'a, I>(&mut self, content: I) -> io::Result<()>
+        where
+            I: Iterator<Item = (u16, u16, &'a Cell)>,
+        {
+            self.inner.draw(content).map_err(|err| match err {})
+        }
+
+        fn hide_cursor(&mut self) -> io::Result<()> {
+            self.inner.hide_cursor().map_err(|err| match err {})
+        }
+
+        fn show_cursor(&mut self) -> io::Result<()> {
+            self.inner.show_cursor().map_err(|err| match err {})
+        }
+
+        fn get_cursor_position(&mut self) -> io::Result<Position> {
+            self.queries += 1;
+            Err(io::Error::other(
+                "The cursor position could not be read within a normal duration",
+            ))
+        }
+
+        fn set_cursor_position<P: Into<Position>>(&mut self, position: P) -> io::Result<()> {
+            self.inner
+                .set_cursor_position(position)
+                .map_err(|err| match err {})
+        }
+
+        fn clear(&mut self) -> io::Result<()> {
+            self.inner.clear().map_err(|err| match err {})
+        }
+
+        fn clear_region(&mut self, clear_type: ratatui::backend::ClearType) -> io::Result<()> {
+            self.inner
+                .clear_region(clear_type)
+                .map_err(|err| match err {})
+        }
+
+        fn size(&self) -> io::Result<Size> {
+            self.inner.size().map_err(|err| match err {})
+        }
+
+        fn window_size(&mut self) -> io::Result<WindowSize> {
+            self.inner.window_size().map_err(|err| match err {})
+        }
+
+        fn flush(&mut self) -> io::Result<()> {
+            self.inner.flush().map_err(|err| match err {})
+        }
+    }
+
+    #[test]
+    fn resume_clear_repaints_without_querying_the_cursor() {
+        let backend = CursorProbe {
+            inner: TestBackend::new(4, 1),
+            queries: 0,
+        };
+        let mut terminal = Terminal::new(backend).unwrap();
+        terminal
+            .draw(|frame| {
+                frame.render_widget("AAAA", frame.area());
+            })
+            .unwrap();
+        clear_screen(&mut terminal).unwrap();
+        assert_eq!(terminal.backend().queries, 0);
+        terminal.backend().inner.assert_buffer_lines(["    "]);
+        // The same frame must be painted again. If the diff baseline still
+        // held "AAAA", this draw would skip every cell and leave the wipe.
+        terminal
+            .draw(|frame| {
+                frame.render_widget("AAAA", frame.area());
+            })
+            .unwrap();
+        assert_eq!(terminal.backend().queries, 0);
+        terminal.backend().inner.assert_buffer_lines(["AAAA"]);
+    }
 }

@@ -364,6 +364,66 @@ pub fn parse_chord(raw: &str) -> Option<(KeyCode, KeyModifiers)> {
     parse_key(raw).map(|binding| (binding.code, binding.modifiers))
 }
 
+/// True when this key is the embedded-session prefix.
+///
+/// The configured chord is matched exactly (`ctrl-]` is `]` with Control).
+/// Legacy terminals send that chord as a single control byte. Crossterm
+/// reports `0x1C`–`0x1F` as Ctrl+4 through Ctrl+7, so Ctrl+] arrives as
+/// Ctrl+5. That alias matches too. A plain `5`, without Control, does not.
+pub fn is_session_prefix(
+    code: KeyCode,
+    modifiers: KeyModifiers,
+    prefix: (KeyCode, KeyModifiers),
+) -> bool {
+    let modifiers = chord_modifiers(modifiers);
+    let (prefix_code, prefix_mods) = prefix;
+    let prefix_mods = chord_modifiers(prefix_mods);
+    if code == prefix_code && modifiers == prefix_mods {
+        return true;
+    }
+    legacy_control_alias(prefix_code, prefix_mods)
+        .is_some_and(|(alias, alias_mods)| code == alias && modifiers == alias_mods)
+}
+
+/// Rewrite the legacy crossterm spelling of the prefix to the configured chord.
+///
+/// A second prefix press is written to the shell. Reporting Ctrl+] as Ctrl+5
+/// would encode the digit `5` instead of `0x1D`. Other keys are unchanged, so
+/// a real `5` still reaches the shell.
+pub fn canonical_session_key(
+    code: KeyCode,
+    modifiers: KeyModifiers,
+    prefix: (KeyCode, KeyModifiers),
+) -> (KeyCode, KeyModifiers) {
+    if is_session_prefix(code, modifiers, prefix) && code != prefix.0 {
+        prefix
+    } else {
+        (code, modifiers)
+    }
+}
+
+fn chord_modifiers(modifiers: KeyModifiers) -> KeyModifiers {
+    modifiers.intersection(KeyModifiers::CONTROL | KeyModifiers::ALT | KeyModifiers::SHIFT)
+}
+
+/// Crossterm's byte mapping for Ctrl+\ Ctrl+] Ctrl+^ Ctrl+_.
+fn legacy_control_alias(code: KeyCode, modifiers: KeyModifiers) -> Option<(KeyCode, KeyModifiers)> {
+    if !modifiers.contains(KeyModifiers::CONTROL) {
+        return None;
+    }
+    let KeyCode::Char(ch) = code else {
+        return None;
+    };
+    let alias = match ch {
+        '\\' => '4',
+        ']' => '5',
+        '^' => '6',
+        '_' | '-' => '7',
+        _ => return None,
+    };
+    Some((KeyCode::Char(alias), modifiers))
+}
+
 fn parse_key(raw: &str) -> Option<Binding> {
     let raw = raw.trim();
     if let Some(letter) = raw.chars().next()
@@ -457,6 +517,50 @@ mod tests {
         assert!(text.contains("connect"), "{text}");
         assert!(text.contains('q'), "{text}");
         assert!(text.contains('?'), "{text}");
+    }
+
+    #[test]
+    fn ctrl_bracket_prefix_matches_both_encodings_but_not_plain_five() {
+        let prefix = (KeyCode::Char(']'), KeyModifiers::CONTROL);
+        assert!(is_session_prefix(
+            KeyCode::Char(']'),
+            KeyModifiers::CONTROL,
+            prefix
+        ));
+        // Legacy terminals send Ctrl+] as 0x1D. Crossterm reports that as Ctrl+5.
+        assert!(is_session_prefix(
+            KeyCode::Char('5'),
+            KeyModifiers::CONTROL,
+            prefix
+        ));
+        assert!(!is_session_prefix(
+            KeyCode::Char('5'),
+            KeyModifiers::NONE,
+            prefix
+        ));
+        assert!(!is_session_prefix(
+            KeyCode::Char(']'),
+            KeyModifiers::NONE,
+            prefix
+        ));
+        assert!(!is_session_prefix(
+            KeyCode::Char('5'),
+            KeyModifiers::SHIFT,
+            prefix
+        ));
+        // A second press must encode as Ctrl+], not as the digit crossterm reported.
+        assert_eq!(
+            canonical_session_key(KeyCode::Char('5'), KeyModifiers::CONTROL, prefix),
+            prefix
+        );
+        assert_eq!(
+            canonical_session_key(KeyCode::Char('5'), KeyModifiers::NONE, prefix),
+            (KeyCode::Char('5'), KeyModifiers::NONE)
+        );
+        assert_eq!(
+            canonical_session_key(KeyCode::Char(']'), KeyModifiers::CONTROL, prefix),
+            prefix
+        );
     }
 
     #[test]
