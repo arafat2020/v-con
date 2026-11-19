@@ -4,13 +4,15 @@ use crate::config::Config;
 use crate::domain::host::EffectiveHost;
 use crate::domain::tunnel::TunnelSpec;
 use crate::error::Error;
+use crate::infra::secrets;
 use crate::infra::ssh::command::command_line;
 use crate::infra::ssh::system;
 use crate::paths::Paths;
 use crate::services::connect;
 use crate::services::inventory::InventoryBundle;
+use crate::services::login::{self, TtyPrompt};
 use crate::services::tunnels::{ensure_local_port_free, plan_forward_args, resolve_spec};
-use std::io::{self, Write};
+use std::io::{self, IsTerminal, Write};
 use std::path::Path;
 use std::process::{Child, Command, ExitStatus, Stdio};
 
@@ -28,7 +30,21 @@ pub fn run(
         ensure_local_port_free(port)?;
     }
     let program = system::find_ssh()?;
-    let args = forward_args(host, &bundle.hosts, &spec);
+    let store = secrets::system_store();
+    let ready = login::prepare_host_auth(
+        &login::Prepare {
+            store: store.as_ref(),
+            cache_dir: &paths.cache_dir,
+            program: &program,
+            host,
+            hosts: &bundle.hosts,
+            interactive: io::stdin().is_terminal() || io::stderr().is_terminal(),
+            multiplexing: false,
+            control_dir: &paths.control_dir(),
+        },
+        &TtyPrompt,
+    )?;
+    let args = forward_args(host, &bundle.hosts, &spec, ready.password_auth);
     let mut displayed = vec![program.display().to_string()];
     displayed.extend(args.iter().cloned());
     tracing::debug!(command = %command_line(&displayed), "tunnel");
@@ -46,7 +62,7 @@ pub fn run(
     println!("Tunnel {label} on {} — Ctrl+C to stop", host.name);
     let _ = io::stdout().flush();
 
-    let mut child = ForwardChild::spawn(&program, &args)?;
+    let mut child = ForwardChild::spawn(&program, &args, &ready.env)?;
     let status = wait_for_forward(&mut child.0)?;
 
     if status.success() || status.code().is_none() {
@@ -70,8 +86,13 @@ pub(crate) fn forward_args(
     host: &EffectiveHost,
     hosts: &[EffectiveHost],
     spec: &TunnelSpec,
+    password_auth: bool,
 ) -> Vec<String> {
-    let options = connect::session_options(false, Path::new(""));
+    let mut options = connect::session_options(false, Path::new(""));
+    // Batch mode when there is no saved password, so ssh cannot read the tty
+    // from its own process group (that read stops the process with SIGTTIN).
+    options.batch_mode = !password_auth;
+    options.password_auth = password_auth;
     let mut args = plan_forward_args(host, hosts, &options, spec);
     let mut isolated = vec![
         "-o".to_string(),
@@ -100,59 +121,21 @@ pub(crate) fn forward_args(
 struct ForwardChild(Child);
 
 impl ForwardChild {
-    fn spawn(program: &Path, args: &[String]) -> Result<Self, Error> {
+    fn spawn(program: &Path, args: &[String], env: &[(String, String)]) -> Result<Self, Error> {
         let mut command = Command::new(program);
         command
             .args(args)
+            .envs(env.iter().cloned())
             .stdin(Stdio::null())
             .stdout(Stdio::inherit())
             .stderr(Stdio::inherit());
         #[cfg(unix)]
-        isolate_tunnel_child(&mut command);
+        system::own_child(&mut command);
         let child = command
             .spawn()
             .map_err(|error| Error::Message(format!("failed to start tunnel: {error}")))?;
         Ok(Self(child))
     }
-}
-
-/// Keep the ssh child from surviving `kill -9` of vcon.
-///
-/// On Linux the child asks to be sent SIGTERM when its parent dies, and it
-/// runs in its own process group.
-#[cfg(unix)]
-fn isolate_tunnel_child(command: &mut Command) {
-    use std::os::unix::process::CommandExt;
-    #[cfg(target_os = "linux")]
-    {
-        let parent = std::process::id();
-        // SAFETY: `pre_exec` runs in the forked child before exec. The armed
-        // path calls `prctl`, `getppid`, and, if the parent is already gone,
-        // `raise` and `_exit`.
-        unsafe {
-            command.pre_exec(move || arm_parent_death_signal(parent));
-        }
-    }
-    command.process_group(0);
-}
-
-/// `PR_SET_PDEATHSIG(SIGTERM)`, then exit if the parent is already gone.
-///
-/// The signal is not delivered for a parent that died before `prctl`, so
-/// compare `getppid` with the pid captured before the spawn.
-#[cfg(target_os = "linux")]
-fn arm_parent_death_signal(parent: u32) -> io::Result<()> {
-    let rc = unsafe { libc::prctl(libc::PR_SET_PDEATHSIG, libc::SIGTERM as libc::c_ulong) };
-    if rc != 0 {
-        return Err(io::Error::last_os_error());
-    }
-    if unsafe { libc::getppid() } != parent as libc::pid_t {
-        unsafe {
-            libc::raise(libc::SIGTERM);
-            libc::_exit(1);
-        }
-    }
-    Ok(())
 }
 
 impl Drop for ForwardChild {
@@ -251,7 +234,7 @@ mod tests {
     fn tunnel_args_disable_multiplexing_before_host_options() {
         let host = host();
         let spec = TunnelSpec::parse("L:3000:localhost:3000").unwrap();
-        let args = forward_args(&host, std::slice::from_ref(&host), &spec);
+        let args = forward_args(&host, std::slice::from_ref(&host), &spec, false);
         let master_no = args
             .iter()
             .position(|arg| arg == "ControlMaster=no")
@@ -273,6 +256,7 @@ mod tests {
                 "{later} must not override the tunnel isolation flags"
             );
         }
+        assert!(args.iter().any(|arg| arg == "BatchMode=yes"));
         assert!(args.iter().any(|arg| arg == "-N"));
         assert!(args.iter().any(|arg| arg == "-L"));
         assert_eq!(args.last().map(String::as_str), Some("root@10.0.0.1"));
@@ -282,7 +266,7 @@ mod tests {
     fn tunnel_args_send_keepalives_without_multiplexing() {
         let host = host();
         let spec = TunnelSpec::parse("L:3000:localhost:3000").unwrap();
-        let args = forward_args(&host, std::slice::from_ref(&host), &spec);
+        let args = forward_args(&host, std::slice::from_ref(&host), &spec, false);
         let path_none = args
             .iter()
             .position(|arg| arg == "ControlPath=none")

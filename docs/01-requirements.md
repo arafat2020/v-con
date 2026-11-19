@@ -73,7 +73,7 @@ roughly 5–200 Linux VPS servers across one or more providers.
 - Configuration management (Ansible's job — vcon is for interactive, ad-hoc work)
 - A web UI or a server/daemon component
 - Managing Windows servers
-- Storing passwords (use keys + ssh-agent)
+- Storing passwords in `hosts.toml` (a password vcon has used successfully is kept in the OS keychain)
 - Being a full tmux replacement (embedded sessions cover the common case, not every tmux feature)
 
 ## Success criteria

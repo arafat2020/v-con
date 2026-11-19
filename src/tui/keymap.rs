@@ -212,7 +212,7 @@ fn action_help_label(action: &Action) -> &'static str {
         Action::OpenSession => "open an embedded session",
         Action::OpenSnippets => "snippet picker",
         Action::OpenTunnels => "tunnels for the cursor host",
-        Action::SavePassword => "save the login password in the OS keychain",
+        Action::SavePassword => "check and save the login password in the OS keychain",
         Action::Tick
         | Action::CloseModal
         | Action::SearchInsert(_)

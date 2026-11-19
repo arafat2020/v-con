@@ -7,9 +7,8 @@ does **not** reimplement SSH. It manages an inventory, works out *which* hosts
 and *what* to do, then drives the system's OpenSSH tools to do the actual work:
 
 - `ssh` for interactive sessions, commands, and health checks
-- `ssh` running the SFTP subsystem for the file browser
+- `ssh` running the SFTP subsystem for the file browser and for `push` / `pull`
 - `ssh` inside a pseudo-terminal (PTY) for embedded sessions
-- `rsync` (optional) for fast directory sync
 
 ```mermaid
 flowchart TB

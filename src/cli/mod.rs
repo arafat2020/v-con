@@ -4,7 +4,7 @@
 //! (`c`), `import`, `exec` (`x`), `status` (`st`), `ping`, `doctor`,
 //! `completions`, and `man` share [`crate::services::inventory`] where needed.
 
-mod commands;
+pub(crate) mod commands;
 
 use crate::error::Error;
 use crate::paths::{self, Paths};
@@ -108,8 +108,8 @@ pub enum Command {
         /// Selector such as `web-1` or `@web`. Absent means every host.
         selector: Option<String>,
         /// Sort by host, status, cpu, load, mem, disk, net, or up.
-        #[arg(long, default_value = "host")]
-        sort: String,
+        #[arg(long, value_enum, default_value_t = commands::status::SortKey::Host)]
+        sort: commands::status::SortKey,
         /// Skip the second sample. CPU % and network rates stay empty.
         #[arg(long)]
         no_cpu: bool,
@@ -330,7 +330,7 @@ fn dispatch(cli: &Cli) -> Result<ExitCode, Error> {
                 &paths,
                 &commands::status::StatusRequest {
                     selector: selector.as_deref(),
-                    sort,
+                    sort: *sort,
                     json: cli.json,
                     sample_cpu: !*no_cpu,
                 },
@@ -350,6 +350,7 @@ fn dispatch(cli: &Cli) -> Result<ExitCode, Error> {
                     selector: selector.as_deref(),
                     parallel: *parallel,
                     timeout: *timeout,
+                    json: cli.json,
                 },
             )
         }

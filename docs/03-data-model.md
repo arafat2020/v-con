@@ -200,7 +200,7 @@ One JSON object per line, append only:
 ```toml
 parallel = 10                  # max concurrent ssh processes (exec, health, sftp)
 confirm_threshold = 5          # ask for confirmation above this many hosts
-protected_tags = ["prod"]      # always confirm when any of these is targeted
+protected_tags = []            # set ["prod"] to confirm those hosts; default is empty
 multiplexing = true            # use ssh ControlMaster
 
 [tui]

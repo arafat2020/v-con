@@ -14,12 +14,48 @@ use std::process::ExitCode;
 use std::sync::Arc;
 use tokio_util::sync::CancellationToken;
 
+/// Column `vcon status --sort` accepts.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, clap::ValueEnum)]
+pub enum SortKey {
+    /// Inventory name.
+    Host,
+    /// Ok / warn / crit / unreachable.
+    Status,
+    /// CPU percent.
+    Cpu,
+    /// Load average.
+    Load,
+    /// Memory percent.
+    Mem,
+    /// Disk percent.
+    Disk,
+    /// Network receive rate.
+    Net,
+    /// Uptime.
+    Up,
+}
+
+impl SortKey {
+    fn as_str(self) -> &'static str {
+        match self {
+            Self::Host => "host",
+            Self::Status => "status",
+            Self::Cpu => "cpu",
+            Self::Load => "load",
+            Self::Mem => "mem",
+            Self::Disk => "disk",
+            Self::Net => "net",
+            Self::Up => "up",
+        }
+    }
+}
+
 /// Options for one `vcon status` invocation.
 pub struct StatusRequest<'a> {
     /// Optional selector. Absent means every host.
     pub selector: Option<&'a str>,
-    /// Sort key: host, status, cpu, load, mem, disk, net, up.
-    pub sort: &'a str,
+    /// Sort key: host, status, cpu, load, mem, disk, net, or up.
+    pub sort: SortKey,
     /// Emit JSON instead of a table.
     pub json: bool,
     /// Take a second sample one second later for CPU % and net rates.
@@ -87,7 +123,7 @@ pub fn run(
                 .map(|report| (host.name.as_str(), report))
         })
         .collect();
-    sort_rows(&mut rows, request.sort);
+    sort_rows(&mut rows, request.sort.as_str());
 
     if request.json {
         let payload: Vec<JsonRow> = rows

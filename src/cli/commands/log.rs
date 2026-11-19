@@ -77,8 +77,8 @@ pub fn run(paths: &Paths, request: &LogRequest<'_>) -> Result<ExitCode, Error> {
 }
 
 fn format_line(entry: &AuditEntry) -> String {
-    let hosts = entry.hosts.join(",");
-    let command = entry.summary();
+    let hosts = escape_field(&entry.hosts.join(","));
+    let command = escape_field(&entry.summary());
     let result = entry
         .results
         .as_ref()
@@ -93,11 +93,26 @@ fn format_line(entry: &AuditEntry) -> String {
     format!(
         "{}  {:<14}  {:<16}  {}  {}",
         entry.ts.format("%Y-%m-%dT%H:%M:%SZ"),
-        entry.action,
+        escape_field(&entry.action),
         hosts,
         command,
-        result
+        escape_field(&result)
     )
+}
+
+/// One physical line per entry. Control characters cannot forge another row.
+pub fn escape_field(text: &str) -> String {
+    let mut out = String::with_capacity(text.len());
+    for ch in text.chars() {
+        match ch {
+            '\n' => out.push_str("\\n"),
+            '\r' => out.push_str("\\r"),
+            '\t' => out.push_str("\\t"),
+            ch if ch.is_control() => out.push_str(&format!("\\u{{{:x}}}", ch as u32)),
+            ch => out.push(ch),
+        }
+    }
+    out
 }
 
 /// Parse `1d` / `12h` / `30m` into a chrono duration.
@@ -128,6 +143,15 @@ pub fn parse_since(raw: &str) -> Result<Duration, Error> {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn escapes_newlines_so_a_command_cannot_forge_a_log_line() {
+        let raw = "echo ok\n2020-01-01T00:00:00Z  exec            forged";
+        let escaped = escape_field(raw);
+        assert!(!escaped.contains('\n'));
+        assert!(escaped.contains("\\n"));
+        assert_eq!(escape_field("a\rb\tc"), "a\\rb\\tc");
+    }
 
     #[test]
     fn parses_day_hour_minute() {

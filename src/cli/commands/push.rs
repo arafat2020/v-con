@@ -7,7 +7,7 @@ use crate::infra::remote_fs::{LocalFs, SftpFs, normalize, sftp_arguments_auth};
 use crate::infra::secrets::{self, AskpassMode};
 use crate::paths::Paths;
 use crate::services::exec::{ConfirmGate, ExecSettings, confirmation_gate, needs_confirmation};
-use crate::services::files::{copy_file, plan_copies};
+use crate::services::files::{copy_file, plan_push};
 use crate::services::inventory::InventoryBundle;
 use std::io::{self, IsTerminal, Write};
 use std::path::Path;
@@ -78,11 +78,27 @@ pub fn run(
         ConfirmGate::Run => {}
     }
     let program = crate::infra::ssh::system::find_ssh()?;
+    let store = secrets::system_store();
+    let interactive = io::stdin().is_terminal();
+    for host in &hosts {
+        crate::services::login::prepare_host_auth(
+            &crate::services::login::Prepare {
+                store: store.as_ref(),
+                cache_dir: &paths.cache_dir,
+                program: &program,
+                host,
+                hosts: &bundle.hosts,
+                interactive,
+                multiplexing: config.multiplexing,
+                control_dir: &paths.control_dir(),
+            },
+            &crate::services::login::TtyPrompt,
+        )?;
+    }
     let local_path = request
         .local
         .to_str()
         .ok_or_else(|| Error::Message("local path is not valid UTF-8".to_string()))?;
-    let remote_dir = normalize(request.remote);
     let control = config
         .multiplexing
         .then(|| paths.control_dir().display().to_string());
@@ -90,7 +106,6 @@ pub fn run(
         .enable_all()
         .build()
         .map_err(|error| Error::Message(error.to_string()))?;
-    let store = secrets::system_store();
     let mut failed = false;
     for host in &hosts {
         let started = std::time::Instant::now();
@@ -107,7 +122,7 @@ pub fn run(
             let remote =
                 Arc::new(SftpFs::connect_with_env(program.clone(), args, &auth.env).await?);
             let source = normalize(local_path);
-            let planned = plan_copies(&LocalFs, remote.as_ref(), &source, &remote_dir).await?;
+            let planned = plan_push(&LocalFs, remote.as_ref(), &source, request.remote).await?;
             let cancel = CancellationToken::new();
             for (src_path, destination, _size) in planned.files {
                 if copy_file(
@@ -121,10 +136,7 @@ pub fn run(
                 .await
                 .is_err()
                 {
-                    return Err(Error::Message(format!(
-                        "{}: copy failed for {src_path}",
-                        host.name
-                    )));
+                    return Err(Error::Message(format!("copy failed for {destination}")));
                 }
             }
             if let Ok(sftp) = Arc::try_unwrap(remote) {

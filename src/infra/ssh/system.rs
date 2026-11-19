@@ -120,6 +120,41 @@ pub fn release_dead_master(program: &Path, args: &[String]) {
     }
 }
 
+/// Run the child in its own process group and, on Linux, ask to be killed
+/// when the parent dies. A tunnel uses this so it cannot outlive vcon or
+/// read the terminal from the wrong process group.
+#[cfg(unix)]
+pub fn own_child(command: &mut std::process::Command) {
+    use std::os::unix::process::CommandExt;
+    #[cfg(target_os = "linux")]
+    {
+        let parent = std::process::id();
+        // SAFETY: `pre_exec` runs in the forked child before exec. The armed
+        // path calls `prctl`, `getppid`, and, if the parent is already gone,
+        // `raise` and `_exit`.
+        unsafe {
+            command.pre_exec(move || arm_parent_death_signal(parent));
+        }
+    }
+    command.process_group(0);
+}
+
+/// `PR_SET_PDEATHSIG(SIGTERM)`, then exit if the parent is already gone.
+#[cfg(target_os = "linux")]
+fn arm_parent_death_signal(parent: u32) -> std::io::Result<()> {
+    let rc = unsafe { libc::prctl(libc::PR_SET_PDEATHSIG, libc::SIGTERM as libc::c_ulong) };
+    if rc != 0 {
+        return Err(std::io::Error::last_os_error());
+    }
+    if unsafe { libc::getppid() } != parent as libc::pid_t {
+        unsafe {
+            libc::raise(libc::SIGTERM);
+            libc::_exit(1);
+        }
+    }
+    Ok(())
+}
+
 /// Run `command` and stop it if it has not exited within `limit`.
 fn output_bounded(mut command: Command, limit: Duration) -> Option<std::process::Output> {
     use std::io::Read;
@@ -212,6 +247,14 @@ impl SystemSsh {
         let mut displayed = vec![self.program.display().to_string()];
         displayed.extend(args.iter().cloned());
         tracing::debug!(command = %command_line(&displayed), "starting ssh exec");
+        let stored = crate::infra::secrets::uses_stored_password(env);
+        if stored && crate::infra::secrets::is_rejected(host) {
+            return blocked_password(host, lines).await;
+        }
+        let mut guard = match crate::infra::secrets::GateGuard::enter(host, stored) {
+            Ok(guard) => guard,
+            Err(()) => return blocked_password(host, lines).await,
+        };
         release_dead_master(&self.program, args);
         let mut child = match TokioCommand::new(&self.program)
             .args(args)
@@ -321,6 +364,20 @@ impl SystemSsh {
             }
         };
         let code = status.ok().and_then(|status| status.code());
+        let auth_failed = stored && stderr_auth_failed(&stderr_text);
+        if auth_failed {
+            let hint = crate::infra::secrets::stale_password_message(host);
+            stderr_text.push_str(&hint);
+            stderr_text.push('\n');
+            let _ = lines
+                .send(crate::services::exec::JobEvent::Line {
+                    host: host.to_string(),
+                    stderr: true,
+                    text: hint,
+                })
+                .await;
+        }
+        guard.finish(auth_failed);
         ProcessResult {
             code,
             timed_out: false,
@@ -329,6 +386,33 @@ impl SystemSsh {
             truncated: truncated.load(Ordering::Relaxed),
             stderr: stderr_text,
         }
+    }
+}
+
+fn stderr_auth_failed(stderr: &str) -> bool {
+    let text = stderr.to_ascii_lowercase();
+    text.contains("permission denied") || text.contains("authentication failed")
+}
+
+async fn blocked_password(
+    host: &str,
+    lines: &mpsc::Sender<crate::services::exec::JobEvent>,
+) -> crate::services::exec::ProcessResult {
+    let hint = crate::infra::secrets::stale_password_message(host);
+    let _ = lines
+        .send(crate::services::exec::JobEvent::Line {
+            host: host.to_string(),
+            stderr: true,
+            text: hint.clone(),
+        })
+        .await;
+    crate::services::exec::ProcessResult {
+        code: Some(255),
+        timed_out: false,
+        cancelled: false,
+        spawn_error: None,
+        truncated: false,
+        stderr: hint,
     }
 }
 

@@ -68,6 +68,11 @@ pub fn run(
             "--stream and --grouped cannot both be set".to_string(),
         ));
     }
+    if let Some(message) =
+        misplaced_exec_flag(&std::env::args().collect::<Vec<_>>(), request.command)
+    {
+        return Err(Error::Message(message));
+    }
     let command = request.command.join(" ");
     let command = command.trim();
     if command.is_empty() {
@@ -89,7 +94,9 @@ pub fn run(
         .timeout
         .map(Duration::from_secs)
         .unwrap_or(DEFAULT_TIMEOUT);
-    let connect_timeout = (timeout.as_secs() > 0).then_some(timeout.as_secs());
+    // `-t` is the command timeout. It changes ssh's ConnectTimeout only when
+    // the user passed it. Otherwise the inventory value is left alone.
+    let connect_timeout = request.timeout.filter(|seconds| *seconds > 0);
     let control = paths.control_dir().display().to_string();
     let store = secrets::system_store();
     let options = SshCommandOptions {
@@ -99,21 +106,21 @@ pub fn run(
         multiplexing: config.multiplexing,
         control_path_dir: Some(control),
     };
-    let targets: Vec<HostTarget> = hosts
-        .iter()
-        .map(|host| {
-            exec::authenticated_target(
-                store.as_ref(),
-                &paths.cache_dir,
-                host,
-                &bundle.hosts,
-                &remote,
-                AskpassMode::Force,
-                &options,
-            )
-        })
-        .collect();
     if request.dry_run {
+        let targets: Vec<HostTarget> = hosts
+            .iter()
+            .map(|host| {
+                exec::authenticated_target(
+                    store.as_ref(),
+                    &paths.cache_dir,
+                    host,
+                    &bundle.hosts,
+                    &remote,
+                    AskpassMode::Force,
+                    &options,
+                )
+            })
+            .collect();
         for target in &targets {
             println!(
                 "{}  {}",
@@ -146,6 +153,37 @@ pub fn run(
         }
         ConfirmGate::Run => {}
     }
+    let program = crate::infra::ssh::system::find_ssh()?;
+    let interactive = io::stdin().is_terminal();
+    for host in &hosts {
+        crate::services::login::prepare_host_auth(
+            &crate::services::login::Prepare {
+                store: store.as_ref(),
+                cache_dir: &paths.cache_dir,
+                program: &program,
+                host,
+                hosts: &bundle.hosts,
+                interactive,
+                multiplexing: config.multiplexing,
+                control_dir: &paths.control_dir(),
+            },
+            &crate::services::login::TtyPrompt,
+        )?;
+    }
+    let targets: Vec<HostTarget> = hosts
+        .iter()
+        .map(|host| {
+            exec::authenticated_target(
+                store.as_ref(),
+                &paths.cache_dir,
+                host,
+                &bundle.hosts,
+                &remote,
+                AskpassMode::Force,
+                &options,
+            )
+        })
+        .collect();
     let parallel = request.parallel.unwrap_or(config.parallel);
     let runtime = tokio::runtime::Builder::new_current_thread()
         .enable_all()
@@ -182,6 +220,40 @@ pub fn run(
     } else {
         Ok(ExitCode::SUCCESS)
     }
+}
+
+/// Known vcon flags that must not be forwarded just because they follow the command.
+///
+/// Anything after `--` is the remote command, including these spellings.
+pub fn misplaced_exec_flag(argv: &[String], command: &[String]) -> Option<String> {
+    const FLAGS: &[&str] = &[
+        "--dry-run",
+        "--sudo",
+        "--stream",
+        "--grouped",
+        "--only-failed",
+        "--json",
+        "--yes",
+        "-y",
+        "--timeout",
+        "-t",
+        "--parallel",
+        "-p",
+    ];
+    let end = argv.iter().position(|arg| arg == "--");
+    for token in command {
+        if !FLAGS.contains(&token.as_str()) {
+            continue;
+        }
+        let passed_through =
+            end.is_some_and(|index| argv.iter().skip(index + 1).any(|arg| arg == token));
+        if !passed_through {
+            return Some(format!(
+                "`{token}` was placed after the command, so it would run on the remote host. Put vcon flags before the command (`vcon x HOST {token} -- COMMAND`), or after `--` to pass them through (`vcon x HOST -- COMMAND {token}`)."
+            ));
+        }
+    }
+    None
 }
 
 fn argv_with_program(program: &str, args: &[String]) -> Vec<String> {
@@ -490,6 +562,32 @@ mod tests {
             connect_timeout: None,
             tunnels: Vec::new(),
         }
+    }
+
+    #[test]
+    fn flags_after_the_command_are_rejected_unless_past_double_dash() {
+        let command = vec!["hostname".into(), "--dry-run".into()];
+        let argv = vec![
+            "vcon".into(),
+            "x".into(),
+            "web-1".into(),
+            "hostname".into(),
+            "--dry-run".into(),
+        ];
+        let message = misplaced_exec_flag(&argv, &command).unwrap();
+        assert!(
+            message.contains("would run on the remote host"),
+            "{message}"
+        );
+        let argv = vec![
+            "vcon".into(),
+            "x".into(),
+            "web-1".into(),
+            "--".into(),
+            "hostname".into(),
+            "--dry-run".into(),
+        ];
+        assert!(misplaced_exec_flag(&argv, &command).is_none());
     }
 
     #[test]

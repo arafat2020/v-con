@@ -97,28 +97,30 @@ impl TunnelManager {
     pub fn start(
         &self,
         host: &EffectiveHost,
-        hosts: &[EffectiveHost],
         label: impl Into<String>,
         spec: TunnelSpec,
-        options: &SshCommandOptions,
+        args: Vec<String>,
         env: &[(String, String)],
     ) -> Result<TunnelId, Error> {
         if let Some(port) = spec.local_listen_port() {
             ensure_local_port_free(port)?;
         }
-        let args = plan_forward_args(host, hosts, options, &spec);
         let label = label.into();
         let mut displayed = vec![self.program.display().to_string()];
         displayed.extend(args.iter().cloned());
         tracing::debug!(command = %command_line(&displayed), "starting tunnel");
         crate::infra::ssh::system::release_dead_master(&self.program, &args);
 
-        let child = Command::new(&self.program)
+        let mut command = Command::new(&self.program);
+        command
             .args(&args)
             .envs(env.iter().cloned())
             .stdin(Stdio::null())
             .stdout(Stdio::null())
-            .stderr(Stdio::piped())
+            .stderr(Stdio::piped());
+        #[cfg(unix)]
+        crate::infra::ssh::system::own_child(&mut command);
+        let child = command
             .spawn()
             .map_err(|error| Error::Message(format!("failed to start tunnel: {error}")))?;
 

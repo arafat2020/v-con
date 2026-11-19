@@ -44,7 +44,6 @@ pub fn run(paths: &Paths) -> Result<ExitCode, Error> {
     };
 
     check_program("ssh", &mut ok, &mut fail);
-    check_program("rsync", &mut ok, &mut warn);
 
     match config::load(&paths.config_file()) {
         Ok(_) if !paths.config_file().exists() => {

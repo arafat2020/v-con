@@ -274,6 +274,57 @@ pub struct PlannedCopy {
     pub made_directory: bool,
 }
 
+/// Where a CLI upload should write.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub enum RemoteTarget {
+    /// Copy into this directory (it exists, or `remote` ends with `/`).
+    IntoDir(String),
+    /// Write this exact file path, replacing a file that is already there.
+    File(String),
+}
+
+/// Directory when `remote` exists as a directory or ends with `/`.
+/// Otherwise the remote path is the file to create or overwrite.
+pub fn classify_remote_target(remote: &str, existing_dir: bool) -> RemoteTarget {
+    if remote.ends_with('/') || existing_dir {
+        RemoteTarget::IntoDir(normalize(remote))
+    } else {
+        RemoteTarget::File(normalize(remote))
+    }
+}
+
+/// Plan a `vcon push`. A remote path that is not a directory is the file name.
+pub async fn plan_push<S: RemoteFs, D: RemoteFs>(
+    src: &S,
+    dst: &D,
+    source: &str,
+    remote: &str,
+) -> Result<PlannedCopy, Error> {
+    let source = normalize(source);
+    let existing_dir = match dst.stat(remote).await {
+        Ok(entry) => entry.is_dir(),
+        Err(_) => false,
+    };
+    match classify_remote_target(remote, existing_dir) {
+        RemoteTarget::IntoDir(dir) => plan_copies(src, dst, &source, &dir).await,
+        RemoteTarget::File(dest) => {
+            let meta = src.stat(&source).await?;
+            if meta.is_dir() {
+                return Err(Error::Message(format!(
+                    "{remote} is a file path but {source} is a directory; add a trailing / to copy into a directory"
+                )));
+            }
+            if let Some(parent) = parent_of(&dest) {
+                ensure_dir(dst, &parent).await?;
+            }
+            Ok(PlannedCopy {
+                files: vec![(source, dest, meta.size)],
+                made_directory: false,
+            })
+        }
+    }
+}
+
 /// Expand `source` into destination paths under `dest_dir`.
 ///
 /// A directory keeps its own name (`/proj/a.txt` copied into `/home` becomes
@@ -663,6 +714,48 @@ mod tests {
             dst.read_at("/dest/deep/down/a.txt", 0, 16).await.unwrap(),
             b"nested"
         );
+    }
+
+    #[test]
+    fn remote_file_path_is_not_treated_as_a_directory() {
+        assert_eq!(
+            classify_remote_target("/tmp/app.conf", false),
+            RemoteTarget::File("/tmp/app.conf".into())
+        );
+        assert_eq!(
+            classify_remote_target("/tmp/app.conf/", false),
+            RemoteTarget::IntoDir("/tmp/app.conf".into())
+        );
+        assert_eq!(
+            classify_remote_target("/tmp/app.conf", true),
+            RemoteTarget::IntoDir("/tmp/app.conf".into())
+        );
+    }
+
+    #[tokio::test]
+    async fn plan_push_overwrites_a_remote_file() {
+        let src = FakeFs::new();
+        let dst = FakeFs::new();
+        src.insert_file("/local.conf", b"new");
+        dst.insert_file("/tmp/app.conf", b"old");
+        let planned = plan_push(&src, &dst, "/local.conf", "/tmp/app.conf")
+            .await
+            .unwrap();
+        assert_eq!(planned.files.len(), 1);
+        assert_eq!(planned.files[0].1, "/tmp/app.conf");
+    }
+
+    #[tokio::test]
+    async fn plan_push_uses_the_path_as_the_file_when_it_is_missing() {
+        let src = FakeFs::new();
+        let dst = FakeFs::new();
+        src.insert_file("/big.bin", b"data");
+        let planned = plan_push(&src, &dst, "/big.bin", "/tmp/big.bin")
+            .await
+            .unwrap();
+        assert_eq!(planned.files[0].1, "/tmp/big.bin");
+        assert!(dst.stat("/tmp").await.unwrap().is_dir());
+        assert!(dst.stat("/tmp/big.bin").await.is_err());
     }
 
     #[tokio::test]

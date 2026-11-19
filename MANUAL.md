@@ -13,7 +13,7 @@ and one-offs (`vcon exec`, `vcon list --json`, …) and share the same core.
 | | |
 |--|--|
 | Platforms | macOS and Linux |
-| Requirements | System `ssh` on `PATH` (optional `rsync` for faster transfers) |
+| Requirements | System `ssh` on `PATH` |
 | Config | `~/.config/vcon/` (or `VCON_CONFIG_DIR` / `--config-dir`) |
 
 ---
@@ -223,6 +223,7 @@ The bottom hint bar always lists keys that work **right now**. Usable at
 | `s` | Snippet picker |
 | `t` | Tunnels for cursor host |
 | `y` | Copy ssh command to clipboard |
+| `P` | Check a login password, then save it in the OS keychain (Ctrl-U clears it) |
 | `*` | Toggle favorite |
 | `S` | Sort by frecency vs inventory order |
 | `E` | Open `hosts.toml` in `$EDITOR` / `$VISUAL` |
@@ -269,7 +270,7 @@ vcon push @web ./deploy/ /var/www/app/
 vcon pull web-1 /var/log/nginx/access.log ./logs/
 ```
 
-Uses `rsync` when available, otherwise `scp`.
+Uploads and downloads use SFTP (`ssh -s sftp`). A remote path that already exists as a directory, or that ends with `/`, receives the file inside it. Any other remote path is the file to create or overwrite.
 
 ---
 
@@ -431,6 +432,8 @@ Global flags:
 | `--dry-run` | Print ssh commands only |
 | `--sudo` | Prefix with `sudo -n` |
 
+Flags belong before the command. `vcon x host hostname --dry-run` is rejected, because that would run `hostname --dry-run` on the server. Put the flag first (`vcon x host --dry-run -- hostname`) or after `--` when the remote program should see it (`vcon x host -- hostname --dry-run`). `-t` / `--timeout` is how long vcon waits for the command. It is also passed as ssh `ConnectTimeout` only when you set it; otherwise the host's `connect_timeout` is used.
+
 Exit code **3** if any host failed.
 
 ```bash
@@ -446,7 +449,7 @@ All fields optional. A missing file uses defaults.
 ```toml
 parallel = 10
 confirm_threshold = 5
-protected_tags = ["prod"]
+protected_tags = []          # example: ["prod"] to confirm those hosts
 multiplexing = true
 
 [tui]
@@ -483,7 +486,7 @@ crit = "red"
 ```
 
 - **`confirm_threshold`**: ask before acting on more than this many hosts.
-- **`protected_tags`**: always confirm when any targeted host has these tags.
+- **`protected_tags`**: always confirm when any targeted host has these tags. The default is an empty list, so `@prod` is not confirmed until you set it.
 - **`multiplexing`**: ControlMaster for faster repeat connections.
 - Theme colours: `black`, `red`, `green`, `yellow`, `blue`, `magenta`, `cyan`,
   `gray`, `white`.
@@ -494,7 +497,7 @@ crit = "red"
 
 ```bash
 vcon doctor
-# OK/WARN/FAIL for ssh, rsync, config, hosts.toml, ssh-agent,
+# OK/WARN/FAIL for ssh, config, hosts.toml, ssh-agent,
 # control socket dir, and terminal capabilities.
 # Non-zero exit if any FAIL.
 
@@ -510,7 +513,7 @@ vcon man | man -l -
 
 ## 16. Security and safety
 
-- Passwords are **not** stored; use keys and `ssh-agent`.
+- A login password vcon obtains (the connect prompt, an embedded session, or `P`) is stored in the OS keychain after ssh accepts it. Later commands reuse it, including after the ControlMaster exits. A rejected saved password is tried once; on a terminal vcon asks again and replaces the keychain entry, and without a terminal it tells you to update it with `P`. The password is not written to `hosts.toml`, the audit log, argv, or the ssh environment.
 - Host key checking is never disabled by default; treat “host key changed”
   as a hard stop and fix `known_hosts` deliberately.
 - Snippet variables are single-quote shell-escaped before substitution.
@@ -531,7 +534,7 @@ vcon man | man -l -
 | Auth failures | `ssh-add -l`; test `vcon connect <host>` / plain `ssh` |
 | Jump / ProxyJump issues | Confirm `jump` names exist and have no cycles (`vcon check`) |
 | Slow repeat connects | Leave `multiplexing = true`; ensure control dir is writable |
-| Transfers fail | Install `rsync`, or fall back relies on `scp`; check remote path perms |
+| Transfers fail | Push and pull use SFTP; check the remote path and permissions |
 | Session keys “eaten” by vcon | You are not session-focused — press Enter on Sessions or open with `o`; use prefix `d` only when you want vcon keys again |
 | Stuck in a session | Prefix (`Ctrl+]`) then `d` to detach, or `x` to close |
 | Corrupt inventory | `vcon check`; restore `hosts.toml.bak` if needed |
