@@ -171,6 +171,7 @@ impl Form {
         }
         // Caps Lock can deliver `S` with CONTROL; accept both.
         if matches!(code, KeyCode::Char('s' | 'S')) && modifiers.contains(KeyModifiers::CONTROL) {
+            self.commit_pending_tags();
             return FormEffect::Submit;
         }
         match code {
@@ -207,7 +208,10 @@ impl Form {
             return FormEffect::Continue;
         };
         match kind {
-            FieldKind::Button => FormEffect::Submit,
+            FieldKind::Button => {
+                self.commit_pending_tags();
+                FormEffect::Submit
+            }
             FieldKind::Tags { .. } => {
                 self.add_chip();
                 FormEffect::Continue
@@ -292,19 +296,33 @@ impl Form {
     }
 
     fn add_chip(&mut self) {
-        let Some(field) = self.fields.get_mut(self.focus) else {
+        let index = self.focus;
+        let Some(field) = self.fields.get_mut(index) else {
             return;
         };
-        let chip = field.value.trim().to_string();
-        if chip.is_empty() {
-            return;
+        if commit_tag_value(field) {
+            self.dirty = true;
         }
-        if !field.chips.iter().any(|existing| existing == &chip) {
-            field.chips.push(chip);
+    }
+
+    /// Turn unfinished tag text into chips before Save.
+    ///
+    /// Text still sitting in the field is shown as "Tags: alpha,beta" but is
+    /// not part of `chips` until Enter. Save and Ctrl+S commit it the same
+    /// way Enter does: split on commas, trim, drop empties, skip duplicates.
+    fn commit_pending_tags(&mut self) {
+        let mut changed = false;
+        for index in 0..self.fields.len() {
+            if !matches!(self.fields[index].kind, FieldKind::Tags { .. }) {
+                continue;
+            }
+            if commit_tag_value(&mut self.fields[index]) {
+                changed = true;
+            }
         }
-        field.value.clear();
-        field.cursor = 0;
-        self.dirty = true;
+        if changed {
+            self.dirty = true;
+        }
     }
 
     fn backspace_tag(&mut self) {
@@ -363,6 +381,28 @@ impl Form {
         let last = self.fields.len() as isize - 1;
         self.focus = (self.focus as isize + delta).clamp(0, last) as usize;
     }
+}
+
+/// Move comma-separated text from `value` onto `chips`.
+///
+/// Returns whether `value` held anything. An empty field is left untouched
+/// so a bare Enter does not mark the form dirty.
+fn commit_tag_value(field: &mut Field) -> bool {
+    if field.value.is_empty() {
+        return false;
+    }
+    let raw = std::mem::take(&mut field.value);
+    field.cursor = 0;
+    for part in raw.split(',') {
+        let chip = part.trim();
+        if chip.is_empty() {
+            continue;
+        }
+        if !field.chips.iter().any(|existing| existing == chip) {
+            field.chips.push(chip.to_string());
+        }
+    }
+    true
 }
 
 fn render_field(field: &Field) -> String {
@@ -472,6 +512,57 @@ mod tests {
         assert_eq!(
             form.on_key(KeyCode::Char('S'), KeyModifiers::CONTROL),
             FormEffect::Submit
+        );
+    }
+
+    #[test]
+    fn enter_splits_comma_separated_tags() {
+        let mut form = sample();
+        form.focus = 1;
+        for ch in " alpha, beta, ,alpha ".chars() {
+            form.on_key(KeyCode::Char(ch), KeyModifiers::NONE);
+        }
+        assert_eq!(
+            form.on_key(KeyCode::Enter, KeyModifiers::NONE),
+            FormEffect::Continue
+        );
+        assert_eq!(
+            form.field("tags").unwrap().chips,
+            vec!["web".to_string(), "alpha".to_string(), "beta".to_string()]
+        );
+        assert!(form.field("tags").unwrap().value.is_empty());
+    }
+
+    #[test]
+    fn save_commits_pending_tags_without_enter() {
+        let mut form = sample();
+        form.focus = 1;
+        for ch in "db, ops".chars() {
+            form.on_key(KeyCode::Char(ch), KeyModifiers::NONE);
+        }
+        assert_eq!(
+            form.on_key(KeyCode::Char('s'), KeyModifiers::CONTROL),
+            FormEffect::Submit
+        );
+        assert_eq!(
+            form.field("tags").unwrap().chips,
+            vec!["web".to_string(), "db".to_string(), "ops".to_string()]
+        );
+        assert!(form.field("tags").unwrap().value.is_empty());
+
+        let mut form = sample();
+        form.focus = 1;
+        for ch in "edge".chars() {
+            form.on_key(KeyCode::Char(ch), KeyModifiers::NONE);
+        }
+        form.on_key(KeyCode::Down, KeyModifiers::NONE);
+        assert_eq!(
+            form.on_key(KeyCode::Enter, KeyModifiers::NONE),
+            FormEffect::Submit
+        );
+        assert_eq!(
+            form.field("tags").unwrap().chips,
+            vec!["web".to_string(), "edge".to_string()]
         );
     }
 }

@@ -256,8 +256,14 @@ async fn event_loop(
         if let Some(handoff) = effects.handoff {
             drop(events);
             run_handoff(terminal, app, handoff).await?;
+            // Paint now. A tick that arrives while ssh was running clears
+            // `dirty` before the frame timer draws, which would leave the
+            // screen blank after resume.
+            terminal
+                .draw(|frame| app.draw(frame, Some(&live_sessions.manager)))
+                .map_err(|error| Error::Message(error.to_string()))?;
             events = EventStream::new();
-            app.dirty = true;
+            app.dirty = false;
         }
         for command in effects.files {
             if let Err(error) = handle_files_command(app, &mut live_files, command).await {
